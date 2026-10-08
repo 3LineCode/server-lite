@@ -19,6 +19,7 @@ dependencies = [
     "pyzmq>=26.0",
     "redis>=5.0",
     "asyncmy>=0.2.9",
+    "cryptography>=42",
     "watchfiles>=0.21",
     "aioconsole>=0.8",
     "prometheus-client>=0.20",

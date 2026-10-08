@@ -66,4 +66,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --extra dev
-      - run: uv run pytest -m integration
+      - name: Run integration tests against service containers
+        run: uv run pytest -m "integration or mysql or redis"

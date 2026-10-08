@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from collections.abc import Sequence
 from typing import Any, cast
 
@@ -22,6 +23,36 @@ import asyncmy
 from pyline.config.models import MySQLSettings
 
 logger = logging.getLogger(__name__)
+
+_DB_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+async def ensure_database(settings: MySQLSettings) -> None:
+    """Create the target database if absent, using a db-less connection.
+
+    Must run before the pool is created: ``create_pool(db=...)`` fails with
+    "Unknown database" on a fresh server, which used to make first boot
+    crash before ``CREATE DATABASE`` could ever execute (migration plan F-05).
+    """
+    if not _DB_NAME_RE.fullmatch(settings.db_name):
+        raise MySQLError(f"invalid database name: {settings.db_name!r}")
+    conn = await asyncmy.connect(
+        host=settings.host,
+        port=settings.port,
+        user=settings.user,
+        password=settings.password,
+        charset=settings.charset,
+        autocommit=True,
+    )
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"CREATE DATABASE IF NOT EXISTS `{settings.db_name}` "
+                "DEFAULT CHARACTER SET utf8mb4"
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            await conn.ensure_closed()
 
 
 class MySQLError(Exception):
@@ -46,6 +77,7 @@ class MySQLPool:
 
     async def connect(self) -> None:
         s = self._settings
+        await ensure_database(s)  # F-05: fresh servers get the DB before pooling
         self._pool = await asyncmy.create_pool(
             host=s.host,
             port=s.port,

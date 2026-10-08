@@ -106,7 +106,10 @@ def reload_module(module_name: str) -> types.ModuleType:
         )
         _run_module_hook(module, "__reload__")
         get_metrics().reload_total.labels(result="ok").inc()
-    except Exception:
+    except BaseException:
+        # F-41: the re-executed module top level can raise SystemExit /
+        # KeyboardInterrupt / GeneratorExit (BaseException, not Exception).
+        # Skipping the rollback there used to leave the module half-updated.
         cache.recover()
         logger.exception("reload of %s failed; module state restored", module_name)
         get_metrics().reload_total.labels(result="failed").inc()
@@ -286,8 +289,10 @@ def _validate_structure(old: types.ModuleType, tree: ast.Module) -> None:
     problems: list[str] = []
     summary = _ast_summary(tree)
     for name, old_obj in old.__dict__.items():
-        if name.startswith("__"):
-            continue
+        # No dunder skip here (F-41): non-owned machinery (__builtins__,
+        # __loader__, ...) is filtered by the __module__ ownership check below,
+        # while a module-level ``__getattr__`` defined in this module is a
+        # real protocol surface whose signature must stay call-compatible.
         if getattr(old_obj, "__module__", None) != old.__name__:
             continue
         entry = summary.get(name)
@@ -361,7 +366,13 @@ def _check_class(name: str, old: type, info: _ClassInfo, problems: list[str]) ->
             f"{sorted(info.identity_dunders)} (instances may sit in dicts/sets)"
         )
     for attr_name, old_attr in old.__dict__.items():
-        if attr_name.startswith("__") and attr_name not in ("__init__",):
+        # F-41: only name-mangled privates (``__foo``) skip -- they live under
+        # ``_Cls__foo`` in the class dict, so AST and runtime names cannot be
+        # matched. Real dunders DO get validated: ``__exit__``/``__call__``/
+        # ``__aiter__``/... are invoked by the language with fixed arity, and a
+        # signature change that slipped validation used to break every
+        # protocol caller the moment the swap landed.
+        if attr_name.startswith("__") and not attr_name.endswith("__"):
             continue
         old_fn = _unwrap_method_function(old_attr)
         if not isinstance(old_fn, types.FunctionType):

@@ -457,3 +457,96 @@ class TestValueLevelReloadKeep:
         reload_module("hotmod")
         assert mod.H.state.n == 99  # value-level keep blocks overwrite too
         assert mod.H().value() == 2
+
+
+def test_base_exception_in_top_level_rolls_back(hotmod, tmp_path: Path) -> None:
+    """F-41: SystemExit raised by the re-executed module top level used to
+    bypass ``except Exception`` -- no rollback, module left half-updated."""
+    old_value = hotmod.value
+    v2 = V1.replace("return 1", "return 2").replace(
+        'COUNTER = {"n": 0}', 'COUNTER = {"n": 0}\nraise SystemExit(9)'
+    )
+    write_module(tmp_path, v2)
+    with pytest.raises(SystemExit):
+        reload_module("hotmod")
+    # full rollback: identity and code untouched by the aborted reload
+    assert hotmod.value is old_value
+    assert hotmod.value() == 1
+    assert hotmod.Greeter().greet() == "v1"
+
+
+CTX_V1 = V1 + textwrap.dedent(
+    """
+    class Ctx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+    """
+)
+
+
+def test_dunder_signature_change_rejected(hotmod, tmp_path: Path) -> None:
+    """F-41: protocol dunders (__exit__ etc.) used to skip signature
+    validation; a breaking change swapped in and broke every caller."""
+    write_module(tmp_path, CTX_V1)
+    reload_module("hotmod")  # adding the class is allowed
+    assert hotmod.Ctx().__exit__(None, None, None) is False
+
+    v3 = CTX_V1.replace(
+        "def __exit__(self, exc_type, exc, tb):",
+        "def __exit__(self, exc_type, exc, tb, extra):",
+    )
+    write_module(tmp_path, v3)
+    with pytest.raises(ReloadRejected, match="__exit__"):
+        reload_module("hotmod")
+    assert hotmod.Ctx().__exit__(None, None, None) is False  # unchanged
+
+
+def test_dunder_compatible_change_passes(hotmod, tmp_path: Path) -> None:
+    """F-41 guard must not false-reject: adding a defaulted kw-only param to a
+    dunder keeps every existing call working."""
+    write_module(tmp_path, CTX_V1)
+    reload_module("hotmod")
+    v4 = CTX_V1.replace(
+        "def __exit__(self, exc_type, exc, tb):",
+        "def __exit__(self, exc_type, exc, tb, *, log=False):",
+    ).replace("return False", "return log")
+    write_module(tmp_path, v4)
+    reload_module("hotmod")
+    assert hotmod.Ctx().__exit__(None, None, None) is False
+    assert hotmod.Ctx().__exit__(None, None, None, log=True) is True
+
+
+def test_mangled_private_methods_still_skip_validation(hotmod, tmp_path: Path) -> None:
+    """F-41: name-mangled privates (``__helper``) cannot be matched between
+    the AST and the live class dict (``_Ctx__helper``) -- they stay exempt."""
+    v2 = V1.replace(
+        "class Greeter:",
+        "class Greeter:\n    def __helper(self, a):\n        return a",
+    )
+    write_module(tmp_path, v2)
+    reload_module("hotmod")  # adding is fine
+    v3 = V1.replace(
+        "class Greeter:",
+        "class Greeter:\n    def __helper(self, a, b):\n        return a + b",
+    )
+    write_module(tmp_path, v3)
+    reload_module("hotmod")  # mangled names are exempt, no reject
+    assert hotmod.Greeter()._Greeter__helper(1, 2) == 3
+
+
+def test_module_getattr_signature_change_rejected(hotmod, tmp_path: Path) -> None:
+    """F-41: a module-level ``__getattr__`` is a protocol surface the import
+    machinery calls with one argument; it used to escape validation."""
+    v2 = V1 + "\n\ndef __getattr__(name):\n    return 'fallback'\n"
+    write_module(tmp_path, v2)
+    reload_module("hotmod")
+    assert hotmod.missing_thing == "fallback"
+
+    v3 = V1 + "\n\ndef __getattr__(name, mode):\n    return 'fallback'\n"
+    write_module(tmp_path, v3)
+    with pytest.raises(ReloadRejected, match="__getattr__"):
+        reload_module("hotmod")
+    assert hotmod.missing_thing == "fallback"

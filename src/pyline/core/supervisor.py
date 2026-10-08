@@ -96,8 +96,14 @@ class ProcessSupervisor:
             if child.is_alive():
                 logger.warning("killing unresponsive child pid=%d", child.pid)
                 child.kill()
+        # async join: the old blocking child.join(timeout=2.0) stalled the
+        # event loop up to 2s per child during shutdown (F-21)
+        join_deadline = asyncio.get_running_loop().time() + 3.0
         for child in self._children.values():
-            child.join(timeout=2.0)
+            while child.is_alive() and asyncio.get_running_loop().time() < join_deadline:
+                await asyncio.sleep(0.05)
+            if child.is_alive():
+                child.join(timeout=0)  # non-blocking reap after kill
         self._children.clear()
 
     # ------------------------------------------------------------------ #
@@ -156,11 +162,10 @@ async def _child_loop(
         ProcessSupervisor(child_main).watch_parent(main_pid, parent_gone)
     )
     signal_task = asyncio.get_running_loop().create_task(_wait_shutdown_event(shutdown_event, stop))
+    runner: asyncio.Task[None] = asyncio.ensure_future(child_main(process_type, index))
+    stop_wait: asyncio.Task[None] = asyncio.ensure_future(_wait_stop(stop))
     try:
-        runner: asyncio.Task[None] = asyncio.ensure_future(child_main(process_type, index))
-        await asyncio.wait(
-            {runner, asyncio.create_task(stop.wait())}, return_when=asyncio.FIRST_COMPLETED
-        )
+        await asyncio.wait({runner, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
         if stop.is_set():
             runner.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -170,6 +175,11 @@ async def _child_loop(
     finally:
         watcher.cancel()
         signal_task.cancel()
+        stop_wait.cancel()
+
+
+async def _wait_stop(stop: asyncio.Event) -> None:
+    await stop.wait()
 
 
 async def _wait_shutdown_event(event: MpEvent, stop: asyncio.Event) -> None:

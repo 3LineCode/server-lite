@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import importlib
 import logging
 import os
 import signal
@@ -16,6 +17,7 @@ from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
 
+from pyline import api as pyline_api
 from pyline import log as pyline_log
 from pyline.config.loader import (
     load_project_settings,
@@ -147,6 +149,7 @@ class ServerRuntime:
         self._start_clock_events()
 
     async def _step_frame_init(self) -> None:
+        self._load_business()
         self.bus_zmq = ZmqBus(self.ctx, self.gateway)
         await self.bus_zmq.start()
         self.router = MessageRouter(self.ctx, self.gateway, self.bus_zmq)
@@ -201,8 +204,28 @@ class ServerRuntime:
             return
         await self.bus.emit(FuncInitEvent())
 
+    def _load_business(self) -> None:
+        """Import the business events module and let it subscribe (the
+        prototype's sys.path-injected script/events flow, now explicit)."""
+        module_name = os.environ.get("PYLINE_EVENTS", "game.events")
+        try:
+            business = importlib.import_module(module_name)
+        except ImportError as exc:
+            logger.info("business module %r not loaded (%s)", module_name, exc)
+            return
+        register = getattr(business, "register", None)
+        if register is not None:
+            register(self.bus)
+            logger.info("business module %s registered", module_name)
+
+    def _register_api_services(self) -> None:
+        """Expose the facade's service handles (rpc is registered earlier)."""
+        self.ctx.services["db"] = self.db
+        self.ctx.services["clock"] = self.clock
+
     async def _step_func_done(self) -> None:
         self.save_scheduler.start()
+        self._register_api_services()
         self._expose_saver_factory()
         self.monitor = LoopLatencyMonitor(
             on_alert=lambda delay: self.alarms.emit("loop_latency", {"delay": delay})
@@ -447,6 +470,7 @@ def build_context(
 
 async def run_process(ctx: Context, config_dir: Path) -> None:
     """Single-process entry: build runtime, boot, park until shutdown."""
+    pyline_api.bind(ctx)
     pyline_log.setup_logging(
         ctx.settings.log,
         process_tag=ctx.process_type,

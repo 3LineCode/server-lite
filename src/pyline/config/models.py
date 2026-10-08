@@ -69,6 +69,10 @@ class RedisSettings(_StrictModel):
     password: str | None = None
     db_index: int = Field(default=0, ge=0)
     conn_cnt: int = Field(default=2, ge=1)
+    # redis-py official options (F-11): without a socket timeout a dead
+    # server parks every awaiting caller forever.
+    socket_timeout: float = Field(default=5.0, gt=0)
+    health_check_interval: int = Field(default=30, ge=0)
 
 
 class ProjectSettings(_StrictModel):

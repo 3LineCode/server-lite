@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 
 from redis import asyncio as aioredis
 
@@ -30,6 +30,9 @@ class RedisClient:
             db=s.db_index,
             max_connections=s.conn_cnt,
             decode_responses=True,
+            socket_timeout=s.socket_timeout,
+            socket_connect_timeout=s.socket_timeout,
+            health_check_interval=s.health_check_interval,
         )
         await self._client.ping()
         logger.info("redis connected: %s:%d db=%d", s.host, s.port, s.db_index)
@@ -48,10 +51,12 @@ class RedisClient:
         await self._require().set(key, value)
 
     async def get(self, key: str, default: str | None = None) -> str | None:
-        value = await self._require().get(key)
-        if value is None:
+        # decode_responses=True: values arrive as str | None, never bytes
+        # (the stub type is the union because the flag is per-instance).
+        raw = await self._require().get(key)
+        if raw is None:
             return default
-        return value if isinstance(value, str) else value.decode("utf-8")
+        return cast("str", raw)
 
     async def delete(self, *keys: str) -> int:
         return int(await self._require().delete(*keys))

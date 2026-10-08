@@ -41,6 +41,9 @@ class ZeroMQSettings(_StrictModel):
     hwm: int = Field(default=10_000, ge=1)
     reconnect_min_ms: int = Field(default=500, ge=100)
     reconnect_max_ms: int = Field(default=30_000, ge=1000)
+    # Per-destination outbound queue bound (F-15): bounds memory when a peer
+    # is slow; overflow drops and counts, mirroring ZMQ's own HWM semantics.
+    queue_bound: int = Field(default=1000, ge=1)
 
 
 class MySQLSettings(_StrictModel):

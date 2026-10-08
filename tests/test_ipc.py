@@ -95,3 +95,90 @@ async def test_dealer_to_router_and_back(config_dir, tmp_path) -> None:
     finally:
         await bus_sub.close()
         await bus_main.close()
+
+
+@pytest.mark.integration
+async def test_ipc_send_order_preserved(config_dir, tmp_path) -> None:
+    """F-15: the single writer per destination keeps per-peer FIFO order."""
+    port = free_tcp_port()
+    ctx_main = make_ctx(config_dir, tmp_path, main=True, index=0, port=port)
+    ctx_sub = make_ctx(config_dir, tmp_path, main=False, index=1, port=port)
+    gw_main, gw_sub = ProtocolGateway(), ProtocolGateway()
+    bus_main, bus_sub = ZmqBus(ctx_main, gw_main), ZmqBus(ctx_sub, gw_sub)
+
+    received: list[int] = []
+    done = asyncio.Event()
+
+    class OrderNet(Network):
+        flag = "order"
+
+        def __init__(self, gateway: ProtocolGateway) -> None:
+            super().__init__(gateway)
+            self.subscribe(1, self.on_seq)
+
+        def on_seq(self, seq: int) -> None:
+            received.append(seq)
+            if seq == 199:
+                done.set()
+
+    OrderNet(gw_sub)
+    await bus_main.start()
+    await bus_sub.start()
+    try:
+        await asyncio.sleep(0.3)
+        for i in range(200):
+            bus_main.send(ctx_sub.service_no, "order", pack_call(1, i))
+        await asyncio.wait_for(done.wait(), 10.0)
+        assert len(received) == 200
+        assert received == sorted(received), "per-destination order broken"
+    finally:
+        await bus_sub.close()
+        await bus_main.close()
+
+
+@pytest.mark.integration
+async def test_ipc_slow_dealer_does_not_block_bus(config_dir, tmp_path) -> None:
+    """F-15: a DEALER that never reads must not stall the ROUTER's recv loop
+    (the old inline-forward design blocked the whole bus on one slow peer)."""
+    port = free_tcp_port()
+    ctx_main = make_ctx(config_dir, tmp_path, main=True, index=0, port=port)
+    ctx_sub = make_ctx(config_dir, tmp_path, main=False, index=1, port=port)
+    gw_main, gw_sub = ProtocolGateway(), ProtocolGateway()
+    bus_main, bus_sub = ZmqBus(ctx_main, gw_main), ZmqBus(ctx_sub, gw_sub)
+
+    got_fast = asyncio.Event()
+
+    class FastNet(Network):
+        flag = "fast"
+
+        def __init__(self, gateway: ProtocolGateway) -> None:
+            super().__init__(gateway)
+            self.subscribe(1, lambda: got_fast.set())
+
+    FastNet(gw_sub)
+
+    import zmq
+    import zmq.asyncio
+
+    slow_no = 3 * 100_000 + 10001  # a subprocess index 3 that never starts
+    slow = zmq.asyncio.Context().socket(zmq.DEALER)
+    slow.setsockopt(zmq.IDENTITY, slow_no.to_bytes(4, "big"))
+    slow.set_hwm(1)
+    slow.connect(f"tcp://127.0.0.1:{port}")
+
+    await bus_main.start()
+    await bus_sub.start()
+    try:
+        await asyncio.sleep(0.3)
+        # spam the vanished-but-connected slow peer far past its HWM
+        for _ in range(200):
+            bus_main.send(slow_no, "fast", pack_call(1))
+        # the fast sub must still receive promptly while the slow peer is stuck
+        bus_main.send(ctx_sub.service_no, "fast", pack_call(1))
+        await asyncio.wait_for(got_fast.wait(), 3.0)
+        assert bus_main.unroutable_sends > 0  # slow peer's HWM rejections counted
+    finally:
+        slow.close(0)
+        await bus_sub.close()
+        await bus_main.close()
+

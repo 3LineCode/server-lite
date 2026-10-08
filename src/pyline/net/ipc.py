@@ -14,6 +14,14 @@ Wire format (after ZMQ identity handling)::
 service number dispatches locally, anything else is forwarded to the DEALER
 with that identity. ROUTER_MANDATORY is enabled so sends to vanished peers
 raise instead of silently dropping (counted in ``unroutable_sends``).
+
+Send architecture (F-15, per the ZeroMQ guide's queue-broker pattern): the
+recv loop never sends. Every outbound destination has its own bounded queue
+and one writer task, so (a) a slow DEALER whose HWM is full stalls only its
+own queue -- never the whole bus -- and (b) one writer per destination
+serializes sends, preserving per-destination FIFO order. Overflowing a
+queue drops the message and counts it (``dropped_sends``), mirroring ZMQ's
+own HWM semantics for fire-and-forget traffic.
 """
 
 from __future__ import annotations
@@ -31,6 +39,9 @@ from pyline.core.context import SERVICE_NO_STRIDE, Context
 from pyline.net.gateway import ProtocolGateway
 
 logger = logging.getLogger(__name__)
+
+# Identity key for a DEALER's single destination (the ROUTER).
+_ROUTER_PEER = -1
 
 
 def service_no_bytes(service_no: int) -> bytes:
@@ -51,9 +62,13 @@ class ZmqBus:
         self._zctx = zmq.asyncio.Context()
         self._socket: zmq.asyncio.Socket | None = None
         self._recv_task: asyncio.Task[None] | None = None
+        # Per-destination outbound queues + their single writer tasks.
+        self._peer_queues: dict[int, asyncio.Queue[list[bytes]]] = {}
+        self._peer_tasks: dict[int, asyncio.Task[None]] = {}
         self.sent_messages = 0
         self.recv_messages = 0
         self.unroutable_sends = 0
+        self.dropped_sends = 0
 
     async def start(self) -> None:
         if self._ctx.is_main_process:
@@ -88,28 +103,56 @@ class ZmqBus:
             self._dispatch_local(flag, payload)
             return
         self.sent_messages += 1
-        asyncio.get_running_loop().create_task(self._async_send(target_service_no, flag, payload))
-
-    async def _async_send(self, target_service_no: int, flag: str, payload: bytes) -> None:
-        assert self._socket is not None
         # Same multipart layout for both roles: ROUTER treats frame 0 as the
         # destination identity; a DEALER's frames reach the ROUTER as
         # [identity, target, from, flag, payload].
-        message = [
-            service_no_bytes(target_service_no),
-            service_no_bytes(self._ctx.service_no),
-            flag.encode("utf-8"),
-            payload,
-        ]
-        try:
-            await self._socket.send_multipart(message)
-        except zmq.ZMQError:
-            self.unroutable_sends += 1
-            logger.warning(
-                "zmq cannot route to service %d (unroutable=%d)",
-                target_service_no,
-                self.unroutable_sends,
+        self._enqueue(
+            target_service_no if self.is_router else _ROUTER_PEER,
+            [
+                service_no_bytes(target_service_no),
+                service_no_bytes(self._ctx.service_no),
+                flag.encode("utf-8"),
+                payload,
+            ],
+        )
+
+    # ---------------------------- outbound queues ---------------------------- #
+
+    def _enqueue(self, peer: int, frames: list[bytes]) -> None:
+        queue = self._peer_queues.get(peer)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=self._settings.queue_bound)
+            self._peer_queues[peer] = queue
+            self._peer_tasks[peer] = asyncio.get_running_loop().create_task(
+                self._peer_writer(peer, queue)
             )
+        try:
+            queue.put_nowait(frames)
+        except asyncio.QueueFull:
+            self.dropped_sends += 1
+            logger.warning(
+                "zmq send queue for %s full; dropping message (dropped=%d)",
+                "router" if peer == _ROUTER_PEER else peer,
+                self.dropped_sends,
+            )
+
+    async def _peer_writer(self, peer: int, queue: asyncio.Queue[list[bytes]]) -> None:
+        assert self._socket is not None
+        while True:
+            frames = await queue.get()
+            try:
+                await self._socket.send_multipart(frames)
+            except zmq.ZMQError:
+                self.unroutable_sends += 1
+                logger.warning(
+                    "zmq cannot route to peer %s (unroutable=%d)",
+                    "router" if peer == _ROUTER_PEER else peer,
+                    self.unroutable_sends,
+                )
+
+    def queue_depth(self) -> int:
+        """Total depth across per-destination outbound queues."""
+        return sum(q.qsize() for q in self._peer_queues.values())
 
     def _dispatch_local(self, flag: str, payload: bytes) -> None:
         self._gateway.dispatch(flag, payload)
@@ -133,7 +176,6 @@ class ZmqBus:
                 logger.exception("zmq message handling failed (parts=%d)", len(parts))
 
     async def _on_recv(self, parts: list[bytes]) -> None:
-        assert self._socket is not None
         self.recv_messages += 1
         if self.is_router:
             # [sender_identity, target, from, flag, payload]
@@ -147,9 +189,9 @@ class ZmqBus:
                 self._dispatch_local(flag, payload)
             else:
                 # Forward: identity = target, then [from, flag, payload].
-                await self._socket.send_multipart(
-                    [service_no_bytes(target), from_b, flag_b, payload]
-                )
+                # Enqueue, never send inline -- a slow DEALER must not stall
+                # the ROUTER's recv loop for every other peer (F-15).
+                self._enqueue(target, [service_no_bytes(target), from_b, flag_b, payload])
         else:
             # [from, flag, payload]
             if len(parts) != 3:
@@ -163,6 +205,13 @@ class ZmqBus:
             self._recv_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._recv_task
+        for task in self._peer_tasks.values():
+            task.cancel()
+        for task in self._peer_tasks.values():
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._peer_tasks.clear()
+        self._peer_queues.clear()
         if self._socket is not None:
             self._socket.close(1)
         self._zctx.term()

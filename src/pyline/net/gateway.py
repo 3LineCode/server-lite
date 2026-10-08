@@ -33,6 +33,19 @@ class ProtocolGateway:
     def get(self, flag: str) -> Network | None:
         return self._networks.get(flag)
 
+    def rebind_module(self, module_name: str) -> int:
+        """Ask every network defined in ``module_name`` to re-register its
+        handlers after that module was hot-reloaded (F-30); returns the
+        count of networks consulted."""
+        count = 0
+        for network in self._networks.values():
+            if type(network).__module__ == module_name:
+                network.rebind_handlers()
+                count += 1
+        if count:
+            logger.info("rebound handlers for %d network(s) in %s", count, module_name)
+        return count
+
     def dispatch(self, flag: str, payload: bytes) -> None:
         """Dispatch one inbound message.
 

@@ -58,6 +58,17 @@ class Network:
     def gateway(self) -> ProtocolGateway:
         return self._gateway
 
+    def rebind_handlers(self) -> None:
+        """Re-run sub-protocol registration after a hot reload (F-30).
+
+        Existing registrations keep working without this: handler functions
+        are updated in place, so live bindings already run the new code.
+        Override this to pick up *newly added* sub-protocols (the business
+        equivalent of the prototype's automatic ReInitHandlers); call it
+        from the module's ``__reload__`` hook or via
+        ``gateway.rebind_module()``.
+        """
+
     def subscribe(self, sub: int, handler: Handler) -> None:
         if sub in self._handlers:
             raise ValueError(f"{type(self).__qualname__}: sub-protocol {sub} already registered")

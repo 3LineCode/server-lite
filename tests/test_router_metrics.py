@@ -95,3 +95,59 @@ async def test_loop_latency_monitor() -> None:
     assert monitor.last_delay >= 0
     # healthy fast loop should not alert
     assert alerts == []
+
+
+class TestRebindF30:
+    def test_gateway_rebind_module(self, config_dir) -> None:
+        """F-30: after a hot reload the gateway asks that module's networks
+        to re-register handlers (prototype ReInitHandlers equivalent)."""
+        import sys
+        import textwrap
+        from pathlib import Path
+
+        from pyline.net.gateway import ProtocolGateway
+
+        gateway = ProtocolGateway()
+        reload_module = pytest.importorskip("pyline.reload").reload_module
+
+        source_v1 = textwrap.dedent(
+            """
+            from pyline.net.network import Network
+
+            class GameNet(Network):
+                flag = "game"
+
+                def __init__(self, gateway):
+                    super().__init__(gateway)
+                    self._extra = None
+
+                def rebind_handlers(self):
+                    if self._extra is None:
+                        self._extra = "bound"
+            """
+        )
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            monkey = pytest.MonkeyPatch()
+            monkey.syspath_prepend(str(tmp_path))
+            monkey.delitem(sys.modules, "gamenet", raising=False)
+            try:
+                (tmp_path / "gamenet.py").write_text(source_v1, encoding="utf-8")
+                import gamenet
+
+                net = gamenet.GameNet(gateway)
+                assert net._extra is None
+                source_v2 = source_v1.replace('"bound"', '"rebound"')
+                (tmp_path / "gamenet.py").write_text(source_v2, encoding="utf-8")
+                import os
+                import time as _t
+
+                os.utime(tmp_path / "gamenet.py", (_t.time() + 5, _t.time() + 5))
+                reload_module("gamenet")
+                assert gateway.rebind_module("gamenet") == 1
+                assert net._extra == "rebound"
+            finally:
+                monkey.undo()
+                sys.modules.pop("gamenet", None)

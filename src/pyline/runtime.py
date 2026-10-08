@@ -217,7 +217,7 @@ class ServerRuntime:
                 self.console = Console(
                     self.bus,
                     unsafe=os.environ.get(ENV_UNSAFE_CONSOLE, "") == "1",
-                    reload_hook=reload_module,
+                    reload_hook=self._reload_and_rebind,
                     shutdown_hook=lambda reason: asyncio.get_running_loop().create_task(
                         self.shutdown(reason)
                     ),
@@ -282,6 +282,10 @@ class ServerRuntime:
             entry.bind_host(),
             entry.client_listen_port(self.ctx.process_index),
         )
+
+    def _reload_and_rebind(self, module_name: str) -> None:
+        reload_module(module_name)
+        self.gateway.rebind_module(module_name)
 
     def _on_client_frame(self, flag: str, payload: bytes) -> None:
         """Client-facing dispatch (F-16): the client network never reaches the

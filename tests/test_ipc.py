@@ -211,3 +211,58 @@ async def test_ipc_slow_dealer_does_not_block_bus(config_dir, tmp_path) -> None:
         slow.close(0)
         await bus_sub.close()
         await bus_main.close()
+
+
+@pytest.mark.integration
+async def test_router_drops_spoofed_from(config_dir, tmp_path) -> None:
+    """F-39: a DEALER claiming to be a different service in the ``from`` field
+    is dropped at the ROUTER; a truthful sender still gets through."""
+    import zmq
+    import zmq.asyncio
+
+    from pyline.net.ipc import service_no_bytes
+
+    port = free_tcp_port()
+    ctx_main = make_ctx(config_dir, tmp_path, main=True, index=0, port=port)
+    gw_main = ProtocolGateway()
+    bus_main = ZmqBus(ctx_main, gw_main)
+    box: dict = {"event": asyncio.Event()}
+    _CaptureNet(gw_main, box)
+
+    await bus_main.start()
+
+    zctx = zmq.asyncio.Context()
+    rogue = zctx.socket(zmq.DEALER)
+    rogue.setsockopt(zmq.IDENTITY, service_no_bytes(424242))
+    rogue.connect(f"tcp://127.0.0.1:{port}")
+    try:
+        await asyncio.sleep(0.3)
+        # socket identity is 424242 but the message claims from=777777
+        await rogue.send_multipart(
+            [
+                service_no_bytes(ctx_main.service_no),
+                service_no_bytes(777777),
+                b"test",
+                pack_call(1, "spoofed"),
+            ]
+        )
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(box["event"].wait(), 1.0)
+        assert bus_main.spoofed_messages == 1
+        assert box.get("got") is None
+
+        # the same socket telling the truth is delivered
+        await rogue.send_multipart(
+            [
+                service_no_bytes(ctx_main.service_no),
+                service_no_bytes(424242),
+                b"test",
+                pack_call(1, "honest"),
+            ]
+        )
+        await asyncio.wait_for(box["event"].wait(), 5.0)
+        assert box["got"] == "honest"
+    finally:
+        rogue.close(0)
+        zctx.term()
+        await bus_main.close()

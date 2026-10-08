@@ -86,6 +86,7 @@ class ZmqBus:
         self.unroutable_sends = 0
         self.dropped_sends = 0
         self.dest_overflow = 0
+        self.spoofed_messages = 0
         self._metrics = get_metrics()
 
     async def start(self) -> None:
@@ -118,7 +119,7 @@ class ZmqBus:
     def send(self, target_service_no: int, flag: str, payload: bytes) -> None:
         """Send to another service on this physical server (or self)."""
         if target_service_no == self._ctx.service_no:
-            self._dispatch_local(flag, payload)
+            self._dispatch_local(flag, payload, self._ctx.service_no)
             return
         self.sent_messages += 1
         # Same multipart layout for both roles: ROUTER treats frame 0 as the
@@ -188,8 +189,8 @@ class ZmqBus:
         """Total depth across per-destination outbound queues."""
         return sum(q.qsize() for q in self._peer_queues.values())
 
-    def _dispatch_local(self, flag: str, payload: bytes) -> None:
-        self._gateway.dispatch(flag, payload)
+    def _dispatch_local(self, flag: str, payload: bytes, from_service: int) -> None:
+        self._gateway.dispatch(flag, payload, from_service)
 
     async def _recv_loop(self) -> None:
         assert self._socket is not None
@@ -216,23 +217,38 @@ class ZmqBus:
             if len(parts) != 5:
                 logger.warning("router got malformed message with %d parts", len(parts))
                 return
-            _, target_b, from_b, flag_b, payload = parts
+            identity_b, target_b, from_b, flag_b, payload = parts
+            # F-39: the claimed ``from`` must match the sender's actual ZMQ
+            # identity. Without this check any bus-connected process could
+            # impersonate any other service and, via RPC, inject results into
+            # live calls. A mismatch drops the message and counts it.
+            if identity_b != from_b:
+                self.spoofed_messages += 1
+                self._metrics.ipc_spoofed.inc()
+                logger.warning(
+                    "zmq message claims from=%d but sender identity is %d; dropped (spoofed=%d)",
+                    int.from_bytes(from_b, "big"),
+                    int.from_bytes(identity_b, "big"),
+                    self.spoofed_messages,
+                )
+                return
             target = int.from_bytes(target_b, "big")
             if target == self._ctx.service_no:
                 flag = flag_b.decode("utf-8")
-                self._dispatch_local(flag, payload)
+                self._dispatch_local(flag, payload, int.from_bytes(from_b, "big"))
             else:
                 # Forward: identity = target, then [from, flag, payload].
                 # Enqueue, never send inline -- a slow DEALER must not stall
                 # the ROUTER's recv loop for every other peer (F-15).
                 self._enqueue(target, [service_no_bytes(target), from_b, flag_b, payload])
         else:
-            # [from, flag, payload]
+            # [from, flag, payload] -- ``from`` was validated against the
+            # sender's identity by the ROUTER before forwarding (F-39).
             if len(parts) != 3:
                 logger.warning("dealer got malformed message with %d parts", len(parts))
                 return
-            _, flag_b, payload = parts
-            self._dispatch_local(flag_b.decode("utf-8"), payload)
+            from_b, flag_b, payload = parts
+            self._dispatch_local(flag_b.decode("utf-8"), payload, int.from_bytes(from_b, "big"))
 
     async def close(self) -> None:
         if self._recv_task is not None:

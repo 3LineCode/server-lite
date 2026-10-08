@@ -105,7 +105,9 @@ class RpcManager(Network):
         self._own_service_no = own_service_no
         self._functions: dict[str, Callable[..., Any]] = {}
         self._pending: dict[int, _PendingCall] = {}
-        self._running: dict[int, asyncio.Task[None]] = {}
+        # call_id -> (running task, validated caller service no) -- the caller
+        # is who a MSG_CANCEL must come from (F-40).
+        self._running: dict[int, tuple[asyncio.Task[None], int]] = {}
         self._call_seq = itertools.count(1)
         self._metrics = get_metrics()
         self.timed_out_calls = 0
@@ -235,7 +237,7 @@ class RpcManager(Network):
     # Inbound (Network entry point)
     # ------------------------------------------------------------------ #
 
-    def handle_message(self, flag: str, payload: bytes) -> None:
+    def handle_message(self, flag: str, payload: bytes, from_service: int = 0) -> None:
         try:
             message = msgpack.unpackb(payload, raw=False, strict_map_key=False)
         except (ValueError, msgpack.exceptions.ExtraData):
@@ -246,31 +248,62 @@ class RpcManager(Network):
             return
         kind = message[0]
         if kind == MSG_CALL:
-            self._on_call(message)
+            self._on_call(message, from_service)
         elif kind == MSG_RESULT:
-            self._on_result(message)
+            self._on_result(message, from_service)
         elif kind == MSG_CANCEL:
-            self._on_cancel(message)
+            self._on_cancel(message, from_service)
         else:
             logger.warning("unknown rpc message kind %r", kind)
 
-    def _on_call(self, message: list[Any]) -> None:
+    def _reject_origin(self, reason: str, kind: str, from_service: int) -> None:
+        """F-40: every inbound rpc message must carry a validated origin.
+
+        The ZMQ ROUTER only forwards messages whose claimed ``from`` matched
+        the sender's socket identity (F-39), and the proxy stamps the original
+        sender into the ``@fwd`` envelope; ``from_service == 0`` therefore
+        means the message bypassed both (or a legacy peer) and is untrusted.
+        A spoofed RESULT used to resolve any pending future for a guessed
+        call_id with an attacker-chosen value.
+        """
+        self._metrics.rpc_origin_rejects.labels(reason=reason).inc()
+        logger.warning(
+            "rpc %s dropped: origin validation failed (%s, from_service=%d)",
+            kind,
+            reason,
+            from_service,
+        )
+
+    def _on_call(self, message: list[Any], from_service: int) -> None:
         # F-13: a malformed CALL must be dropped here, never unpacked -- a
         # ValueError from the tuple below used to tear the whole connection.
         if len(message) != 5:
             logger.warning("malformed rpc CALL arity %d (dropped)", len(message))
             return
-        _, call_id, from_service, func_path, args = message
+        _, call_id, from_service_claim, func_path, args = message
         if (
             not isinstance(call_id, int)
-            or not isinstance(from_service, int)
+            or not isinstance(from_service_claim, int)
             or not isinstance(func_path, str)
             or not isinstance(args, list)
         ):
             logger.warning("malformed rpc CALL field types (dropped)")
             return
+        if from_service == 0:
+            self._reject_origin("unknown", "CALL", from_service_claim)
+            return
+        if from_service_claim != from_service:
+            # The transport-validated origin wins over the body's claim;
+            # a mismatch means someone is lying about who they are.
+            logger.warning(
+                "rpc CALL claims from=%d but validated origin is %d; using the "
+                "validated origin for replies",
+                from_service_claim,
+                from_service,
+            )
+            from_service_claim = from_service
         task = asyncio.get_running_loop().create_task(
-            self._execute(call_id, from_service, func_path, args)
+            self._execute(call_id, from_service_claim, func_path, args)
         )
         # F-20: keep a strong reference + observe the outcome for EVERY task
         # (call_id 0 used to leave the task unreferenced -- GC could kill it
@@ -278,7 +311,7 @@ class RpcManager(Network):
         self._inbound.add(task)
         task.add_done_callback(self._inbound_done)
         if call_id:
-            self._running[call_id] = task
+            self._running[call_id] = (task, from_service_claim)
 
             def drop_running(_task: asyncio.Task[None], cid: int = call_id) -> None:
                 self._running.pop(cid, None)
@@ -349,7 +382,7 @@ class RpcManager(Network):
         finally:
             _current_caller.reset(caller_token)
 
-    def _on_result(self, message: list[Any]) -> None:
+    def _on_result(self, message: list[Any], from_service: int) -> None:
         if len(message) != 4:
             logger.warning("malformed rpc RESULT arity %d (dropped)", len(message))
             return
@@ -357,6 +390,15 @@ class RpcManager(Network):
         pending = self._pending.get(call_id)
         if pending is None:
             logger.debug("rpc result for unknown/expired call_id=%d", call_id)
+            return
+        # F-40: only the service the caller actually invoked may resolve its
+        # future. A result arriving via any other (or unknown) origin is an
+        # injection attempt -- drop it and let the caller's own timeout fire.
+        if from_service == 0:
+            self._reject_origin("unknown", "RESULT", from_service)
+            return
+        if from_service != pending.target:
+            self._reject_origin("mismatch", "RESULT", from_service)
             return
         pending.timer.cancel()
         self._pending.pop(call_id, None)
@@ -370,13 +412,26 @@ class RpcManager(Network):
         else:
             pending.future.set_exception(RpcRemoteError(pending.func, str(value)))
 
-    def _on_cancel(self, message: list[Any]) -> None:
+    def _on_cancel(self, message: list[Any], from_service: int) -> None:
         if len(message) != 3:
             logger.warning("malformed rpc CANCEL arity %d (dropped)", len(message))
             return
-        _, call_id, _from = message
-        task = self._running.get(call_id)
-        if task is not None and not task.done():
+        _, call_id, from_claim = message
+        # F-40: only the service that issued the CALL may cancel it -- a
+        # spoofed CANCEL is a cheap remote DoS against arbitrary running calls.
+        if from_service == 0 or from_claim != from_service:
+            self._reject_origin(
+                "unknown" if from_service == 0 else "mismatch", "CANCEL", from_service
+            )
+            return
+        entry = self._running.get(call_id)
+        if entry is None:
+            return
+        task, caller = entry
+        if caller != from_service:
+            self._reject_origin("mismatch", "CANCEL", from_service)
+            return
+        if not task.done():
             task.cancel()
 
     # ------------------------------------------------------------------ #

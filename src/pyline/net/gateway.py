@@ -46,8 +46,15 @@ class ProtocolGateway:
             logger.info("rebound handlers for %d network(s) in %s", count, module_name)
         return count
 
-    def dispatch(self, flag: str, payload: bytes) -> None:
+    def dispatch(self, flag: str, payload: bytes, from_service: int = 0) -> None:
         """Dispatch one inbound message.
+
+        ``from_service`` is the validated origin service number (F-39): the
+        ZMQ ROUTER only passes through values that matched the sender's
+        socket identity, and the proxy stamps the original sender into the
+        ``@fwd`` envelope. ``0`` means "origin unknown" -- transports that
+        cannot establish an origin (e.g. the untrusted client listener)
+        dispatch with 0 and trust each network to decide what it accepts.
 
         Unknown protocols are counted and dropped, never raised: a single bad
         flag must not be able to kill the dispatch path.
@@ -65,4 +72,4 @@ class ProtocolGateway:
                 self.unknown_dispatches,
             )
             return
-        network.handle_message(flag, payload)
+        network.handle_message(flag, payload, from_service)

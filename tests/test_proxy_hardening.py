@@ -130,3 +130,20 @@ async def test_proxy_reconnect_survives_immediate_close(config_dir, tmp_path) ->
     assert not task.done(), "reconnect task must survive immediate-close servers"
     task.cancel()
     await conn_mod.close_server(srv)
+
+
+class TestForwardEnvelopeF39:
+    def test_forward_envelope_carries_original_sender(self) -> None:
+        from pyline.net.proxy import build_forward, parse_forward
+
+        data = build_forward(10001, 20002, "game", b"payload", 3)
+        assert parse_forward(data) == (10001, 20002, "game", b"payload", 3)
+        assert isinstance(data, bytes)
+
+    def test_legacy_four_field_envelope_parses_as_unknown_origin(self) -> None:
+        import msgpack
+
+        from pyline.net.proxy import parse_forward
+
+        legacy = msgpack.packb([10001, "game", b"payload", 0], use_bin_type=True)
+        assert parse_forward(legacy) == (10001, 0, "game", b"payload", 0)

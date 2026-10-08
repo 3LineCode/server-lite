@@ -6,9 +6,12 @@ connection per configured proxy server (excluding itself); a proxy machine's
 main process additionally accepts connections from every other machine and
 forwards ``@fwd`` frames.
 
-``@fwd`` payload is ``msgpack([target_service, inner_flag, inner_payload,
-hops])``. The hop counter bounds forwarding loops (max 8) -- misconfigured
-proxy rings drop frames with an error instead of looping forever.
+``@fwd`` payload is ``msgpack([target_service, from_service, inner_flag,
+inner_payload, hops])``. ``from_service`` is the ORIGINAL sender (F-39) so the
+receiving side can validate RPC result origins; a legacy 4-field envelope
+without it parses with ``from=0`` (origin unknown). The hop counter bounds
+forwarding loops (max 8) -- misconfigured proxy rings drop frames with an
+error instead of looping forever.
 
 The proxy validates peers by IP allowlist (every configured ``advertise_ip``)
 plus the connection token handshake.
@@ -36,13 +39,27 @@ IDENT_FLAG = "@ident"
 MAX_HOPS = 8
 
 
-def build_forward(target: int, flag: str, payload: bytes, hops: int = 0) -> bytes:
-    return cast(bytes, msgpack.packb([target, flag, payload, hops], use_bin_type=True))
+def build_forward(
+    target: int, from_service: int, flag: str, payload: bytes, hops: int = 0
+) -> bytes:
+    return cast(
+        bytes, msgpack.packb([target, from_service, flag, payload, hops], use_bin_type=True)
+    )
 
 
-def parse_forward(data: bytes) -> tuple[int, str, bytes, int]:
-    target, flag, payload, hops = msgpack.unpackb(data, raw=False, strict_map_key=False)
-    return target, flag, payload, hops
+def parse_forward(data: bytes) -> tuple[int, int, str, bytes, int]:
+    """Return ``(target, from_service, flag, payload, hops)``.
+
+    Accepts the legacy 4-field form (no ``from_service``) for mixed-version
+    clusters; those parse with ``from_service=0`` = origin unknown, which the
+    RPC layer treats as untrusted (F-39/F-40).
+    """
+    fields = msgpack.unpackb(data, raw=False, strict_map_key=False)
+    if len(fields) == 4:
+        target, flag, payload, hops = fields
+        return target, 0, flag, payload, hops
+    target, from_service, flag, payload, hops = fields
+    return target, from_service, flag, payload, hops
 
 
 def inter_token(ctx: Context) -> str:
@@ -152,12 +169,12 @@ class ProxyServer:
 
     def _on_forward(self, payload: bytes) -> None:
         try:
-            target, inner_flag, inner_payload, hops = parse_forward(payload)
+            target, from_service, inner_flag, inner_payload, hops = parse_forward(payload)
         except (ValueError, msgpack.exceptions.ExtraData):
             logger.exception("malformed @fwd payload on proxy")
             return
         if main_service_no(target) == self._ctx.main_service_no:
-            self._router.route(inner_flag, inner_payload, target)
+            self._router.route(inner_flag, inner_payload, target, from_service=from_service)
             return
         if hops >= MAX_HOPS:
             logger.error("@fwd exceeded max hops (%d); dropping message to %d", hops, target)
@@ -168,14 +185,16 @@ class ProxyServer:
                 "proxy has no connection to machine %d (target=%d)", main_service_no(target), target
             )
             return
-        node.send_message(FWD_FLAG, build_forward(target, inner_flag, inner_payload, hops + 1))
+        node.send_message(
+            FWD_FLAG, build_forward(target, from_service, inner_flag, inner_payload, hops + 1)
+        )
 
-    def forward(self, target: int, flag: str, payload: bytes) -> bool:
+    def forward(self, target: int, from_service: int, flag: str, payload: bytes) -> bool:
         """Direct forwarding via this proxy's node table (local machine only)."""
         node = self._nodes.get(main_service_no(target))
         if node is None:
             return False
-        node.send_message(FWD_FLAG, build_forward(target, flag, payload, 1))
+        node.send_message(FWD_FLAG, build_forward(target, from_service, flag, payload, 1))
         return True
 
     async def close(self) -> None:
@@ -258,11 +277,11 @@ class ProxyClient:
         if flag != FWD_FLAG:
             return
         try:
-            target, inner_flag, inner_payload, _hops = parse_forward(payload)
+            target, from_service, inner_flag, inner_payload, _hops = parse_forward(payload)
         except (ValueError, msgpack.exceptions.ExtraData):
             logger.exception("malformed @fwd payload")
             return
-        self._router.route(inner_flag, inner_payload, target)
+        self._router.route(inner_flag, inner_payload, target, from_service=from_service)
 
     def send_to_service(self, target: int, flag: str, payload: bytes) -> None:
         """Send cross-server via any connected proxy; raises if none."""
@@ -275,7 +294,7 @@ class ProxyClient:
         proxy = self._proxies.get(main_service_no(target))
         if proxy is None:
             proxy = next(iter(self._proxies.values()))
-        proxy.send_message(FWD_FLAG, build_forward(target, flag, payload, 0))
+        proxy.send_message(FWD_FLAG, build_forward(target, self._ctx.service_no, flag, payload, 0))
 
     async def close(self) -> None:
         """Shut down the client: stop the maintain loops AND close every

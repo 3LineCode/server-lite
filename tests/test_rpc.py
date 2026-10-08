@@ -20,16 +20,37 @@ from pyline.net.rpc import (
 
 
 class LoopbackRouter:
-    """Delivers every send straight back into the local rpc manager."""
+    """Delivers every send straight back into the local rpc manager.
 
-    def __init__(self) -> None:
+    Models message origin faithfully (F-40): a CALL is dispatched as coming
+    from this service (the caller), a RESULT/CANCEL as coming from the service
+    the message was routed to (the callee that replied). ``spoof_from``
+    overrides the delivered origin to simulate injection attempts; set it to
+    ``0`` to simulate an unknown-origin delivery.
+    """
+
+    def __init__(self, own_service_no: int = 1) -> None:
         self.rpc: RpcManager | None = None
+        self.own_service_no = own_service_no
         self.sent: list[tuple[int, str, bytes]] = []
+        self.spoof_from: int | None = None
+        # the callee identity results claim to come from: the target of the
+        # most recent CALL this router delivered
+        self.last_call_target: int = own_service_no
 
     def route(self, flag: str, payload: bytes, target_service_no: int) -> None:
+        import msgpack
+
         self.sent.append((target_service_no, flag, payload))
         assert self.rpc is not None
-        self.rpc.handle_message(flag, payload)
+        kind = msgpack.unpackb(payload, raw=False)[0]
+        if kind == 1:
+            self.last_call_target = target_service_no
+        if self.spoof_from is not None:
+            origin = self.spoof_from
+        else:
+            origin = self.own_service_no if kind == 1 else self.last_call_target
+        self.rpc.handle_message(flag, payload, origin)
 
 
 @pytest.fixture()
@@ -135,11 +156,11 @@ class TestHardeningF13F14F18:
         import msgpack
 
         rpc, _ = loopback
-        rpc.handle_message("@rpc", msgpack.packb([1, 2]))  # CALL arity 2
-        rpc.handle_message("@rpc", msgpack.packb([2, 9]))  # RESULT arity 2
-        rpc.handle_message("@rpc", msgpack.packb([3]))  # CANCEL arity 1
-        rpc.handle_message("@rpc", msgpack.packb([1, "x", "y", "z", []]))  # bad types
-        rpc.handle_message("@rpc", msgpack.packb([9]))  # unknown kind
+        rpc.handle_message("@rpc", msgpack.packb([1, 2]), from_service=5)  # CALL arity 2
+        rpc.handle_message("@rpc", msgpack.packb([2, 9]), from_service=5)  # RESULT arity 2
+        rpc.handle_message("@rpc", msgpack.packb([3]), from_service=5)  # CANCEL arity 1
+        rpc.handle_message("@rpc", msgpack.packb([1, "x", "y", "z", []]), from_service=5)
+        rpc.handle_message("@rpc", msgpack.packb([9]), from_service=5)  # unknown kind
         assert rpc.pending_count() == 0  # nothing exploded, nothing leaked
 
     async def test_rpc_send_failure_cleans_pending(self, loopback) -> None:
@@ -273,3 +294,94 @@ class TestInflightLimitF19:
         assert await rpc.call(1, quick, timeout=10) == "quick"
         assert executed == [True]
         assert rpc.pending_count() == 0
+
+
+class TestOriginValidationF40:
+    async def test_result_from_wrong_origin_times_out(self, loopback) -> None:
+        """F-40: a result arriving from a service other than the called target
+        is an injection attempt -- dropped, the caller's own timeout fires."""
+        rpc, router = loopback
+
+        @rpc.expose
+        def echo(x: str) -> str:
+            return x
+
+        router.spoof_from = 99
+        with pytest.raises(RpcTimeoutError):
+            await rpc.call(1, echo, "hi", timeout=0.1)
+        assert rpc.pending_count() == 0
+
+    async def test_result_with_unknown_origin_times_out(self, loopback) -> None:
+        """F-40: from_service=0 (no validated origin) is untrusted."""
+        rpc, router = loopback
+
+        @rpc.expose
+        def echo(x: str) -> str:
+            return x
+
+        router.spoof_from = 0
+        with pytest.raises(RpcTimeoutError):
+            await rpc.call(1, echo, "hi", timeout=0.1)
+        assert rpc.pending_count() == 0
+
+    async def test_call_with_unknown_origin_dropped(self, loopback) -> None:
+        """F-40: a CALL without a validated origin never executes."""
+        import msgpack
+
+        rpc, router = loopback
+        executed: list[bool] = []
+        rpc.register("probe.f40", lambda: executed.append(True))
+        router.spoof_from = 0
+        rpc.handle_message("@rpc", msgpack.packb([1, 1, 1, "probe.f40", []]), from_service=0)
+        await asyncio.sleep(0.05)
+        assert executed == []
+
+    async def test_validated_origin_overrides_body_claim(self, loopback) -> None:
+        """F-40/F-39: when the transport-validated origin disagrees with the
+        body's ``from`` claim, the validated origin wins."""
+        from pyline.net.rpc import current_caller
+
+        rpc, router = loopback
+        seen: list[int] = []
+
+        @rpc.expose
+        async def who() -> int:
+            seen.append(current_caller())
+            router.spoof_from = None  # reply delivers with the honest origin
+            return 7
+
+        router.spoof_from = 42  # CALL arrives validated from 42, body claims 1
+        assert await rpc.call(1, who, timeout=5) == 7
+        assert seen == [42]
+
+    async def test_cancel_from_non_caller_ignored(self, loopback) -> None:
+        """F-40: a forged CANCEL from a service that did not issue the call
+        cannot kill the running task."""
+        import msgpack
+
+        rpc, _router = loopback
+        started = asyncio.Event()
+        state = {"cancelled": False}
+
+        @rpc.expose
+        async def hang() -> str:
+            started.set()
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                state["cancelled"] = True
+                raise
+            return "done"
+
+        task = asyncio.get_running_loop().create_task(rpc.call(1, hang, timeout=10))
+        await asyncio.wait_for(started.wait(), 1.0)
+        # forged CANCEL for call_id 1, claiming to be (and validated as) 99
+        rpc.handle_message("@rpc", msgpack.packb([3, 1, 99]), from_service=99)
+        await asyncio.sleep(0.05)
+        assert state["cancelled"] is False
+        # the genuine caller cancelling still works
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.05)
+        assert state["cancelled"] is True

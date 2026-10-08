@@ -79,8 +79,13 @@ class Network:
             raise ValueError(f"{type(self).__qualname__}: sub-protocol {sub} already registered")
         self._handlers[sub] = handler
 
-    def handle_message(self, flag: str, payload: bytes) -> None:
-        """Entry point from the gateway; schedule the matching handler."""
+    def handle_message(self, flag: str, payload: bytes, from_service: int = 0) -> None:
+        """Entry point from the gateway; schedule the matching handler.
+
+        ``from_service`` is the validated origin (F-39), 0 when the dispatch
+        path cannot establish one. Plain networks may ignore it; trust-sensitive
+        networks (see RpcManager) must not.
+        """
         try:
             sub, args = unpack_call(payload)
         except (ValueError, msgpack.exceptions.ExtraData):

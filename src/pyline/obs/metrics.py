@@ -48,6 +48,15 @@ class Metrics:
             f"{namespace}_ipc_dest_overflow_total",
             "ZMQ sends dropped: destination table at max_destinations",
         )
+        self.ipc_spoofed = Counter(
+            f"{namespace}_ipc_spoofed_total",
+            "ZMQ messages dropped: claimed from-service != actual sender identity",
+        )
+        self.rpc_origin_rejects = Counter(
+            f"{namespace}_rpc_origin_rejects_total",
+            "RPC messages dropped: result/call origin failed validation",
+            ("reason",),
+        )
         self.save_queue = Gauge(f"{namespace}_save_queue", "Pending auto-save entries")
         self.save_flushed = Counter(f"{namespace}_save_flushed_total", "Flushed save entries")
         self.save_failures = Counter(f"{namespace}_save_failures_total", "Failed save flushes")

@@ -63,6 +63,7 @@ from pyline.net import (
     ProxyServer,
     RpcManager,
     ZmqBus,
+    close_server,
     serve,
 )
 from pyline.obs import LoopLatencyMonitor
@@ -339,8 +340,8 @@ class ServerRuntime:
         if self.monitor is not None:
             await self.monitor.stop()
         if self._client_server is not None:
-            self._client_server.close()
-            await self._client_server.wait_closed()
+            await close_server(self._client_server)
+            self._client_server = None
         if self.proxy_server is not None:
             await self.proxy_server.close()
         if self.proxy_client is not None:

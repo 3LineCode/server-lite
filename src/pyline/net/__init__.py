@@ -3,6 +3,7 @@
 from pyline.net.connection import (
     Connection,
     ConnectionClosedError,
+    close_server,
     open_connection,
     serve,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "RpcTimeoutError",
     "RpcUnknownFunctionError",
     "ZmqBus",
+    "close_server",
     "encode_message",
     "main_service_no",
     "open_connection",

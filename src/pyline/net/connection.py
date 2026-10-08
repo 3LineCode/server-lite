@@ -18,6 +18,7 @@ prototype lacked.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections import deque
@@ -34,6 +35,7 @@ from pyline.net.protocol import (
 logger = logging.getLogger(__name__)
 
 AUTH_FLAG = "@auth"
+WELCOME_FLAG = "@welcome"
 PING_FLAG = "@ping"
 PONG_FLAG = "@pong"
 BYE_FLAG = "@bye"
@@ -87,21 +89,25 @@ class Connection:
         self._tasks: list[asyncio.Task[None]] = []
         self._dispatch_errors = 0
         self._error_times: deque[float] = deque()
+        self._write_failed = False
+        self._closing = False
 
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
 
     async def start(self) -> None:
-        if self.is_server_side:
-            loop = asyncio.get_running_loop()
-            self._tasks.append(loop.create_task(self._handshake_deadline()))
-        else:
-            self.verified = True
+        loop = asyncio.get_running_loop()
+        # Both sides enforce the deadline (F-17): a client that never hears
+        # @welcome must not hang forever either.
+        self._tasks.append(loop.create_task(self._handshake_deadline()))
+        if not self.is_server_side:
+            # verified stays False until the server's @welcome confirms the
+            # token was accepted (F-17; it used to be set unconditionally).
             self.send_message(AUTH_FLAG, self._token.encode("utf-8"))
-        self._tasks.append(asyncio.get_running_loop().create_task(self._read_loop()))
-        self._tasks.append(asyncio.get_running_loop().create_task(self._write_loop()))
-        self._tasks.append(asyncio.get_running_loop().create_task(self._idle_watch()))
+        self._tasks.append(loop.create_task(self._read_loop()))
+        self._tasks.append(loop.create_task(self._write_loop()))
+        self._tasks.append(loop.create_task(self._idle_watch()))
 
     async def _handshake_deadline(self) -> None:
         await asyncio.sleep(self._handshake_timeout)
@@ -127,8 +133,24 @@ class Connection:
 
     def _handle_frame(self, frame: Frame) -> bool:
         """Route one decoded frame; returns False to stop the read loop."""
-        if self.is_server_side and not self.verified:
-            if frame.flag == AUTH_FLAG and self._decode_text(frame.payload) == self._token:
+        if not self.verified:
+            if self.is_server_side:
+                if (
+                    frame.flag == AUTH_FLAG
+                    and self._decode_text(frame.payload) == self._token
+                ):
+                    self.verified = True
+                    self.send_message(WELCOME_FLAG, b"")
+                    if self._on_verified is not None:
+                        try:
+                            self._on_verified(self)
+                        except Exception:
+                            logger.exception("on_verified hook failed for %s", self)
+                    return True
+                logger.warning("rejecting unauthenticated frame %r from %s", frame.flag, self)
+                asyncio.get_running_loop().create_task(self.close("handshake rejected"))
+                return False
+            if frame.flag == WELCOME_FLAG:
                 self.verified = True
                 if self._on_verified is not None:
                     try:
@@ -136,15 +158,14 @@ class Connection:
                     except Exception:
                         logger.exception("on_verified hook failed for %s", self)
                 return True
-            logger.warning("rejecting unauthenticated frame %r from %s", frame.flag, self)
-            asyncio.get_running_loop().create_task(self.close("handshake rejected"))
-            return False
+            logger.warning("client ignoring pre-welcome frame %r from %s", frame.flag, self)
+            return True
         if frame.flag == PING_FLAG:
             self.send_message(PONG_FLAG, b"")
             return True
         if frame.flag == PONG_FLAG:
             return True
-        if frame.flag == AUTH_FLAG:
+        if frame.flag == AUTH_FLAG or frame.flag == WELCOME_FLAG:
             return True
         if frame.flag == BYE_FLAG:
             reason = self._decode_text(frame.payload)
@@ -188,8 +209,10 @@ class Connection:
         except asyncio.CancelledError:
             raise
         except ConnectionError:
+            self._write_failed = True
             await self.close("write error")
         except Exception:
+            self._write_failed = True
             logger.exception("write loop crashed for %s", self)
             await self.close("write error")
 
@@ -199,10 +222,15 @@ class Connection:
             await asyncio.sleep(ping_interval)
             if self.closed:
                 return
-            if time.monotonic() - self._last_recv > self._idle_timeout:
+            quiet_for = time.monotonic() - self._last_recv
+            if quiet_for > self._idle_timeout:
                 await self.close("idle timeout")
                 return
-            if not self.is_server_side:
+            if quiet_for >= ping_interval:
+                # Link has been quiet: probe from EITHER side (F-17) -- a
+                # server that never probed used to idle-kill third-party
+                # clients that only answer pings. Replies refresh _last_recv
+                # on both sides, so mutual probes do not loop.
                 self.send_message(PING_FLAG, b"")
 
     # ------------------------------------------------------------------ #
@@ -217,8 +245,8 @@ class Connection:
 
     def send_message(self, flag: str, payload: bytes) -> None:
         """Queue one message (non-blocking). Raises ConnectionClosedError if
-        the connection is closed or the peer consumes too slowly."""
-        if self.closed:
+        the connection is closed (or closing) or the peer consumes too slowly."""
+        if self.closed or self._closing:
             raise ConnectionClosedError(f"connection {self} closed ({self.close_reason})")
         frames = encode_message(flag, payload, chunk_size=self._chunk_size)
         try:
@@ -237,13 +265,31 @@ class Connection:
             return
         self._close_hooks.append(hook)
 
-    async def close(self, reason: str) -> None:
-        if self.closed:
+    async def close(self, reason: str, *, flush_timeout: float = 2.0) -> None:
+        """Close the connection, giving the writer a bounded chance to drain
+        queued frames first (F-17: graceful-close traffic like ``@bye`` used
+        to race the write-loop cancellation and could be lost).
+
+        Two-phase: ``_closing`` rejects new sends while the writer keeps
+        flushing; ``closed`` lands only once the queue drained (or the
+        deadline passed), then the transport is torn down.
+        """
+        if self.closed or self._closing:
             return
-        self.closed = True
+        self._closing = True
         self.close_reason = reason
+        if flush_timeout > 0 and not self._write_failed:
+            deadline = time.monotonic() + flush_timeout
+            while self._send_queue.qsize() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+        self.closed = True
         try:
             self._writer.close()
+            # wait_closed can block forever while the peer refuses to read
+            # (transport still flushing) -- bound it, then abort hard.
+            with contextlib.suppress(Exception, TimeoutError):
+                await asyncio.wait_for(self._writer.wait_closed(), timeout=flush_timeout)
+            self._writer.transport.abort()
         except Exception:
             logger.debug("error closing writer for %s", self, exc_info=True)
         for task in self._tasks:
@@ -312,3 +358,21 @@ async def serve(
         await conn.start()
 
     return await asyncio.start_server(handle, host, port)
+
+
+async def close_server(server: asyncio.AbstractServer, *, timeout: float = 5.0) -> None:
+    """Close a listening server and bounded-wait for it (F-17).
+
+    On 3.12 ``Server.wait_closed()`` can hang forever while client handler
+    tasks linger (3.13 adds close_clients/abort_clients for exactly this);
+    bound the wait and use the 3.13 helpers when available.
+    """
+    server.close()
+    if hasattr(server, "close_clients"):
+        server.close_clients()
+    try:
+        await asyncio.wait_for(server.wait_closed(), timeout)
+    except TimeoutError:
+        if hasattr(server, "abort_clients"):
+            server.abort_clients()
+        logger.warning("server wait_closed timed out after %.1fs; aborting clients", timeout)

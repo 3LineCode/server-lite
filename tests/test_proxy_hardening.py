@@ -61,8 +61,7 @@ class TestIdentValidation:
         client.send_message(IDENT_FLAG, (99999).to_bytes(4, "big"))
         await wait_closed(client)
         assert not nodes(server)
-        srv.close()
-        await srv.wait_closed()
+        await conn_mod.close_server(srv)
 
     async def test_ident_duplicate_claim_rejected(self, config_dir, tmp_path) -> None:
         """A second live connection claiming the same machine is refused."""
@@ -86,8 +85,7 @@ class TestIdentValidation:
         assert not first.closed, "the original registration survives"
         assert 10001 in nodes(server), "original registration kept"
         await first.close("done")
-        srv.close()
-        await srv.wait_closed()
+        await conn_mod.close_server(srv)
 
     def test_inter_token_falls_back(self, config_dir, tmp_path) -> None:
         ctx = make_ctx(config_dir, tmp_path, main=True, index=0, port=0)
@@ -122,5 +120,4 @@ async def test_proxy_reconnect_survives_immediate_close(config_dir, tmp_path) ->
     await asyncio.sleep(1.5)
     assert not task.done(), "reconnect task must survive immediate-close servers"
     task.cancel()
-    srv.close()
-    await srv.wait_closed()
+    await conn_mod.close_server(srv)

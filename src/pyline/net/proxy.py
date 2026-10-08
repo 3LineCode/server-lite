@@ -167,8 +167,8 @@ class ProxyServer:
 
     async def close(self) -> None:
         if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
+            await conn_mod.close_server(self._server)
+            self._server = None
 
 
 class ProxyClient:

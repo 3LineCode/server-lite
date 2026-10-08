@@ -1,0 +1,18 @@
+{
+    // Base templates (non-numeric keys) + servers (numeric keys).
+    // Every server MUST declare advertise_ip explicitly -- the framework
+    // never guesses its identity from network interfaces.
+    "normal": {
+        "sub_process": [],  // e.g. ["game", "db"] to split processes
+        "use_mysql": true,
+        "use_redis": true,
+    },
+
+    "10001": {
+        "base": "normal",
+        "name": "local-dev",
+        "advertise_ip": "127.0.0.1",
+        "client_port": 1520,
+        "server_port": 2520,
+    },
+}

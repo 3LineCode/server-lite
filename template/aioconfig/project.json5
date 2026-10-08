@@ -1,0 +1,50 @@
+{
+    // pyline project configuration (JSON5: comments allowed)
+    "project": "my-game",
+    "srv_type": "develop",  // develop | production
+
+    "log": {
+        "log_dir": ".aiolog",
+        "level": "INFO",
+        "retention_days": 7,
+        "rotation_mb": 64,
+    },
+
+    "socket": {
+        // Secret reference: $env:VAR | $file:key | $plain:dev-only
+        "token": "$env:PYLINE_TOKEN",
+        "bind_host": "0.0.0.0",
+        "client_port": 1520,
+        "server_port": 2520,
+        "max_frame_size": 16777216,
+        "send_queue_limit": 1024,
+        "handshake_timeout": 5.0,
+        "idle_timeout": 60.0,
+    },
+
+    "zeromq": {
+        "bind_host": "tcp://127.0.0.1:2918",
+        "bind_file": "/tmp/pyline.ipc",
+        "hwm": 10000,
+    },
+
+    "mysql": {
+        "isolation_level": "READ COMMITTED",
+        "host": "127.0.0.1",
+        "port": 3306,
+        "user": "game",
+        "password": "$env:PYLINE_MYSQL_PASSWORD",
+        "db_name": "my_game",
+        "charset": "utf8mb4",
+        "max_conn": 4,
+        "min_conn": 1,
+    },
+
+    "redis": {
+        "host": "127.0.0.1",
+        "port": 6379,
+        "password": "$env:PYLINE_REDIS_PASSWORD",
+        "db_index": 0,
+        "conn_cnt": 2,
+    },
+}

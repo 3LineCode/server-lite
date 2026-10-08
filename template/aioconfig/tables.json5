@@ -1,0 +1,17 @@
+{
+    "tbl_global": {
+        "comment": "global data",
+        "fields": {
+            "save_key": {"type": "VARCHAR(127)", "primary": true, "comment": "save key"},
+            "data": {"type": "MEDIUMBLOB", "comment": "payload"},
+        },
+    },
+    "tbl_player": {
+        "comment": "player data",
+        "fields": {
+            "id": {"type": "BIGINT", "primary": true, "comment": "player id"},
+            "base": {"type": "MEDIUMBLOB", "comment": "base info"},
+            "data": {"type": "MEDIUMBLOB", "comment": "player data"},
+        },
+    },
+}

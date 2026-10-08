@@ -106,6 +106,7 @@ class ServerRuntime:
         self.console: Console | None = None
         self.watcher: FileWatcher | None = None
         self._client_server: asyncio.AbstractServer | None = None
+        self._client_control_rejected = 0
         self._bg_tasks: set[asyncio.Task[object]] = set()
 
     # ------------------------------------------------------------------ #
@@ -246,7 +247,7 @@ class ServerRuntime:
             max_frame=self.ctx.settings.socket.max_frame_size,
             idle_timeout=self.ctx.settings.socket.idle_timeout,
             send_queue_limit=self.ctx.settings.socket.send_queue_limit,
-            on_message=lambda flag, payload: self.gateway.dispatch(flag, payload),
+            on_message=self._on_client_frame,
             on_connected=self._on_client_connected,
         )
         logger.info(
@@ -254,6 +255,20 @@ class ServerRuntime:
             entry.bind_host(),
             entry.client_listen_port(self.ctx.process_index),
         )
+
+    def _on_client_frame(self, flag: str, payload: bytes) -> None:
+        """Client-facing dispatch (F-16): the client network never reaches the
+        internal control surface -- ``@``-prefixed flags (@rpc/@fwd/...) are
+        reserved for inter-server links and rejected here."""
+        if flag.startswith("@"):
+            self._client_control_rejected += 1
+            logger.warning(
+                "client connection sent reserved flag %r (dropped, total=%d)",
+                flag,
+                self._client_control_rejected,
+            )
+            return
+        self.gateway.dispatch(flag, payload)
 
     def _on_client_connected(self, conn: Connection) -> None:
         self._spawn(self.bus.emit(ClientConnectedEvent(peer=conn.peer)))

@@ -44,6 +44,12 @@ def parse_forward(data: bytes) -> tuple[int, str, bytes, int]:
     return target, flag, payload, hops
 
 
+def inter_token(ctx: Context) -> str:
+    """Server-to-server token; falls back to the client token (F-16)."""
+    s = ctx.settings.socket
+    return s.inter_token if s.inter_token is not None else s.token
+
+
 class ProxyServer:
     """Accepts proxy connections on the proxy machine's main process."""
 
@@ -53,12 +59,15 @@ class ProxyServer:
         self._nodes: dict[int, conn_mod.Connection] = {}  # main service no -> conn
         self._server: asyncio.AbstractServer | None = None
 
+    def _inter_token(self) -> str:
+        return inter_token(self._ctx)
+
     async def start(self) -> None:
         entry = self._ctx.entry
         self._server = await conn_mod.serve(
             entry.bind_host(),
             entry.process_port(process_index=0),
-            token=self._ctx.settings.socket.token,
+            token=self._inter_token(),
             handshake_timeout=self._ctx.settings.socket.handshake_timeout,
             idle_timeout=self._ctx.settings.socket.idle_timeout,
             send_queue_limit=self._ctx.settings.socket.send_queue_limit,
@@ -79,16 +88,49 @@ class ProxyServer:
             lambda flag, payload: self._on_frame(connection, flag, payload)
         )
 
-    def _on_frame(self, connection: conn_mod.Connection, flag: str, payload: bytes) -> None:
-        if flag == IDENT_FLAG and len(payload) == 4:
-            machine = int.from_bytes(payload, "big")
-            self._nodes[machine] = connection
+    def _register_ident(self, connection: conn_mod.Connection, machine: int) -> None:
+        """Validate an IDENT claim (F-16): the machine must exist, its
+        advertised IP must match the peer, and no live connection may already
+        claim it (a duplicate claim is treated as hijacking)."""
+        try:
+            entry = self._ctx.registry.entry(machine)
+        except KeyError:
+            logger.warning("proxy IDENT for unknown machine %d from %s; closing", machine, connection)
+            asyncio.get_running_loop().create_task(connection.close("unknown machine"))
+            return
+        peer_ip = connection.peer[0]
+        if entry.advertise_ip != peer_ip and peer_ip not in ("127.0.0.1", "::1"):
+            logger.warning(
+                "proxy IDENT machine %d claims ip %s but connects from %s; closing",
+                machine,
+                entry.advertise_ip,
+                peer_ip,
+            )
+            asyncio.get_running_loop().create_task(connection.close("machine/ip mismatch"))
+            return
+        existing = self._nodes.get(machine)
+        if existing is not None and existing is not connection and not existing.closed:
+            logger.critical(
+                "proxy IDENT conflict: machine %d already registered by %s; "
+                "rejecting new claim from %s",
+                machine,
+                existing.peer,
+                connection.peer,
+            )
+            asyncio.get_running_loop().create_task(connection.close("duplicate machine claim"))
+            return
+        self._nodes[machine] = connection
 
-            def drop_node(_conn: conn_mod.Connection, m: int = machine) -> None:
+        def drop_node(_conn: conn_mod.Connection, m: int = machine) -> None:
+            if self._nodes.get(m) is _conn:
                 self._nodes.pop(m, None)
 
-            connection.add_close_hook(drop_node)
-            logger.info("proxy peer registered: machine %d (%s)", machine, connection.peer)
+        connection.add_close_hook(drop_node)
+        logger.info("proxy peer registered: machine %d (%s)", machine, connection.peer)
+
+    def _on_frame(self, connection: conn_mod.Connection, flag: str, payload: bytes) -> None:
+        if flag == IDENT_FLAG and len(payload) == 4:
+            self._register_ident(connection, int.from_bytes(payload, "big"))
             return
         if flag == FWD_FLAG:
             self._on_forward(payload)
@@ -159,30 +201,34 @@ class ProxyClient:
                 connection = await conn_mod.open_connection(
                     host,
                     port,
-                    token=self._ctx.settings.socket.token,
+                    token=inter_token(self._ctx),
                     handshake_timeout=self._ctx.settings.socket.handshake_timeout,
                     idle_timeout=self._ctx.settings.socket.idle_timeout,
                     send_queue_limit=self._ctx.settings.socket.send_queue_limit,
                     max_frame=self._ctx.settings.socket.max_frame_size,
                     on_message=self._on_frame,
                 )
-            except (TimeoutError, ConnectionError, OSError) as exc:
-                logger.info("proxy %d unreachable (%s); retrying in %.1fs", proxy_no, exc, backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
-                continue
-            backoff = 1.0
-            self._proxies[proxy_no] = connection
+                backoff = 1.0  # connected: reset the reconnect ladder
+                self._proxies[proxy_no] = connection
 
-            def drop_proxy(_conn: conn_mod.Connection, p: int = proxy_no) -> None:
-                self._proxies.pop(p, None)
+                def drop_proxy(_conn: conn_mod.Connection, p: int = proxy_no) -> None:
+                    self._proxies.pop(p, None)
 
-            connection.add_close_hook(drop_proxy)
-            connection.send_message(IDENT_FLAG, service_no_bytes(self._ctx.main_service_no))
-            logger.info("connected to proxy %d at %s:%d", proxy_no, host, port)
-            await self._wait_closed(connection)
-            logger.warning("proxy %d disconnected; reconnecting", proxy_no)
-            await asyncio.sleep(1.0)
+                connection.add_close_hook(drop_proxy)
+                # F-16: this send is inside the guard -- when the server closes
+                # the connection in the instant after handshake, the raised
+                # ConnectionClosedError used to kill the reconnect task and
+                # this proxy stayed offline forever.
+                connection.send_message(IDENT_FLAG, service_no_bytes(self._ctx.main_service_no))
+                logger.info("connected to proxy %d at %s:%d", proxy_no, host, port)
+                await self._wait_closed(connection)
+                logger.warning("proxy %d disconnected; reconnecting", proxy_no)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.info("proxy %d link error (%s); retrying in %.1fs", proxy_no, exc, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
 
     async def _wait_closed(self, connection: conn_mod.Connection) -> None:
         while not connection.closed:

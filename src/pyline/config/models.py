@@ -26,6 +26,9 @@ class LogSettings(_StrictModel):
 class SocketSettings(_StrictModel):
     # Secret reference ($env:/$file:/$plain:), resolved at load time.
     token: str
+    # Separate token for server-to-server/proxy links (F-16); falls back to
+    # ``token`` so existing single-token deployments keep working.
+    inter_token: str | None = None
     bind_host: str = "0.0.0.0"
     client_port: int = Field(ge=1, le=65535)
     server_port: int = Field(ge=1, le=65535)

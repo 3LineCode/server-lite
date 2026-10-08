@@ -37,6 +37,7 @@ import zmq.asyncio
 from pyline.config.models import ZeroMQSettings
 from pyline.core.context import SERVICE_NO_STRIDE, Context
 from pyline.net.gateway import ProtocolGateway
+from pyline.obs.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ class ZmqBus:
         self.recv_messages = 0
         self.unroutable_sends = 0
         self.dropped_sends = 0
+        self._metrics = get_metrics()
 
     async def start(self) -> None:
         if self._ctx.is_main_process:
@@ -130,6 +132,7 @@ class ZmqBus:
             queue.put_nowait(frames)
         except asyncio.QueueFull:
             self.dropped_sends += 1
+            self._metrics.ipc_dropped.inc()
             logger.warning(
                 "zmq send queue for %s full; dropping message (dropped=%d)",
                 "router" if peer == _ROUTER_PEER else peer,
@@ -144,6 +147,7 @@ class ZmqBus:
                 await self._socket.send_multipart(frames)
             except zmq.ZMQError:
                 self.unroutable_sends += 1
+                self._metrics.ipc_unroutable.inc()
                 logger.warning(
                     "zmq cannot route to peer %s (unroutable=%d)",
                     "router" if peer == _ROUTER_PEER else peer,

@@ -17,6 +17,7 @@ import asyncio
 import contextvars
 import itertools
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -24,6 +25,7 @@ from typing import Any, Protocol
 import msgpack
 
 from pyline.net.network import Network
+from pyline.obs.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,7 @@ class _PendingCall:
     func: str
     future: asyncio.Future[Any]
     timer: asyncio.TimerHandle
+    started: float = 0.0
 
 
 class RpcManager(Network):
@@ -91,6 +94,7 @@ class RpcManager(Network):
         self._pending: dict[int, _PendingCall] = {}
         self._running: dict[int, asyncio.Task[None]] = {}
         self._call_seq = itertools.count(1)
+        self._metrics = get_metrics()
         self.timed_out_calls = 0
 
     # ------------------------------------------------------------------ #
@@ -156,6 +160,7 @@ class RpcManager(Network):
             func=func_path,
             future=future,
             timer=timer,
+            started=time.monotonic(),
         )
         try:
             self._sender.route(RPC_FLAG, call_body, target_service_no)
@@ -194,6 +199,7 @@ class RpcManager(Network):
         if pending is None or pending.future.done():
             return
         self.timed_out_calls += 1
+        self._metrics.rpc_timeouts.inc()
         pending.future.set_exception(
             RpcTimeoutError(f"rpc call {pending.func!r} -> service {pending.target} timed out")
         )
@@ -306,6 +312,7 @@ class RpcManager(Network):
         self._pending.pop(call_id, None)
         if pending.future.done():
             return
+        self._metrics.rpc_latency.observe(time.monotonic() - pending.started)
         if ok == 1:
             pending.future.set_result(value)
         elif ok == 2:

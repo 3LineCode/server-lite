@@ -89,6 +89,8 @@ class ProjectSettings(_StrictModel):
     zeromq: ZeroMQSettings = ZeroMQSettings()
     mysql: MySQLSettings
     redis: RedisSettings
+    # Prometheus export port on the MAIN process (F-28); null disables.
+    metrics_port: int | None = Field(default=9100, ge=1, le=65535)
 
 
 class TableFieldDef(_StrictModel):

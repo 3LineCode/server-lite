@@ -31,6 +31,7 @@ from pyline.net.protocol import (
     FrameDecoder,
     encode_message,
 )
+from pyline.obs.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,8 @@ class Connection:
         self._error_times: deque[float] = deque()
         self._write_failed = False
         self._closing = False
+        self._metrics = get_metrics()
+        self._metrics.connections.inc()
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -177,6 +180,7 @@ class Connection:
             self._on_message(frame.flag, frame.payload)
         except Exception:
             self._dispatch_errors += 1
+            self._metrics.dispatch_errors.inc()
             now = time.monotonic()
             self._error_times.append(now)
             while self._error_times and now - self._error_times[0] > DISPATCH_ERROR_WINDOW:
@@ -277,6 +281,7 @@ class Connection:
         if self.closed or self._closing:
             return
         self._closing = True
+        self._metrics.connections.dec()
         self.close_reason = reason
         if flush_timeout > 0 and not self._write_failed:
             deadline = time.monotonic() + flush_timeout

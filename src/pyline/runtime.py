@@ -68,6 +68,7 @@ from pyline.net import (
     serve,
 )
 from pyline.obs import LoopLatencyMonitor
+from pyline.obs.metrics import AlarmHub
 from pyline.reload.inplace import reload_module
 
 logger = logging.getLogger(__name__)
@@ -100,7 +101,10 @@ class ServerRuntime:
         self.db_service: DatabaseService | None = None
         self.mysql: MySQLPool | None = None
         self.redis: RedisClient | None = None
-        self.save_scheduler = SaveScheduler()
+        self.alarms = AlarmHub()
+        self.save_scheduler = SaveScheduler(
+            on_alarm=lambda kind, payload: self.alarms.emit(kind, payload)
+        )
         # Set False by teardown when the shutdown flush deadline passes with
         # dirty savers remaining; the process then exits non-zero (F-01).
         self.save_flush_ok = True
@@ -200,8 +204,12 @@ class ServerRuntime:
     async def _step_func_done(self) -> None:
         self.save_scheduler.start()
         self._expose_saver_factory()
-        self.monitor = LoopLatencyMonitor()
+        self.monitor = LoopLatencyMonitor(
+            on_alert=lambda delay: self.alarms.emit("loop_latency", {"delay": delay})
+        )
         self.monitor.start()
+        self.ctx.services["alarms"] = self.alarms
+        self._start_metrics_server()
         if self.ctx.is_develop:
             # Terminal console on the main process only (F-27): sub-processes
             # share one stdin and would fight over it.
@@ -218,6 +226,16 @@ class ServerRuntime:
             self.watcher = FileWatcher([Path.cwd()])
             self.watcher.start()
         await self.bus.emit(FuncDoneEvent())
+
+    def _start_metrics_server(self) -> None:
+        """Export Prometheus metrics on the main process (F-28)."""
+        port = self.ctx.settings.metrics_port
+        if port is None or not self.ctx.is_main_process:
+            return
+        from prometheus_client import start_http_server
+
+        start_http_server(port)
+        logger.info("prometheus metrics on :%d", port)
 
     def _expose_saver_factory(self) -> None:
         """Provide a configured DataSaver factory for business code."""

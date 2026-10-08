@@ -12,6 +12,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Callable
+from typing import Any
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -34,6 +35,15 @@ class Metrics:
             buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5),
         )
         self.rpc_timeouts = Counter(f"{namespace}_rpc_timeouts_total", "Timed-out RPC calls")
+        self.dispatch_errors = Counter(
+            f"{namespace}_dispatch_errors_total", "Handler exceptions during frame dispatch"
+        )
+        self.ipc_unroutable = Counter(
+            f"{namespace}_ipc_unroutable_total", "ZMQ sends to unroutable peers"
+        )
+        self.ipc_dropped = Counter(
+            f"{namespace}_ipc_dropped_total", "ZMQ messages dropped on full queues"
+        )
         self.save_queue = Gauge(f"{namespace}_save_queue", "Pending auto-save entries")
         self.save_flushed = Counter(f"{namespace}_save_flushed_total", "Flushed save entries")
         self.save_failures = Counter(f"{namespace}_save_failures_total", "Failed save flushes")
@@ -97,3 +107,38 @@ class LoopLatencyMonitor:
                     except Exception:
                         logger.exception("loop-latency alert callback failed")
             self.healthy = not blocked
+
+
+class AlarmHub:
+    """Central alarm fan-out (F-28): producers emit (kind, payload), ops
+    code subscribes -- the bridge between framework events and alerting."""
+
+    def __init__(self) -> None:
+        self._subs: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
+        self._all: list[Callable[[str, dict[str, Any]], None]] = []
+
+    def register(
+        self, kind: str, callback: Callable[[dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        self._subs.setdefault(kind, []).append(callback)
+        return lambda: self._unsubscribe(kind, callback)
+
+    def register_all(self, callback: Callable[[str, dict[str, Any]], None]) -> None:
+        self._all.append(callback)
+
+    def _unsubscribe(self, kind: str, callback: Callable[[dict[str, Any]], None]) -> None:
+        handlers = self._subs.get(kind)
+        if handlers and callback in handlers:
+            handlers.remove(callback)
+
+    def emit(self, kind: str, payload: dict[str, Any]) -> None:
+        for callback in self._subs.get(kind, []):
+            try:
+                callback(payload)
+            except Exception:
+                logger.exception("alarm callback failed (%s)", kind)
+        for catch_all in self._all:
+            try:
+                catch_all(kind, payload)
+            except Exception:
+                logger.exception("alarm callback failed (%s)", kind)

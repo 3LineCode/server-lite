@@ -12,6 +12,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+from pyline.obs.metrics import get_metrics  # noqa: E402
+
+_METRICS = get_metrics()
+
 _FUNC_ATTRS = (
     "__code__",
     "__defaults__",
@@ -71,9 +75,11 @@ def reload_module(module_name: str) -> types.ModuleType:
             after_digest[:10],
         )
         _run_module_hook(module, "__reload__")
+        _METRICS.reload_total.labels(result="ok").inc()
     except Exception:
         cache.recover()
         logger.exception("reload of %s failed; module state restored", module_name)
+        _METRICS.reload_total.labels(result="failed").inc()
         raise
     finally:
         _RELOADING.discard(module_name)

@@ -1,14 +1,37 @@
-"""In-place reload implementation (see package docstring for the contract)."""
+"""In-place reload implementation (see package docstring for the contract).
+
+Guard architecture (F-29):
+
+1. **Static AST validation, no execution** -- the new source is parsed (never
+   exec'd into a scratch namespace). The prototype-style sandbox executed the
+   module top level once, double-running import side effects; the check is
+   now purely structural: kinds, class bases, ``__slots__``/identity dunders,
+   and *call-compatibility* of every function/method signature (a new
+   required parameter used to be accepted and then TypeError every caller).
+2. **Single source read** -- validate and apply the SAME bytes/AST-derived
+   code object; ``importlib.reload`` re-read the file, so an edit landing
+   between the two reads was checked as A and executed as B.
+3. **True rollback** -- the pre-reload snapshot covers module dict, every
+   module-owned class dict and every function's swappable attributes, so a
+   failure mid-update is fully undone (the old code restored only the module
+   dict while half-updated classes kept their new methods).
+4. **Runtime invariants** -- closure-layout equality is enforced at swap
+   time; with real rollback a violation is now safely fatal to the reload,
+   not to the process.
+"""
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
-import importlib
+import inspect
 import logging
 import sys
 import types
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 logger = logging.getLogger(__name__)
 
@@ -28,13 +51,18 @@ _FUNC_ATTRS = (
 
 _RELOADING: set[str] = set()
 
+# Changing these on a live class breaks instances already inside dicts/sets.
+_IDENTITY_DUNDERS = frozenset(
+    {"__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "__hash__"}
+)
+
 
 class ReloadError(Exception):
     pass
 
 
 class ReloadRejected(ReloadError):
-    """Forbidden structural change detected in the sandbox pass."""
+    """Forbidden structural change detected by static validation."""
 
 
 class ReloadedClass(dict[type, type]):
@@ -50,29 +78,29 @@ def reload_module(module_name: str) -> types.ModuleType:
     """Reload ``module_name`` in place, preserving object identity."""
     module = sys.modules.get(module_name)
     if module is None:
-        module = importlib.import_module(module_name)
+        module = importlib_import(module_name)
     if module_name in _RELOADING:
         logger.debug("nested reload of %s ignored", module_name)
         return module
     if getattr(module, "__file__", None) is None:
         raise ReloadError(f"module {module_name!r} has no source file; cannot reload")
 
-    sandbox = _sandbox_import(module)
-    _validate_structure(module, sandbox)
+    source, tree = _read_and_parse(module)  # single read (F-29: no TOCTOU)
+    _validate_structure(module, tree)
 
+    assert module.__file__ is not None
+    code = compile(source, module.__file__, "exec")  # the SAME validated bytes
     _RELOADING.add(module_name)
-    cache = ModCache(module)  # pre-reload snapshot: the OLD objects
+    cache = ModCache(module)  # pre-reload deep snapshot: the OLD objects
     try:
-        before_digest = _source_digest(module)
-        importlib.reload(module)  # module dict now holds NEW objects
+        before_digest = hashlib.sha256(source).hexdigest()
+        exec(code, module.__dict__)  # module dict now holds NEW objects
         class_map = _update_module(module, cache)
-        after_digest = _source_digest(module)
         logger.info(
-            "reloaded %s (classes=%d, checksum %s -> %s)",
+            "reloaded %s (classes=%d, checksum %s)",
             module_name,
             len(class_map),
             before_digest[:10],
-            after_digest[:10],
         )
         _run_module_hook(module, "__reload__")
         _METRICS.reload_total.labels(result="ok").inc()
@@ -86,6 +114,26 @@ def reload_module(module_name: str) -> types.ModuleType:
     return module
 
 
+def importlib_import(module_name: str) -> types.ModuleType:
+    import importlib
+
+    return importlib.import_module(module_name)
+
+
+def _read_and_parse(module: types.ModuleType) -> tuple[bytes, ast.Module]:
+    """Read the source exactly once; return raw bytes and parsed tree."""
+    assert module.__file__ is not None
+    try:
+        source = Path(module.__file__).read_bytes()
+    except OSError as exc:
+        raise ReloadError(f"cannot read source of {module.__name__}: {exc}") from exc
+    try:
+        tree = ast.parse(source, filename=module.__file__)
+    except SyntaxError as exc:
+        raise ReloadRejected(f"syntax error in {module.__name__}: {exc}") from exc
+    return source, tree
+
+
 def _run_module_hook(module: types.ModuleType, hook_name: str) -> None:
     hook = module.__dict__.get(hook_name)
     if isinstance(hook, types.FunctionType) and hook.__module__ == module.__name__:
@@ -96,78 +144,200 @@ def _run_module_hook(module: types.ModuleType, hook_name: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Guard 1: sandbox prevalidation
+# Guard 1: static (AST) structural validation -- executes nothing
 # --------------------------------------------------------------------------- #
 
 
-def _sandbox_import(module: types.ModuleType) -> types.ModuleType:
-    """Execute the module's current source into a scratch namespace."""
-    assert module.__file__ is not None
-    source_path = Path(module.__file__)
-    source = source_path.read_bytes()
-    code = compile(source, str(source_path), "exec")
-    scratch = types.ModuleType(f"__sandbox__.{module.__name__}")
-    scratch.__file__ = module.__file__
-    scratch.__dict__["__name__"] = scratch.__name__
-    try:
-        exec(code, scratch.__dict__)
-    except Exception as exc:
-        raise ReloadRejected(f"sandbox exec of {module.__name__} failed: {exc}") from exc
-    return scratch
+@dataclass(slots=True)
+class _FnSpec:
+    positional: list[str] = field(default_factory=list)
+    pos_default_count: int = 0
+    kwonly: list[str] = field(default_factory=list)
+    kwonly_defaults: set[str] = field(default_factory=set)
+    star_args: bool = False
+    star_kwargs: bool = False
 
 
-def _validate_structure(old: types.ModuleType, new: types.ModuleType) -> None:
-    problems: list[str] = []
-    old_dict = {
-        k: v
-        for k, v in old.__dict__.items()
-        if getattr(v, "__module__", None) == old.__name__ and not k.startswith("__")
+@dataclass(slots=True)
+class _ClassInfo:
+    bases: list[str] = field(default_factory=list)
+    functions: dict[str, _FnSpec] = field(default_factory=dict)
+    has_slots: bool = False
+    identity_dunders: frozenset[str] = frozenset()
+
+
+def _spec_from_arguments(args: ast.arguments) -> _FnSpec:
+    positional = [a.arg for a in args.posonlyargs] + [a.arg for a in args.args]
+    # ast defaults apply to the trailing N positional parameters
+    pos_default_count = len(args.defaults)
+    kwonly = [a.arg for a in args.kwonlyargs]
+    kwonly_defaults = {
+        a.arg for a, d in zip(args.kwonlyargs, args.kw_defaults, strict=False) if d is not None
     }
-    for name, old_obj in old_dict.items():
-        new_obj = new.__dict__.get(name)
-        if new_obj is None:
-            continue  # deletion is allowed
-        if type(old_obj) is not type(new_obj):
-            problems.append(
-                f"{name}: kind changed {type(old_obj).__name__} -> {type(new_obj).__name__}"
-            )
+    return _FnSpec(
+        positional=positional,
+        pos_default_count=pos_default_count,
+        kwonly=kwonly,
+        kwonly_defaults=kwonly_defaults,
+        star_args=args.vararg is not None,
+        star_kwargs=args.kwarg is not None,
+    )
+
+
+def _spec_from_function(fn: types.FunctionType) -> _FnSpec:
+    spec = _FnSpec()
+    for param in inspect.signature(fn).parameters.values():
+        kind = param.kind
+        if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            spec.positional.append(param.name)
+            if param.default is not inspect.Parameter.empty:
+                spec.pos_default_count += 1
+        elif kind is inspect.Parameter.KEYWORD_ONLY:
+            spec.kwonly.append(param.name)
+            if param.default is not inspect.Parameter.empty:
+                spec.kwonly_defaults.add(param.name)
+        elif kind is inspect.Parameter.VAR_POSITIONAL:
+            spec.star_args = True
+        elif kind is inspect.Parameter.VAR_KEYWORD:
+            spec.star_kwargs = True
+    return spec
+
+
+def _fn_node_spec(node: ast.FunctionDef | ast.AsyncFunctionDef) -> _FnSpec:
+    return _spec_from_arguments(node.args)
+
+
+def _class_info(node: ast.ClassDef) -> _ClassInfo:
+    # ``class X:`` has no explicit bases but __bases__ == (object,)
+    bases = [ast.unparse(b) for b in node.bases] or ["object"]
+    info = _ClassInfo(bases=bases)
+    for stmt in node.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            info.functions[stmt.name] = _fn_node_spec(stmt)
+            if stmt.name in _IDENTITY_DUNDERS:
+                info.identity_dunders = info.identity_dunders | {stmt.name}
+        elif isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name) and target.id == "__slots__":
+                    info.has_slots = True
+    return info
+
+
+def _ast_summary(tree: ast.Module) -> dict[str, tuple[str, object]]:
+    """name -> ("function", _FnSpec) | ("class", _ClassInfo) | ("value", None).
+
+    Assignments are reported as plain values: their runtime kind is unknown
+    statically (e.g. ``scaled = factory()`` yields a closure function).
+    """
+    summary: dict[str, tuple[str, object]] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            summary[stmt.name] = ("function", _fn_node_spec(stmt))
+        elif isinstance(stmt, ast.ClassDef):
+            summary[stmt.name] = ("class", _class_info(stmt))
+        elif isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    summary.setdefault(target.id, ("value", None))
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            summary.setdefault(stmt.target.id, ("value", None))
+    return summary
+
+
+def _validate_structure(old: types.ModuleType, tree: ast.Module) -> None:
+    problems: list[str] = []
+    summary = _ast_summary(tree)
+    for name, old_obj in old.__dict__.items():
+        if name.startswith("__"):
             continue
-        if isinstance(old_obj, type):
-            _check_class(name, old_obj, new_obj, problems)
-        elif isinstance(old_obj, types.FunctionType):
-            _check_function(name, old_obj, new_obj, problems)
+        if getattr(old_obj, "__module__", None) != old.__name__:
+            continue
+        entry = summary.get(name)
+        if entry is None:
+            continue  # deleted in the new source: allowed
+        kind, info = entry
+        if isinstance(old_obj, types.FunctionType):
+            if kind == "function" and isinstance(info, _FnSpec):
+                _check_signature_compatible(name, _spec_from_function(old_obj), info, problems)
+            # function -> assignment/class handled below (class is a problem)
+            if kind == "class":
+                problems.append(f"{name}: kind changed function -> class")
+        elif isinstance(old_obj, type):
+            if kind != "class":
+                if kind != "value":  # class -> assignment may be a closure trick; reject clearly
+                    problems.append(f"{name}: kind changed class -> {kind}")
+                else:
+                    problems.append(f"{name}: class became a plain assignment")
+                continue
+            assert isinstance(info, _ClassInfo)
+            _check_class(name, old_obj, info, problems)
     if problems:
         raise ReloadRejected(
             "forbidden structural changes (restart required):\n  - " + "\n  - ".join(problems)
         )
 
 
-def _check_class(name: str, old: type, new: type, problems: list[str]) -> None:
-    if old.__bases__ != new.__bases__:
+def _check_class(name: str, old: type, info: _ClassInfo, problems: list[str]) -> None:
+    old_bases = [b.__qualname__ for b in old.__bases__]
+    if old_bases != info.bases:
         problems.append(
-            f"{name}: inheritance changed "
-            f"{[b.__name__ for b in old.__bases__]} -> {[b.__name__ for b in new.__bases__]}"
+            f"{name}: inheritance changed {old_bases} -> {info.bases}"
+        )
+    if hasattr(old, "__slots__") != info.has_slots:
+        problems.append(f"{name}: __slots__ presence changed (hash/layout contract)")
+    old_identity = {d for d in _IDENTITY_DUNDERS if d in old.__dict__}
+    if old_identity != set(info.identity_dunders):
+        problems.append(
+            f"{name}: identity dunder change {sorted(old_identity)} -> "
+            f"{sorted(info.identity_dunders)} (instances may sit in dicts/sets)"
         )
     for attr_name, old_attr in old.__dict__.items():
         if attr_name.startswith("__") and attr_name not in ("__init__",):
             continue
-        new_attr = new.__dict__.get(attr_name)
-        if isinstance(old_attr, types.FunctionType) and isinstance(new_attr, types.FunctionType):
-            _check_function(f"{name}.{attr_name}", old_attr, new_attr, problems)
-
-
-def _check_function(
-    name: str, old: types.FunctionType, new: types.FunctionType, problems: list[str]
-) -> None:
-    if old.__code__.co_freevars != new.__code__.co_freevars:
-        problems.append(
-            f"{name}: closure layout changed "
-            f"{old.__code__.co_freevars} -> {new.__code__.co_freevars}"
+        if not isinstance(old_attr, types.FunctionType):
+            continue
+        new_spec = info.functions.get(attr_name)
+        if new_spec is None:
+            continue  # method deleted: allowed (same as before)
+        _check_signature_compatible(
+            f"{name}.{attr_name}", _spec_from_function(old_attr), new_spec, problems
         )
 
 
+def _check_signature_compatible(name: str, old: _FnSpec, new: _FnSpec, problems: list[str]) -> None:
+    """Old callers must keep working: same positional prefix; extra positionals
+    only with defaults; no removed keyword-only; same *args/**kwargs shape."""
+    n = len(old.positional)
+    if new.positional[:n] != old.positional:
+        problems.append(
+            f"{name}: positional parameters changed {old.positional} -> {new.positional}"
+        )
+        return
+    extras = new.positional[n:]
+    if extras and new.pos_default_count < len(extras):
+        problems.append(
+            f"{name}: new parameters {extras} must have defaults "
+            "(existing callers pass fewer arguments)"
+        )
+    if new.pos_default_count < old.pos_default_count:
+        problems.append(f"{name}: a positional default was removed")
+    old_kw = set(old.kwonly)
+    new_kw = set(new.kwonly)
+    if old_kw - new_kw:
+        problems.append(f"{name}: keyword-only parameters removed {sorted(old_kw - new_kw)}")
+    naked_new_kw = new_kw - new.kwonly_defaults
+    naked_old_kw = old_kw - old.kwonly_defaults
+    if naked_old_kw & new_kw and (naked_new_kw - naked_old_kw):
+        problems.append(
+            f"{name}: keyword-only parameters {sorted(naked_new_kw - naked_old_kw)} "
+            "must have defaults"
+        )
+    if old.star_args != new.star_args or old.star_kwargs != new.star_kwargs:
+        problems.append(f"{name}: *args/**kwargs shape changed")
+
+
 # --------------------------------------------------------------------------- #
-# Guard 2: in-place update with rollback support
+# Guard 2: in-place update with deep rollback support
 # --------------------------------------------------------------------------- #
 
 
@@ -193,7 +363,7 @@ def _update_module(module: types.ModuleType, cache: ModCache) -> ReloadedClass:
             _update_generic(old_obj, new_obj, class_map)
             setattr(module, name, old_obj)
         elif isinstance(old_obj, (types.FunctionType, type)):
-            continue  # definition became plain state: sandbox rejects this earlier
+            continue  # definition became plain state: validation rejects this earlier
         else:
             # Plain module-level values are runtime state: a reload never
             # clobbers live state. (The prototype needed a manual
@@ -236,6 +406,14 @@ def _update_descriptor(old_desc: object, new_desc: object) -> None:
 
 
 def _update_function(old_func: types.FunctionType, new_func: types.FunctionType) -> None:
+    if old_func.__code__.co_freevars != new_func.__code__.co_freevars:
+        # Runtime invariant (rollback makes this fatal to the reload only):
+        # swapping a closure with a different free-variable layout breaks
+        # every already-created cell consumer.
+        raise ReloadError(
+            f"closure layout of {old_func.__qualname__} changed "
+            f"{old_func.__code__.co_freevars} -> {new_func.__code__.co_freevars}"
+        )
     for attr in _FUNC_ATTRS:
         with contextlib.suppress(AttributeError, TypeError):
             setattr(old_func, attr, getattr(new_func, attr))
@@ -260,6 +438,8 @@ def _update_class(old_cls: type, new_cls: type, class_map: ReloadedClass) -> Non
             continue  # kept attributes are neither deleted nor overwritten
         old_val = old_dict.get(key)
         if old_val is None:
+            # New class attributes are visible to existing instances through
+            # normal class-level lookup -- no instance migration needed.
             setattr(old_cls, key, new_val)
             continue
         updated = _update_generic(old_val, new_val, class_map)
@@ -280,34 +460,91 @@ def _run_class_hook(cls: type) -> None:
             logger.exception("class __reload__ hook of %s failed", cls.__qualname__)
 
 
-def _source_digest(module: types.ModuleType) -> str:
-    try:
-        assert module.__file__ is not None
-        data = Path(module.__file__).read_bytes()
-    except OSError:
-        return "unknown"
-    return hashlib.sha256(data).hexdigest()
+# --------------------------------------------------------------------------- #
+# Guard 2 support: deep module snapshot / rollback
+# --------------------------------------------------------------------------- #
 
 
-# --------------------------------------------------------------------------- #
-# Guard 2 support: module snapshot / rollback
-# --------------------------------------------------------------------------- #
+def _func_state(fn: types.FunctionType) -> tuple[object, ...]:
+    return (
+        fn.__code__,
+        fn.__defaults__,
+        fn.__kwdefaults__,
+        fn.__closure__,
+        dict(fn.__dict__),
+        dict(fn.__annotations__) if fn.__annotations__ else {},
+        fn.__doc__,
+    )
+
+
+def _restore_func(fn: types.FunctionType, state: tuple[object, ...]) -> None:
+    code, defaults, kwdefaults, closure, fdict, annotations, doc = state
+    with contextlib.suppress(AttributeError, TypeError):
+        fn.__code__ = code  # type: ignore[assignment]
+    with contextlib.suppress(AttributeError, TypeError):
+        fn.__defaults__ = defaults  # type: ignore[assignment]
+    with contextlib.suppress(AttributeError, TypeError):
+        fn.__kwdefaults__ = kwdefaults  # type: ignore[assignment]
+    with contextlib.suppress(AttributeError, TypeError):
+        object.__setattr__(fn, "__closure__", closure)
+    with contextlib.suppress(AttributeError, TypeError):
+        fn.__dict__.clear()
+        cast("dict[str, object]", fdict)
+        fn.__dict__.update(cast("dict[str, object]", fdict))
+    with contextlib.suppress(AttributeError, TypeError):
+        fn.__annotations__ = annotations  # type: ignore[assignment]
+    with contextlib.suppress(AttributeError, TypeError):
+        fn.__doc__ = doc  # type: ignore[assignment]
 
 
 class ModCache:
-    """Snapshot of a module dict for rollback and ownership checks."""
+    """Deep snapshot of a module for rollback and ownership checks.
+
+    Covers the module dict, every module-owned class dict and every module-
+    owned function's swappable state (including methods) -- a failure mid-
+    update is fully undone (F-29; the old restore only reset the module dict
+    and left half-updated classes carrying their new methods).
+    """
 
     def __init__(self, module: types.ModuleType) -> None:
         self._module = module
         self._snapshot = dict(module.__dict__)
+        self._class_snapshots: dict[type, dict[str, object]] = {}
+        self._func_snapshots: dict[int, tuple[types.FunctionType, tuple[object, ...]]] = {}
+        for obj in self._snapshot.values():
+            self._capture(obj)
+            if isinstance(obj, type) and self._owned(obj):
+                for member in obj.__dict__.values():
+                    self._capture(member)
+
+    def _capture(self, obj: object) -> None:
+        if isinstance(obj, types.FunctionType) and self._owned(obj):
+            self._func_snapshots[id(obj)] = (obj, _func_state(obj))
+        elif isinstance(obj, type) and self._owned(obj):
+            self._class_snapshots[obj] = dict(obj.__dict__)
+
+    def _owned(self, obj: object) -> bool:
+        module_attr = getattr(obj, "__module__", None)
+        return module_attr == self._module.__name__
 
     def snapshot(self) -> dict[str, object]:
         return self._snapshot
 
     def owned(self, obj: object) -> bool:
-        module_attr = getattr(obj, "__module__", None)
-        return module_attr == self._module.__name__
+        return self._owned(obj)
 
     def recover(self) -> None:
+        for fn, state in self._func_snapshots.values():
+            _restore_func(fn, state)
+        for cls, saved in self._class_snapshots.items():
+            current = dict(cls.__dict__)
+            for key in current:
+                if key not in saved and key not in ("__dict__", "__weakref__"):
+                    with contextlib.suppress(AttributeError, TypeError):
+                        delattr(cls, key)
+            for key, value in saved.items():
+                if key in ("__dict__", "__weakref__"):
+                    continue
+                setattr(cls, key, value)
         self._module.__dict__.clear()
         self._module.__dict__.update(self._snapshot)

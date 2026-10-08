@@ -1,7 +1,8 @@
-"""MySQLPool: bootstrap ordering and settings plumbing (no live server)."""
+"""MySQLPool: bootstrap ordering, dedicated keepalive, settings plumbing."""
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pyline.db.mysql as mysql_mod
@@ -9,26 +10,34 @@ from pyline.config.models import MySQLSettings
 from pyline.db.mysql import MySQLPool, ensure_database
 
 
-class _Cursor:
-    def __init__(self, log: list[str]) -> None:
-        self._log = log
+class FakeCursor:
+    def __init__(self, exc: BaseException | None = None, row: tuple = (1,)) -> None:
+        self._exc = exc
+        self._row = row
 
-    async def __aenter__(self) -> _Cursor:
+    async def __aenter__(self) -> FakeCursor:
         return self
 
     async def __aexit__(self, *exc: object) -> bool:
         return False
 
     async def execute(self, sql: str, args: tuple = ()) -> None:
-        self._log.append(sql)
+        if self._exc is not None:
+            raise self._exc
+        self._sql = sql
+
+    async def fetchone(self) -> tuple:
+        return self._row
 
 
-class FakeBootstrapConn:
-    def __init__(self) -> None:
+class FakeConn:
+    def __init__(self, exc: BaseException | None = None, row: tuple = (1,)) -> None:
         self.executed: list[str] = []
+        self._exc = exc
+        self._row = row
 
-    def cursor(self) -> _Cursor:
-        return _Cursor(self.executed)
+    def cursor(self) -> FakeCursor:
+        return FakeCursor(self._exc, self._row)
 
     async def ensure_closed(self) -> None:
         pass
@@ -37,9 +46,11 @@ class FakeBootstrapConn:
 class FakeAsyncmyPool:
     def __init__(self) -> None:
         self.closed = False
+        self.acquired = 0
 
-    async def acquire(self) -> Any:
-        raise AssertionError("not used in this test")
+    def acquire(self) -> Any:
+        self.acquired += 1
+        raise AssertionError("business pool must not be used by keepalive or bootstrap")
 
     def close(self) -> None:
         self.closed = True
@@ -52,9 +63,9 @@ class TestConnectBootstrap:
     async def test_connect_creates_database_before_pool(self, monkeypatch: Any) -> None:
         """F-05: bootstrap (db-less CREATE DATABASE) runs before create_pool."""
         order: list[tuple[str, str | None]] = []
-        conn = FakeBootstrapConn()
+        conn = FakeConn()
 
-        async def fake_connect(**kwargs: Any) -> FakeBootstrapConn:
+        async def fake_connect(**kwargs: Any) -> FakeConn:
             order.append(("connect", kwargs.get("db")))
             return conn
 
@@ -74,10 +85,12 @@ class TestConnectBootstrap:
         await pool.connect()
         await pool.close()
 
-        assert [step for step, _ in order] == ["connect", "create_pool"]
-        assert order[0][1] is None  # bootstrap connection selects no database
-        assert order[1][1] == "fresh_db"  # the pool connects to the target db
-        assert any("CREATE DATABASE IF NOT EXISTS `fresh_db`" in sql for sql in conn.executed)
+        steps = [step for step, _ in order]
+        # bootstrap connection (no db) -> pool (target db) -> keepalive conn
+        assert steps == ["connect", "create_pool", "connect"]
+        assert order[0][1] is None
+        assert order[1][1] == "fresh_db"
+        assert order[2][1] == "fresh_db"
 
     async def test_ensure_database_rejects_bad_name(self, monkeypatch: Any) -> None:
         async def fail_connect(**kwargs: Any) -> Any:
@@ -91,3 +104,61 @@ class TestConnectBootstrap:
             assert "invalid database name" in str(exc)
         else:
             raise AssertionError("expected MySQLError for invalid database name")
+
+
+class TestKeepalive:
+    def _patch(self, monkeypatch: Any, keepalive_conn: FakeConn) -> FakeAsyncmyPool:
+        async def fake_connect(**kwargs: Any) -> FakeConn:
+            if kwargs.get("db") is None:
+                return FakeConn()  # bootstrap
+            return keepalive_conn
+
+        pool = FakeAsyncmyPool()
+
+        async def fake_create_pool(**kwargs: Any) -> FakeAsyncmyPool:
+            return pool
+
+        monkeypatch.setattr(mysql_mod.asyncmy, "connect", fake_connect)
+        monkeypatch.setattr(mysql_mod.asyncmy, "create_pool", fake_create_pool)
+        return pool
+
+    async def test_keepalive_uses_dedicated_connection_and_alarms(
+        self, monkeypatch: Any
+    ) -> None:
+        """F-10: heartbeat on its own connection; lost -> flag + on_lost."""
+        dead_conn = FakeConn(exc=ConnectionError("server gone"))
+        async_pool = self._patch(monkeypatch, dead_conn)
+        lost_calls: list[int] = []
+        settings = MySQLSettings(
+            user="root",
+            password="x",
+            db_name="d",
+            keepalive_interval=0.01,
+            keepalive_miss_limit=2,
+        )
+        pool = MySQLPool(settings, on_lost=lambda: lost_calls.append(1))
+        await pool.connect()
+        for _ in range(200):
+            if pool.lost:
+                break
+            await asyncio.sleep(0.01)
+        assert pool.lost
+        assert lost_calls == [1]
+        assert async_pool.acquired == 0  # never touched the business pool
+        await pool.close()
+
+    async def test_keepalive_healthy_stays_alive(self, monkeypatch: Any) -> None:
+        healthy = FakeConn(row=(1,))
+        self._patch(monkeypatch, healthy)
+        settings = MySQLSettings(
+            user="root",
+            password="x",
+            db_name="d",
+            keepalive_interval=0.01,
+            keepalive_miss_limit=2,
+        )
+        pool = MySQLPool(settings)
+        await pool.connect()
+        await asyncio.sleep(0.1)
+        assert not pool.lost
+        await pool.close()

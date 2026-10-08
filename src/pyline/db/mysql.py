@@ -15,7 +15,8 @@ import asyncio
 import contextlib
 import logging
 import re
-from collections.abc import Sequence
+import weakref
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 import asyncmy
@@ -64,11 +65,21 @@ class MySQLLostError(MySQLError):
 
 
 class MySQLPool:
-    def __init__(self, settings: MySQLSettings) -> None:
+    def __init__(
+        self,
+        settings: MySQLSettings,
+        *,
+        on_lost: Callable[[], None] | None = None,
+    ) -> None:
         self._settings = settings
         self._pool: asyncmy.Pool | None = None
+        self._keepalive_conn: Any = None  # dedicated, outside the business pool
         self._keepalive_task: asyncio.Task[None] | None = None
-        self._configured_conns: set[int] = set()
+        # WeakSet keyed on the connection objects themselves: entries vanish
+        # when a pooled connection is GC'd, and id()-reuse cannot resurrect one.
+        self._configured_conns: Any = weakref.WeakSet()
+        self._on_lost = on_lost
+        self.lost = False
         self._closed = False
 
     @property
@@ -90,8 +101,20 @@ class MySQLPool:
             autocommit=True,
             connect_timeout=5,
         )
+        # F-10: heartbeat traffic never competes with business queries for
+        # pool slots -- the keepalive runs on its own connection.
+        self._keepalive_conn = await asyncmy.connect(
+            host=s.host,
+            port=s.port,
+            user=s.user,
+            password=s.password,
+            db=s.db_name,
+            charset=s.charset,
+            autocommit=True,
+        )
         logger.info("mysql connected: %s:%d/%s", s.host, s.port, s.db_name)
         self._keepalive_task = asyncio.get_running_loop().create_task(self._keepalive())
+        self._keepalive_task.add_done_callback(self._keepalive_done)
 
     async def execute(self, sql: str, args: Sequence[Any] = ()) -> int:
         """Run a statement; returns affected row count."""
@@ -114,42 +137,67 @@ class MySQLPool:
                 return cursor.rowcount
 
     async def _ensure_isolation(self, conn: Any) -> None:
-        conn_id = id(conn)
-        if conn_id in self._configured_conns:
+        if conn in self._configured_conns:
             return
         async with conn.cursor() as cursor:
             await cursor.execute(
                 f"SET SESSION TRANSACTION ISOLATION LEVEL {self._settings.isolation_level}"
             )
-        self._configured_conns.add(conn_id)
+        self._configured_conns.add(conn)
+
+    def _keepalive_done(self, task: asyncio.Task[None]) -> None:
+        """Surface keepalive termination (F-10): the exception was previously
+        raised into a task nobody awaited."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        self.lost = True
+        logger.critical("mysql keepalive ended: %r -- pool declared dead", exc)
+        if self._on_lost is not None:
+            try:
+                self._on_lost()
+            except Exception:
+                logger.exception("mysql on_lost callback failed")
 
     async def _keepalive(self) -> None:
         """Dedicated connection; misses are tolerated up to the configured limit."""
-        assert self._pool is not None
+        conn = self._keepalive_conn
         s = self._settings
         misses = 0
         while not self._closed:
             await asyncio.sleep(s.keepalive_interval)
+            healthy = False
             try:
-                async with self._pool.acquire() as conn, conn.cursor() as cursor:
+                async with conn.cursor() as cursor:
                     await cursor.execute("SELECT 1")
                     row = await cursor.fetchone()
-                if row and row[0] == 1:
-                    misses = 0
-                    continue
+                healthy = bool(row) and row[0] == 1
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                misses += 1
-                logger.warning("mysql keepalive missed %d/%d", misses, s.keepalive_miss_limit)
-                if misses >= s.keepalive_miss_limit:
-                    logger.error("mysql keepalive exceeded miss limit; pool declared dead")
-                    raise MySQLLostError("mysql connection lost (keepalive)") from None
+                healthy = False
+            if healthy:
+                misses = 0
+                continue
+            misses += 1
+            logger.warning("mysql keepalive missed %d/%d", misses, s.keepalive_miss_limit)
+            if misses >= s.keepalive_miss_limit:
+                raise MySQLLostError("mysql connection lost (keepalive)")
 
     async def close(self) -> None:
         self._closed = True
         if self._keepalive_task is not None:
             self._keepalive_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            # a finished keepalive task re-raises its MySQLLostError on await;
+            # the done-callback has already observed and logged it
+            with contextlib.suppress(asyncio.CancelledError, MySQLLostError):
                 await self._keepalive_task
+        if self._keepalive_conn is not None:
+            with contextlib.suppress(Exception):
+                await self._keepalive_conn.ensure_closed()
+            self._keepalive_conn = None
         if self._pool is not None:
             self._pool.close()
             await self._pool.wait_closed()

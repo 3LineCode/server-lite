@@ -41,6 +41,12 @@ _WIDTH_LESS_TYPES = frozenset(
     {"TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "YEAR"}
 )
 
+# TEXT/BLOB columns are always created nullable (see ColumnSpec.ddl()): MySQL
+# grants them no DEFAULT either, so the prototype semantics keep them loose.
+# Drift detection must expect exactly what ddl() emits, or every boot re-flags
+# tables this very code created (F-36).
+_BLOB_TYPES = frozenset({"MEDIUMTEXT", "MEDIUMBLOB"})
+
 
 class SchemaError(ValueError):
     pass
@@ -79,6 +85,19 @@ def check_default_literal(default: str) -> str:
     )
 
 
+def check_comment(comment: str) -> str:
+    """Validate a COMMENT payload; returns the escaped SQL text (F-37).
+
+    Single quotes are doubled on emit, but a backslash cannot be neutralized
+    the same way -- a trailing ``\\`` escapes the closing quote and shifts
+    the rest of the DDL -- so backslashes are rejected outright, mirroring
+    the backslash ban in :func:`check_default_literal`.
+    """
+    if "\\" in comment:
+        raise SchemaError(f"invalid COMMENT text: {comment!r} (backslashes are not allowed)")
+    return comment.replace(chr(39), chr(39) * 2)
+
+
 @dataclass(slots=True)
 class ColumnSpec:
     name: str
@@ -89,6 +108,15 @@ class ColumnSpec:
     nullable: bool = True
     default: str | None = None
     comment: str = ""
+
+    def expects_not_null(self) -> bool:
+        """Whether generated DDL emits NOT NULL for this column.
+
+        Drift detection compares against what ddl() actually creates, not the
+        raw config flag: TEXT/BLOB columns stay nullable regardless of
+        ``not_null`` (F-36).
+        """
+        return not self.nullable and self.data_type not in _BLOB_TYPES
 
     def ddl(self) -> str:
         check_identifier(self.name)
@@ -102,10 +130,10 @@ class ColumnSpec:
             part += " UNIQUE KEY"
         if self.default is not None:
             part += f" DEFAULT {check_default_literal(self.default)}"
-        if not self.nullable and self.data_type not in ("MEDIUMTEXT", "MEDIUMBLOB"):
+        if self.expects_not_null():
             part += " NOT NULL"
         if self.comment:
-            part += f" COMMENT '{self.comment.replace(chr(39), chr(39) * 2)}'"
+            part += f" COMMENT '{check_comment(self.comment)}'"
         return part
 
     def column_type(self) -> str:
@@ -271,10 +299,7 @@ class SchemaManager:
         for col in spec.columns.values():
             if col.name in present:
                 continue
-            statement = (
-                f"ALTER TABLE `{name}` ADD COLUMN {col.ddl()}, "
-                "ALGORITHM=INSTANT, LOCK=NONE"
-            )
+            statement = f"ALTER TABLE `{name}` ADD COLUMN {col.ddl()}, ALGORITHM=INSTANT, LOCK=NONE"
             logger.info("adding column %s.%s", name, col.name)
             await self._pool.execute(statement)
             self.alter_statements.append(statement)
@@ -294,8 +319,7 @@ class SchemaManager:
             live_type, live_nullable = actual[col.name]
             if live_type.lower() != col.column_type():
                 problems.append(
-                    f"{name}.{col.name}: type drift, declared {col.column_type()}, "
-                    f"live {live_type}"
+                    f"{name}.{col.name}: type drift, declared {col.column_type()}, live {live_type}"
                 )
             expected_nullable = "YES" if col.nullable else "NO"
             if live_nullable != expected_nullable:

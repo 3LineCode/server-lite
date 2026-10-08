@@ -29,7 +29,10 @@ class GameClock:
         self._offset = 0.0
         self._tz = zoneinfo.ZoneInfo(tz) if tz else None
 
-    def _local(self, ts: float) -> dt.datetime:
+    def local(self, ts: float) -> dt.datetime:
+        """Wall-clock datetime for a logical timestamp, honoring the clock's
+        pinned tz (host-local when unset). Boundary derivations must go
+        through this so they can never disagree with ``next_halfhour_after``."""
         if self._tz is not None:
             return dt.datetime.fromtimestamp(ts, self._tz)
         return dt.datetime.fromtimestamp(ts)
@@ -67,17 +70,17 @@ class GameClock:
 
     def month_no(self, timestamp: float | None = None) -> int:
         ts = self.now() if timestamp is None else timestamp
-        local = self._local(ts)
+        local = self.local(ts)
         base = self._epoch
         return (local.year - base.year) * 12 + (local.month - base.month)
 
     def hour(self, timestamp: float | None = None) -> int:
         ts = self.now() if timestamp is None else timestamp
-        return self._local(ts).hour
+        return self.local(ts).hour
 
     def next_halfhour_after(self, ts: float) -> float:
         """Timestamp of the first :00/:30 boundary STRICTLY after ``ts``."""
-        local = self._local(ts)
+        local = self.local(ts)
         minute = 30 if local.minute < 30 else 60
         nxt = local.replace(minute=0, second=0, microsecond=0) + dt.timedelta(minutes=minute)
         return nxt.timestamp()
@@ -85,4 +88,4 @@ class GameClock:
     def next_halfhour_boundary(self) -> tuple[float, int]:
         """Return ``(deadline, hour_at_deadline)`` for the next :00/:30 boundary."""
         deadline = self.next_halfhour_after(self.now())
-        return deadline, self._local(deadline).hour
+        return deadline, self.local(deadline).hour

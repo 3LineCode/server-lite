@@ -38,13 +38,16 @@ class _WheelEntry:
 
 
 class TimerHandle:
-    """Cancellation handle returned by every scheduling call."""
+    """Cancellation handle returned by every scheduling call; ``left()``
+    exposes the remaining seconds so callers can tell "almost due" from
+    "gone" (the prototype's ``left`` always returned 0)."""
 
-    __slots__ = ("_cancel_fn", "_cancelled")
+    __slots__ = ("_cancel_fn", "_cancelled", "_deadline")
 
-    def __init__(self, cancel_fn: Callable[[], None]) -> None:
+    def __init__(self, cancel_fn: Callable[[], None], deadline: float | None = None) -> None:
         self._cancelled = False
         self._cancel_fn = cancel_fn
+        self._deadline = deadline
 
     def cancel(self) -> None:
         if not self._cancelled:
@@ -54,6 +57,12 @@ class TimerHandle:
     @property
     def cancelled(self) -> bool:
         return self._cancelled
+
+    def left(self) -> float:
+        """Seconds until the scheduled deadline (0.0 when unknown/past)."""
+        if self._deadline is None:
+            return 0.0
+        return max(0.0, self._deadline - time.monotonic())
 
 
 class Scheduler:
@@ -96,16 +105,24 @@ class Scheduler:
         delay = max(0.0, delay)
         deadline = time.monotonic() + delay
         if delay <= SHORT_DELAY:
-            return self._call_later(delay, func, args, label)
+            return self._call_later(delay, func, args, label, deadline)
         return self._schedule_wheel(deadline, func, args, label)
 
     def call_repeating(
         self, interval: float, func: Callable[..., object], *args: object, label: str = ""
     ) -> TimerHandle:
-        """Repeat ``func`` every ``interval`` seconds until cancelled."""
+        """Repeat ``func`` every ``interval`` seconds until cancelled.
+
+        Re-arms from the ORIGINAL deadline grid, not the actual fire time:
+        a slow callback or a busy loop must not accumulate drift. Missed
+        ticks (pause longer than one interval) are skipped, never replayed.
+        """
         if interval <= 0:
             raise ValueError(f"repeating interval must be > 0, got {interval}")
+        if self._closed:
+            raise RuntimeError("scheduler is closed")
         stopped = {"v": False}
+        state = {"next_deadline": time.monotonic() + interval}
 
         def run_once() -> None:
             if stopped["v"]:
@@ -114,11 +131,17 @@ class Scheduler:
                 func(*args)
             except Exception:
                 logger.exception("repeating timer %r failed", label or func)
-            if not stopped["v"]:
-                self.call_after(interval, run_once, label=label)
+            if stopped["v"]:
+                return
+            state["next_deadline"] += interval
+            now = time.monotonic()
+            if state["next_deadline"] <= now:
+                missed = math.ceil((now - state["next_deadline"]) / interval)
+                state["next_deadline"] += missed * interval
+            self.call_after(state["next_deadline"] - now, run_once, label=label)
 
         self.call_after(interval, run_once, label=label)
-        return TimerHandle(lambda: stopped.__setitem__("v", True))
+        return TimerHandle(lambda: stopped.__setitem__("v", True), state["next_deadline"])
 
     def soon(self, func: Callable[..., object], *args: object) -> None:
         self.loop.call_soon(func, *args)
@@ -139,6 +162,10 @@ class Scheduler:
         self._short_timers.clear()
         self._wheel.clear()
         self._entries.clear()
+        # A closed scheduler must not leave coroutine callbacks running
+        # against services that teardown closes next (mysql/zmq handles).
+        for task in self._async_tasks:
+            task.cancel()
         self._async_tasks.clear()
 
     # ------------------------------------------------------------------ #
@@ -151,6 +178,7 @@ class Scheduler:
         func: Callable[..., object],
         args: tuple[object, ...],
         label: str,
+        deadline: float,
     ) -> TimerHandle:
         holder: dict[str, asyncio.TimerHandle | None] = {"h": None}
 
@@ -168,7 +196,7 @@ class Scheduler:
             loop_timer.cancel()
             self._short_timers.discard(loop_timer)
 
-        return TimerHandle(cancel)
+        return TimerHandle(cancel, deadline)
 
     def _fire(self, func: Callable[..., object], args: tuple[object, ...], label: str) -> None:
         try:
@@ -209,7 +237,7 @@ class Scheduler:
         )
         self._wheel.setdefault(bucket, []).append(entry)
         self._entries[entry.seq] = entry
-        return TimerHandle(lambda: self._remove(entry))
+        return TimerHandle(lambda: self._remove(entry), deadline)
 
     def _remove(self, entry: _WheelEntry) -> None:
         if self._entries.pop(entry.seq, None) is not None:

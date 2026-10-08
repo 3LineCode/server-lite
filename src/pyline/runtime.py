@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import datetime as dt
 import importlib
 import logging
 import os
@@ -19,6 +18,7 @@ from typing import Any
 
 from pyline import api as pyline_api
 from pyline import log as pyline_log
+from pyline.config.errors import ConfigError
 from pyline.config.loader import (
     load_project_settings,
     load_server_registry,
@@ -41,6 +41,8 @@ from pyline.core.events import (
     NewMonthEvent,
     NewWeekEvent,
     NewYearEvent,
+    OnReloadEvent,
+    PreReloadEvent,
 )
 from pyline.core.lifecycle import LifecycleManager, LifecycleState
 from pyline.core.scheduler import Scheduler
@@ -87,7 +89,7 @@ class ServerRuntime:
         self.bus = EventBus()
         self.scheduler = Scheduler()
         self.clock = GameClock()
-        self.lifecycle = LifecycleManager()
+        self.lifecycle = LifecycleManager(step_timeout=ctx.settings.boot_step_timeout)
         self.gateway = ProtocolGateway()
         ctx.loop = asyncio.get_running_loop()
         ctx.scheduler = self.scheduler
@@ -110,6 +112,7 @@ class ServerRuntime:
         # Set False by teardown when the shutdown flush deadline passes with
         # dirty savers remaining; the process then exits non-zero (F-01).
         self.save_flush_ok = True
+        self._flush_completed = False
         self.shutdown_timeout = 90.0
         self.monitor: LoopLatencyMonitor | None = None
         self.console: Console | None = None
@@ -161,7 +164,15 @@ class ServerRuntime:
             self.router.attach_proxy_server(self.proxy_server)
         if self.ctx.is_main_process:
             await self.proxy_client.start()
-        self.rpc = RpcManager(self.gateway, self.router, own_service_no=self.ctx.service_no)
+        self.rpc = RpcManager(
+            self.gateway,
+            self.router,
+            own_service_no=self.ctx.service_no,
+            # Inbound CALL storm bound (F-19): authenticated peers must not
+            # stack unbounded execution tasks.
+            max_inflight=self.ctx.settings.socket.rpc_max_inflight,
+            inflight_wait=self.ctx.settings.socket.rpc_inflight_wait,
+        )
         self.ctx.services["rpc"] = self.rpc
         await self.bus.emit(FrameInitEvent())
 
@@ -178,7 +189,15 @@ class ServerRuntime:
     async def _connect_local_db(self) -> None:
         s = self.ctx.settings
         if self.ctx.entry.use_mysql:
-            self.mysql = MySQLPool(s.mysql)
+            self.mysql = MySQLPool(
+                s.mysql,
+                # Pool loss raises the mysql_lost alarm (recovery itself runs
+                # inside the pool); the hub is wired from __init__, so this
+                # works even though CONN_DB precedes FUNC_DONE.
+                on_lost=lambda: self.alarms.emit(
+                    "mysql_lost", {"host": s.mysql.host, "port": s.mysql.port}
+                ),
+            )
             await self.mysql.connect()
             schema = SchemaManager(self.mysql, self.ctx.tables, s.mysql.db_name)
             await schema.ensure_all()
@@ -211,8 +230,10 @@ class ServerRuntime:
         try:
             business = importlib.import_module(module_name)
         except ImportError as exc:
-            logger.info("business module %r not loaded (%s)", module_name, exc)
-            return
+            # A typo'd module used to boot a business-less server that looked
+            # perfectly healthy; a server without its handlers must fail boot.
+            logger.error("business module %r failed to import: %s", module_name, exc)
+            raise ConfigError(f"business module {module_name!r} failed to import: {exc}") from exc
         register = getattr(business, "register", None)
         if register is not None:
             register(self.bus)
@@ -297,6 +318,7 @@ class ServerRuntime:
             max_frame=self.ctx.settings.socket.max_frame_size,
             idle_timeout=self.ctx.settings.socket.idle_timeout,
             send_queue_limit=self.ctx.settings.socket.send_queue_limit,
+            send_queue_bytes=self.ctx.settings.socket.send_queue_bytes,
             on_message=self._on_client_frame,
             on_connected=self._on_client_connected,
         )
@@ -307,8 +329,15 @@ class ServerRuntime:
         )
 
     def _reload_and_rebind(self, module_name: str) -> None:
+        import sys
+
+        module = sys.modules.get(module_name)
+        if module is not None:
+            self._spawn(self.bus.emit(PreReloadEvent(module=module)))
         reload_module(module_name)
         self.gateway.rebind_module(module_name)
+        if module is not None:
+            self._spawn(self.bus.emit(OnReloadEvent(module=module)))
 
     def _on_client_frame(self, flag: str, payload: bytes) -> None:
         """Client-facing dispatch (F-16): the client network never reaches the
@@ -341,9 +370,7 @@ class ServerRuntime:
 
     def _start_clock_events(self) -> None:
         self._last_boundary = self.clock.now()
-        self._clock_channel = pyline_log.file_logger(
-            "clock", Path(self.ctx.settings.log.log_dir)
-        )
+        self._clock_channel = pyline_log.file_logger("clock", Path(self.ctx.settings.log.log_dir))
 
         def on_boundary() -> None:
             self._emit_clock_events()
@@ -371,12 +398,14 @@ class ServerRuntime:
         self._last_boundary = now_ts
 
     def _fire_boundary_events(self, ts: float) -> None:
-        local = dt.datetime.fromtimestamp(ts)
+        # Derive wall-clock fields through the clock itself so a pinned tz can
+        # never disagree with next_halfhour_after's boundary math.
+        local = self.clock.local(ts)
         events: list[object] = []
         if local.minute == 0:
             events.append(NewHourEvent(hour=local.hour))
             if local.hour == 0:
-                events.append(NewDayEvent(day=local.day))
+                events.append(NewDayEvent(day=self.clock.day_no(ts)))
                 if local.day == 1:
                     events.append(NewMonthEvent(month=local.month))
                     if local.month == 1:
@@ -415,7 +444,9 @@ class ServerRuntime:
 
         async def sequence() -> None:
             await guarded("func-quit", self.bus.emit(FuncQuitEvent(), reverse=True))
-            self.save_flush_ok = await self.save_scheduler.stop()
+            flush_ok = await self.save_scheduler.stop()
+            self._flush_completed = True
+            self.save_flush_ok = flush_ok
             if self.console is not None:
                 await guarded("console", self.console.stop())
             if self.watcher is not None:
@@ -440,6 +471,11 @@ class ServerRuntime:
         try:
             await asyncio.wait_for(sequence(), timeout=self.shutdown_timeout)
         except TimeoutError:
+            if not self._flush_completed:
+                # The deadline hit before the flush step finished (or started):
+                # dirty data may still be in memory, and the clean exit-0 path
+                # must not claim otherwise (F-01 extends to teardown timeouts).
+                self.save_flush_ok = False
             logger.critical(
                 "shutdown teardown exceeded %.0fs; continuing exit", self.shutdown_timeout
             )
@@ -559,25 +595,46 @@ def main(argv: list[str] | None = None) -> None:
         main_runtime: ServerRuntime | None = None
 
         async def on_child_died(process_type: str, exitcode: int | None) -> None:
-            if main_runtime is not None:
-                await main_runtime.shutdown(f"sub-process {process_type} died ({exitcode})")
+            if main_runtime is None:
+                # Unreachable today: the runtime is created before the watch
+                # starts. Keep the guard loud rather than silently ignoring.
+                logger.critical(
+                    "sub-process %s died (%s) before the main runtime was ready",
+                    process_type,
+                    exitcode,
+                )
+                return
+            await main_runtime.shutdown(f"sub-process {process_type} died ({exitcode})")
 
         async def main_proc() -> None:
             nonlocal main_runtime
-            supervisor.start_child_watch(on_child_died)
             ctx = build_context(config_dir, server_no, PROCESS_MAIN, 0, main_pid)
+            pyline_api.bind(ctx)
             pyline_log.setup_logging(
                 ctx.settings.log,
                 process_tag=PROCESS_MAIN,
                 run_dir=Path(ctx.settings.log.log_dir),
             )
-            main_runtime = ServerRuntime(ctx)
-            _install_signal_handlers(main_runtime)  # F-20: main process too
-            await main_runtime.boot()
-            while not main_runtime.lifecycle.in_quit():
-                await asyncio.sleep(0.5)
-            await supervisor.terminate_children()
-            if not main_runtime.save_flush_ok:
+            runtime = ServerRuntime(ctx)
+            main_runtime = runtime
+            _install_signal_handlers(runtime)  # F-20: main process too
+            # Watch only after the runtime exists: a child that died while the
+            # main process was still setting up must find a runtime to tear
+            # down, otherwise the main process would run on without it.
+            supervisor.start_child_watch(on_child_died)
+            try:
+                boot_task = asyncio.get_running_loop().create_task(runtime.boot())
+                try:
+                    await boot_task
+                    while not runtime.lifecycle.in_quit():
+                        await asyncio.sleep(0.5)
+                finally:
+                    if not runtime.lifecycle.in_quit():
+                        await runtime.shutdown("main loop exit")
+            finally:
+                # Children must die with the main process even when boot fails.
+                await supervisor.terminate_children()
+            if not runtime.save_flush_ok:
                 raise SystemExit(3)  # dirty data could not be flushed at shutdown
 
         asyncio.run(main_proc())

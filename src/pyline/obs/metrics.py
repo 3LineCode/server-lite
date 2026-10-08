@@ -44,6 +44,10 @@ class Metrics:
         self.ipc_dropped = Counter(
             f"{namespace}_ipc_dropped_total", "ZMQ messages dropped on full queues"
         )
+        self.ipc_dest_overflow = Counter(
+            f"{namespace}_ipc_dest_overflow_total",
+            "ZMQ sends dropped: destination table at max_destinations",
+        )
         self.save_queue = Gauge(f"{namespace}_save_queue", "Pending auto-save entries")
         self.save_flushed = Counter(f"{namespace}_save_flushed_total", "Flushed save entries")
         self.save_failures = Counter(f"{namespace}_save_failures_total", "Failed save flushes")
@@ -117,9 +121,7 @@ class AlarmHub:
         self._subs: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
         self._all: list[Callable[[str, dict[str, Any]], None]] = []
 
-    def register(
-        self, kind: str, callback: Callable[[dict[str, Any]], None]
-    ) -> Callable[[], None]:
+    def register(self, kind: str, callback: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
         self._subs.setdefault(kind, []).append(callback)
         return lambda: self._unsubscribe(kind, callback)
 

@@ -37,6 +37,9 @@ def resolve_secret(value: str, *, config_dir: Path | None = None) -> str:
     if kind == "$plain":
         # Empty $plain: means "explicitly no secret" (e.g. no-auth Redis),
         # matching the RedisSettings docs; all other kinds require a ref.
+        # Warn here -- the match below is unreachable for $plain and the
+        # docstring promises the warning is never skipped.
+        logger.warning("inline plaintext secret in use ($plain:) -- dev only!")
         return ref
     if not ref:
         raise ConfigError(f"malformed secret reference: {value!r}")
@@ -60,8 +63,5 @@ def resolve_secret(value: str, *, config_dir: Path | None = None) -> str:
             if ref not in data:
                 raise ConfigError(f"secrets file {secrets_path} has no key {ref!r}")
             return str(data[ref])
-        case "$plain":
-            logger.warning("inline plaintext secret in use ($plain:) -- dev only!")
-            return ref
         case _:
             raise ConfigError(f"unknown secret reference kind {kind!r} in {value!r}")

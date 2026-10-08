@@ -17,6 +17,7 @@ plus the connection token handshake.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import logging
 from typing import cast
@@ -45,9 +46,19 @@ def parse_forward(data: bytes) -> tuple[int, str, bytes, int]:
 
 
 def inter_token(ctx: Context) -> str:
-    """Server-to-server token; falls back to the client token (F-16)."""
+    """Server-to-server token; falls back to the client token (F-16).
+
+    The fallback keeps single-token deployments working but widens the blast
+    radius of a client-token leak to the inter-server plane -- warn so ops
+    can see it in the log instead of discovering it during an incident."""
     s = ctx.settings.socket
-    return s.inter_token if s.inter_token is not None else s.token
+    if s.inter_token is None:
+        logger.warning(
+            "socket.inter_token not set; server-to-server links reuse the CLIENT "
+            "token -- configure a separate $env: reference for production"
+        )
+        return s.token
+    return s.inter_token
 
 
 class ProxyServer:
@@ -95,7 +106,9 @@ class ProxyServer:
         try:
             entry = self._ctx.registry.entry(machine)
         except KeyError:
-            logger.warning("proxy IDENT for unknown machine %d from %s; closing", machine, connection)
+            logger.warning(
+                "proxy IDENT for unknown machine %d from %s; closing", machine, connection
+            )
             asyncio.get_running_loop().create_task(connection.close("unknown machine"))
             return
         peer_ip = connection.peer[0]
@@ -211,10 +224,10 @@ class ProxyClient:
                 backoff = 1.0  # connected: reset the reconnect ladder
                 self._proxies[proxy_no] = connection
 
-                def drop_proxy(_conn: conn_mod.Connection, p: int = proxy_no) -> None:
-                    self._proxies.pop(p, None)
+                def drop_hook(conn: conn_mod.Connection, p: int = proxy_no) -> None:
+                    self._drop_proxy(conn, p)
 
-                connection.add_close_hook(drop_proxy)
+                connection.add_close_hook(drop_hook)
                 # F-16: this send is inside the guard -- when the server closes
                 # the connection in the instant after handshake, the raised
                 # ConnectionClosedError used to kill the reconnect task and
@@ -229,6 +242,13 @@ class ProxyClient:
                 logger.info("proxy %d link error (%s); retrying in %.1fs", proxy_no, exc, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
+
+    def _drop_proxy(self, connection: conn_mod.Connection, proxy_no: int) -> None:
+        """Identity-checked deregistration (same pattern as ProxyServer's
+        drop_node): the close hook of a connection that was already replaced
+        by a reconnect must not evict its live replacement."""
+        if self._proxies.get(proxy_no) is connection:
+            self._proxies.pop(proxy_no, None)
 
     async def _wait_closed(self, connection: conn_mod.Connection) -> None:
         while not connection.closed:
@@ -258,8 +278,17 @@ class ProxyClient:
         proxy.send_message(FWD_FLAG, build_forward(target, flag, payload, 0))
 
     async def close(self) -> None:
+        """Shut down the client: stop the maintain loops AND close every
+        established proxy connection (cancelling the tasks alone used to leak
+        the sockets -- the connections only died on idle timeout)."""
         for task in self._tasks:
             task.cancel()
+        for task in self._tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        for connection in list(self._proxies.values()):
+            await connection.close("proxy client shutdown")
+        self._proxies.clear()
 
 
 __all__ = ["FWD_FLAG", "IDENT_FLAG", "MAX_HOPS", "ProxyClient", "ProxyServer"]

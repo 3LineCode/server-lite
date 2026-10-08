@@ -204,7 +204,8 @@ class TestHardeningF13F14F18:
         cancels = [
             msgpack.unpackb(p)
             for (_t, f, p) in router.sent
-            if f == "@rpc" and isinstance(msgpack.unpackb(p), list)
+            if f == "@rpc"
+            and isinstance(msgpack.unpackb(p), list)
             and msgpack.unpackb(p)[:1] == [3]
         ]
         assert cancels, "expected a MSG_CANCEL after timeout"
@@ -225,3 +226,50 @@ class TestHardeningF13F14F18:
         assert await rpc.call(7, who_calls) == 1
         assert seen == [1]
         assert current_caller() == 0  # reset after the call
+
+
+class TestInflightLimitF19:
+    async def test_busy_call_rejected_not_executed(self) -> None:
+        """F-19: with one execution slot, a CALL arriving while another still
+        runs waits ``inflight_wait`` and then gets a busy error -- the
+        function is never executed."""
+        router = LoopbackRouter()
+        rpc = RpcManager(
+            ProtocolGateway(),
+            router,
+            own_service_no=1,
+            max_inflight=1,
+            inflight_wait=0.1,
+        )
+        router.rpc = rpc
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        @rpc.expose
+        async def blocker() -> str:
+            started.set()
+            await release.wait()
+            return "done"
+
+        executed: list[bool] = []
+
+        @rpc.expose
+        async def quick() -> str:
+            executed.append(True)
+            return "quick"
+
+        first = asyncio.get_running_loop().create_task(rpc.call(1, blocker, timeout=10))
+        await asyncio.wait_for(started.wait(), 1.0)  # slot is now held
+
+        with pytest.raises(RpcRemoteError, match="busy"):
+            await rpc.call(1, quick, timeout=10)
+        assert executed == []  # rejected before execution
+        assert rpc.busy_rejects == 1
+
+        release.set()
+        assert await first == "done"
+        # the slot was released: subsequent calls execute normally again
+        assert await rpc.call(1, quick, timeout=10) == "quick"
+        assert executed == [True]
+        assert rpc.pending_count() == 0

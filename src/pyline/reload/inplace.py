@@ -37,8 +37,11 @@ logger = logging.getLogger(__name__)
 
 from pyline.obs.metrics import get_metrics  # noqa: E402
 
-_METRICS = get_metrics()
-
+# Swappable function state. ``__closure__`` is deliberately absent: it is a
+# read-only attribute (assignment silently fails), and closure-layout equality
+# is enforced separately at swap time, so old cells stay self-consistent with
+# the swapped code. Closure *captured values* are therefore preserved across
+# reloads, never updated (see docs/hot-reload.md).
 _FUNC_ATTRS = (
     "__code__",
     "__defaults__",
@@ -46,7 +49,6 @@ _FUNC_ATTRS = (
     "__annotations__",
     "__doc__",
     "__dict__",
-    "__closure__",
 )
 
 _RELOADING: set[str] = set()
@@ -103,11 +105,11 @@ def reload_module(module_name: str) -> types.ModuleType:
             before_digest[:10],
         )
         _run_module_hook(module, "__reload__")
-        _METRICS.reload_total.labels(result="ok").inc()
+        get_metrics().reload_total.labels(result="ok").inc()
     except Exception:
         cache.recover()
         logger.exception("reload of %s failed; module state restored", module_name)
-        _METRICS.reload_total.labels(result="failed").inc()
+        get_metrics().reload_total.labels(result="failed").inc()
         raise
     finally:
         _RELOADING.discard(module_name)
@@ -163,7 +165,38 @@ class _ClassInfo:
     bases: list[str] = field(default_factory=list)
     functions: dict[str, _FnSpec] = field(default_factory=dict)
     has_slots: bool = False
+    slot_names: frozenset[str] = frozenset()
+    slots_unresolved: bool = False
     identity_dunders: frozenset[str] = frozenset()
+
+
+def _base_name(expr: ast.expr) -> str:
+    """Comparable name for a base-class expression: ``list[int]`` and
+    ``module.Base`` must compare equal to their runtime ``__qualname__``
+    (``list`` / ``Base``), or every subscripted/dotted base is a false reject."""
+    if isinstance(expr, ast.Subscript):
+        expr = expr.value
+    if isinstance(expr, ast.Attribute):
+        return expr.attr
+    return ast.unparse(expr)
+
+
+def _slots_names(value: ast.expr) -> tuple[frozenset[str], bool]:
+    """Statically resolve a ``__slots__`` assignment value.
+
+    Returns ``(names, unresolved)``; ``unresolved`` is True for anything but a
+    string or a tuple/list of strings (the caller then rejects conservatively).
+    """
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return frozenset({value.value}), False
+    if isinstance(value, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for item in value.elts:
+            if not (isinstance(item, ast.Constant) and isinstance(item.value, str)):
+                return frozenset(), True
+            names.add(item.value)
+        return frozenset(names), False
+    return frozenset(), True
 
 
 def _spec_from_arguments(args: ast.arguments) -> _FnSpec:
@@ -209,7 +242,7 @@ def _fn_node_spec(node: ast.FunctionDef | ast.AsyncFunctionDef) -> _FnSpec:
 
 def _class_info(node: ast.ClassDef) -> _ClassInfo:
     # ``class X:`` has no explicit bases but __bases__ == (object,)
-    bases = [ast.unparse(b) for b in node.bases] or ["object"]
+    bases = [_base_name(b) for b in node.bases] or ["object"]
     info = _ClassInfo(bases=bases)
     for stmt in node.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -220,6 +253,11 @@ def _class_info(node: ast.ClassDef) -> _ClassInfo:
             for target in stmt.targets:
                 if isinstance(target, ast.Name) and target.id == "__slots__":
                     info.has_slots = True
+                    info.slot_names, info.slots_unresolved = _slots_names(stmt.value)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            if stmt.target.id == "__slots__" and stmt.value is not None:
+                info.has_slots = True
+                info.slot_names, info.slots_unresolved = _slots_names(stmt.value)
     return info
 
 
@@ -277,14 +315,45 @@ def _validate_structure(old: types.ModuleType, tree: ast.Module) -> None:
         )
 
 
+def _unwrap_method_function(attr: object) -> object:
+    """Descriptor-wrapped methods carry a swappable inner function; signature
+    compatibility must be validated on that inner function (the swap would
+    replace it, so the wrapper being opaque is no excuse to skip the check)."""
+    if isinstance(attr, (staticmethod, classmethod)):
+        return attr.__func__
+    if isinstance(attr, property):
+        return attr.fget
+    return attr
+
+
+def _runtime_slot_names(cls: type) -> frozenset[str]:
+    decl = cls.__dict__.get("__slots__", ())
+    if isinstance(decl, str):
+        return frozenset({decl})
+    return frozenset(s for s in decl if isinstance(s, str))
+
+
 def _check_class(name: str, old: type, info: _ClassInfo, problems: list[str]) -> None:
     old_bases = [b.__qualname__ for b in old.__bases__]
     if old_bases != info.bases:
-        problems.append(
-            f"{name}: inheritance changed {old_bases} -> {info.bases}"
-        )
-    if hasattr(old, "__slots__") != info.has_slots:
+        problems.append(f"{name}: inheritance changed {old_bases} -> {info.bases}")
+    # Own ``__slots__`` only: hasattr() would also see inherited slots and
+    # falsely reject every slot-less subclass of a slotted parent.
+    old_has_slots = "__slots__" in old.__dict__
+    if old_has_slots != info.has_slots:
         problems.append(f"{name}: __slots__ presence changed (hash/layout contract)")
+    elif old_has_slots:
+        if info.slots_unresolved:
+            problems.append(f"{name}: __slots__ cannot be statically resolved (restart required)")
+        else:
+            old_names = _runtime_slot_names(old)
+            if old_names != info.slot_names:
+                # Renaming a slot orphans the data still sitting in existing
+                # instances' old slot layout; presence alone never caught it.
+                problems.append(
+                    f"{name}: __slots__ layout changed {sorted(old_names)} -> "
+                    f"{sorted(info.slot_names)} (existing instances keep the old layout)"
+                )
     old_identity = {d for d in _IDENTITY_DUNDERS if d in old.__dict__}
     if old_identity != set(info.identity_dunders):
         problems.append(
@@ -294,19 +363,22 @@ def _check_class(name: str, old: type, info: _ClassInfo, problems: list[str]) ->
     for attr_name, old_attr in old.__dict__.items():
         if attr_name.startswith("__") and attr_name not in ("__init__",):
             continue
-        if not isinstance(old_attr, types.FunctionType):
+        old_fn = _unwrap_method_function(old_attr)
+        if not isinstance(old_fn, types.FunctionType):
             continue
         new_spec = info.functions.get(attr_name)
         if new_spec is None:
             continue  # method deleted: allowed (same as before)
         _check_signature_compatible(
-            f"{name}.{attr_name}", _spec_from_function(old_attr), new_spec, problems
+            f"{name}.{attr_name}", _spec_from_function(old_fn), new_spec, problems
         )
 
 
 def _check_signature_compatible(name: str, old: _FnSpec, new: _FnSpec, problems: list[str]) -> None:
     """Old callers must keep working: same positional prefix; extra positionals
-    only with defaults; no removed keyword-only; same *args/**kwargs shape."""
+    only with defaults; no removed keyword-only; no keyword-only that gains
+    "required" status (added without default, or its default removed); same
+    *args/**kwargs shape."""
     n = len(old.positional)
     if new.positional[:n] != old.positional:
         problems.append(
@@ -325,12 +397,12 @@ def _check_signature_compatible(name: str, old: _FnSpec, new: _FnSpec, problems:
     new_kw = set(new.kwonly)
     if old_kw - new_kw:
         problems.append(f"{name}: keyword-only parameters removed {sorted(old_kw - new_kw)}")
-    naked_new_kw = new_kw - new.kwonly_defaults
-    naked_old_kw = old_kw - old.kwonly_defaults
-    if naked_old_kw & new_kw and (naked_new_kw - naked_old_kw):
+    new_required = new_kw - new.kwonly_defaults
+    old_required = old_kw - old.kwonly_defaults
+    if new_required - old_required:
         problems.append(
-            f"{name}: keyword-only parameters {sorted(naked_new_kw - naked_old_kw)} "
-            "must have defaults"
+            f"{name}: keyword-only parameters {sorted(new_required - old_required)} "
+            "must have defaults (existing callers pass fewer arguments)"
         )
     if old.star_args != new.star_args or old.star_kwargs != new.star_kwargs:
         problems.append(f"{name}: *args/**kwargs shape changed")
@@ -421,7 +493,12 @@ def _update_function(old_func: types.FunctionType, new_func: types.FunctionType)
 
 def _update_class(old_cls: type, new_cls: type, class_map: ReloadedClass) -> None:
     class_map[old_cls] = new_cls
-    reload_keep = set(getattr(old_cls, "__reloadkeep__", ()))
+    raw_keep = getattr(old_cls, "__reloadkeep__", ())
+    # tuple/list form lists kept attribute names; a bare True (value-level
+    # marker) is also legal on classes that happen to be reload targets.
+    reload_keep: set[str] = (
+        set(raw_keep) if isinstance(raw_keep, (tuple, list, set, frozenset)) else set()
+    )
     old_dict = dict(old_cls.__dict__)
     new_dict = dict(new_cls.__dict__)
     for key in old_dict:
@@ -437,6 +514,8 @@ def _update_class(old_cls: type, new_cls: type, class_map: ReloadedClass) -> Non
         if key in reload_keep:
             continue  # kept attributes are neither deleted nor overwritten
         old_val = old_dict.get(key)
+        if old_val is not None and getattr(old_val, "__reloadkeep__", False):
+            continue  # value-level keep: the carried flag also blocks overwrite
         if old_val is None:
             # New class attributes are visible to existing instances through
             # normal class-level lookup -- no instance migration needed.
@@ -466,11 +545,13 @@ def _run_class_hook(cls: type) -> None:
 
 
 def _func_state(fn: types.FunctionType) -> tuple[object, ...]:
+    # ``__closure__`` is intentionally not captured: it is read-only on
+    # functions, and closure layout equality at swap time guarantees the old
+    # cells remain valid for the restored code.
     return (
         fn.__code__,
         fn.__defaults__,
         fn.__kwdefaults__,
-        fn.__closure__,
         dict(fn.__dict__),
         dict(fn.__annotations__) if fn.__annotations__ else {},
         fn.__doc__,
@@ -478,15 +559,13 @@ def _func_state(fn: types.FunctionType) -> tuple[object, ...]:
 
 
 def _restore_func(fn: types.FunctionType, state: tuple[object, ...]) -> None:
-    code, defaults, kwdefaults, closure, fdict, annotations, doc = state
+    code, defaults, kwdefaults, fdict, annotations, doc = state
     with contextlib.suppress(AttributeError, TypeError):
         fn.__code__ = code  # type: ignore[assignment]
     with contextlib.suppress(AttributeError, TypeError):
         fn.__defaults__ = defaults  # type: ignore[assignment]
     with contextlib.suppress(AttributeError, TypeError):
         fn.__kwdefaults__ = kwdefaults  # type: ignore[assignment]
-    with contextlib.suppress(AttributeError, TypeError):
-        object.__setattr__(fn, "__closure__", closure)
     with contextlib.suppress(AttributeError, TypeError):
         fn.__dict__.clear()
         cast("dict[str, object]", fdict)
@@ -522,6 +601,16 @@ class ModCache:
             self._func_snapshots[id(obj)] = (obj, _func_state(obj))
         elif isinstance(obj, type) and self._owned(obj):
             self._class_snapshots[obj] = dict(obj.__dict__)
+        elif isinstance(obj, (staticmethod, classmethod)):
+            # The swap replaces the descriptor's inner function; rollback must
+            # cover it or a failed reload leaves half-new static/class methods.
+            func = getattr(obj, "__func__", None)
+            if isinstance(func, types.FunctionType):
+                self._capture(func)
+        elif isinstance(obj, property):
+            for part in (obj.fget, obj.fset, obj.fdel):
+                if isinstance(part, types.FunctionType):
+                    self._capture(part)
 
     def _owned(self, obj: object) -> bool:
         module_attr = getattr(obj, "__module__", None)

@@ -3,11 +3,16 @@ aioinfo judgement family)."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
 from pyline import api
-from pyline.core.context import PROCESS_MAIN
+from pyline.core.context import PROCESS_MAIN, SERVICE_NO_STRIDE
+
+# Shutdown requests fired from business code must keep a strong reference
+# (a bare create_task can be garbage-collected before it runs).
+_pending: set[asyncio.Task[object]] = set()
 
 
 def service_no() -> int:
@@ -25,7 +30,9 @@ def service_name() -> str:
 def is_main_process(service: int | None = None) -> bool:
     if service is None:
         return api.ctx().process_type == PROCESS_MAIN
-    return service < 100_000
+    # Main processes have process_index 0 -> service_no below one stride;
+    # single source of truth with Context.service_no.
+    return service < SERVICE_NO_STRIDE
 
 
 def is_sub_process(service: int | None = None) -> bool:
@@ -62,13 +69,13 @@ def process_index_of(process_type: str) -> int:
 
 def shutdown(reason: str) -> None:
     """Request graceful shutdown (old StopAio); schedules asynchronously."""
-    import asyncio
-
     lifecycle = api.ctx().lifecycle
     if lifecycle is None:
         os.kill(os.getpid(), 15)
         return
-    asyncio.get_running_loop().create_task(lifecycle.request_shutdown(reason))
+    task = asyncio.get_running_loop().create_task(lifecycle.request_shutdown(reason))
+    _pending.add(task)
+    task.add_done_callback(_pending.discard)
 
 
 def kill(reason: str) -> None:

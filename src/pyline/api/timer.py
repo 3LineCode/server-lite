@@ -42,10 +42,13 @@ class TimerFacade:
         self._scheduler.soon(func, *args)
 
     def left(self, flag: str) -> float:
+        """Remaining seconds until the timer fires (0.0 when absent/fired).
+
+        The prototype contract: distinguish "almost due" from "not there"."""
         entry = self._entries.get(flag)
         if entry is None or entry.cancelled:
             return 0.0
-        return 0.0  # deadline introspection is not exposed by TimerHandle
+        return entry.left()
 
     def delete(self, flag: str) -> None:
         entry = self._entries.pop(flag, None)
@@ -61,10 +64,12 @@ _FACADE: TimerFacade | None = None
 
 def _timer() -> TimerFacade:
     global _FACADE
-    if _FACADE is None:
-        scheduler = api.ctx().scheduler
-        if scheduler is None:
-            raise RuntimeError("scheduler not bound to the context yet")
+    scheduler = api.ctx().scheduler
+    if scheduler is None:
+        raise RuntimeError("scheduler not bound to the context yet")
+    if _FACADE is None or _FACADE._scheduler is not scheduler:
+        # A re-bound context (tests, multi-runtime) must not keep firing the
+        # previous scheduler's timer grid.
         _FACADE = TimerFacade(scheduler)
     return _FACADE
 

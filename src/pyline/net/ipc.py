@@ -21,7 +21,9 @@ and one writer task, so (a) a slow DEALER whose HWM is full stalls only its
 own queue -- never the whole bus -- and (b) one writer per destination
 serializes sends, preserving per-destination FIFO order. Overflowing a
 queue drops the message and counts it (``dropped_sends``), mirroring ZMQ's
-own HWM semantics for fire-and-forget traffic.
+own HWM semantics for fire-and-forget traffic. New destinations beyond
+``max_destinations`` are refused the same way (``dest_overflow``) -- a rogue
+DEALER must not grow the ROUTER's queue table without bound.
 """
 
 from __future__ import annotations
@@ -56,7 +58,13 @@ def main_service_no(service_no: int) -> int:
 
 
 class ZmqBus:
-    def __init__(self, ctx: Context, gateway: ProtocolGateway) -> None:
+    def __init__(
+        self,
+        ctx: Context,
+        gateway: ProtocolGateway,
+        *,
+        max_destinations: int | None = None,
+    ) -> None:
         self._ctx = ctx
         self._gateway = gateway
         self._settings: ZeroMQSettings = ctx.settings.zeromq
@@ -66,10 +74,18 @@ class ZmqBus:
         # Per-destination outbound queues + their single writer tasks.
         self._peer_queues: dict[int, asyncio.Queue[list[bytes]]] = {}
         self._peer_tasks: dict[int, asyncio.Task[None]] = {}
+        # F-24: cap on tracked destinations. Any DEALER can name any ``target``
+        # value; without a cap each new one permanently allocated a queue plus
+        # a writer task (unbounded memory growth). ``None`` defers to the
+        # zeromq settings (which default to 256).
+        self._max_destinations = (
+            max_destinations if max_destinations is not None else self._settings.max_destinations
+        )
         self.sent_messages = 0
         self.recv_messages = 0
         self.unroutable_sends = 0
         self.dropped_sends = 0
+        self.dest_overflow = 0
         self._metrics = get_metrics()
 
     async def start(self) -> None:
@@ -123,6 +139,20 @@ class ZmqBus:
     def _enqueue(self, peer: int, frames: list[bytes]) -> None:
         queue = self._peer_queues.get(peer)
         if queue is None:
+            # F-24: never allocate a queue+writer for target values beyond the
+            # destination cap -- drop and count instead (mirrors the
+            # dropped_sends semantics for full queues).
+            if len(self._peer_queues) >= self._max_destinations:
+                self.dest_overflow += 1
+                self._metrics.ipc_dest_overflow.inc()
+                logger.warning(
+                    "zmq destination table full (%d peers); dropping message to %s "
+                    "(dest_overflow=%d)",
+                    self._max_destinations,
+                    "router" if peer == _ROUTER_PEER else peer,
+                    self.dest_overflow,
+                )
+                return
             queue = asyncio.Queue(maxsize=self._settings.queue_bound)
             self._peer_queues[peer] = queue
             self._peer_tasks[peer] = asyncio.get_running_loop().create_task(

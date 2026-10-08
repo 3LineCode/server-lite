@@ -52,6 +52,11 @@ class Network:
         self._gateway = gateway
         self._handlers: dict[int, Handler] = {}
         self._unknown_subs = 0
+        # F-20: strong references to in-flight handler tasks. A bare
+        # ``create_task`` result can be garbage-collected mid-run (a known
+        # CPython pitfall) and its exception is then never observed; the set
+        # plus done callback mirrors scheduler.py's ``_async_tasks`` pattern.
+        self._inbound: set[asyncio.Task[None]] = set()
         gateway.register(self)
 
     @property
@@ -92,7 +97,9 @@ class Network:
                 self._unknown_subs,
             )
             return
-        asyncio.get_running_loop().create_task(self._run_handler(handler, sub, args))
+        task = asyncio.get_running_loop().create_task(self._run_handler(handler, sub, args))
+        self._inbound.add(task)
+        task.add_done_callback(self._inbound_done)
 
     async def _run_handler(self, handler: Handler, sub: int, args: list[Any]) -> None:
         try:
@@ -103,3 +110,14 @@ class Network:
             logger.exception(
                 "handler %r (sub=%d) failed", getattr(handler, "__qualname__", handler), sub
             )
+
+    def _inbound_done(self, task: asyncio.Task[None]) -> None:
+        self._inbound.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("inbound handler task failed: %r", task)
+
+    def close(self) -> None:
+        """Cancel still-running inbound handler tasks (shutdown path, F-20)."""
+        for task in self._inbound:
+            task.cancel()
+        self._inbound.clear()

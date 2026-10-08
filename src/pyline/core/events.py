@@ -19,7 +19,6 @@ import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -82,6 +81,11 @@ class NewHourEvent:
 
 @dataclass(slots=True)
 class NewDayEvent:
+    """A new game day started (midnight boundary). ``day`` is the 1-based
+    game day number (same frozen base as ``GameClock.day_no``), NOT the
+    day-of-month -- the two coincide only within the first month of the
+    2024 epoch and confusing them corrupts persisted day-keyed data."""
+
     day: int
 
 
@@ -151,11 +155,16 @@ class EventBus:
         *,
         layer: int = LAYER_BUSINESS,
     ) -> Callable[[], None]:
-        """Register ``handler`` for ``event_type``; returns an unsubscribe fn."""
+        """Register ``handler`` for ``event_type``; returns an unsubscribe fn.
+
+        Re-subscribing the same handler is a no-op: a double registration
+        (e.g. a module re-running its register() hook) must not double-deliver."""
         if layer not in _VALID_LAYERS:
             raise ValueError(f"invalid layer {layer!r}")
-        self._handlers.setdefault((event_type, layer), []).append(handler)
-        self._mro_cache.clear()
+        handlers = self._handlers.setdefault((event_type, layer), [])
+        if handler not in handlers:
+            handlers.append(handler)
+            self._mro_cache.clear()
         return lambda: self._unsubscribe(event_type, layer, handler)
 
     def _unsubscribe(self, event_type: type, layer: int, handler: EventHandler) -> None:
@@ -207,8 +216,3 @@ class EventBus:
     def clear(self) -> None:
         self._handlers.clear()
         self._mro_cache.clear()
-
-
-def describe_event_file(path: Path) -> str:
-    """Human-readable helper used in diagnostics."""
-    return str(path)

@@ -233,6 +233,4 @@ class TestVersionedMigration:
         manager = SchemaManager(pool, {"tbl_player": make_def()}, "test_db")
         await manager.ensure_all()
         alters = [sql for sql, _ in pool.statements if sql.startswith("ALTER TABLE")]
-        assert alters and all(
-            sql.endswith("ALGORITHM=INSTANT, LOCK=NONE") for sql in alters
-        )
+        assert alters and all(sql.endswith("ALGORITHM=INSTANT, LOCK=NONE") for sql in alters)

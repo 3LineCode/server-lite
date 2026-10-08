@@ -17,9 +17,7 @@ class _Secret:
 class FakeMigratePool:
     """Returns canned rows per (table, column); records UPDATEs."""
 
-    def __init__(
-        self, rows: dict[tuple[str, str], list[tuple[object, bytes | None]]]
-    ) -> None:
+    def __init__(self, rows: dict[tuple[str, str], list[tuple[object, bytes | None]]]) -> None:
         self.rows = rows
         self.updates: list[tuple[str, tuple]] = []
 

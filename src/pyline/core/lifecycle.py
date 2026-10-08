@@ -69,12 +69,24 @@ class StartupStuckError(RuntimeError):
 
 
 class LifecycleManager:
-    """Owns the boot sequence, start gates and shutdown sequencing."""
+    """Owns the boot sequence, start gates and shutdown sequencing.
 
-    def __init__(self, *, startup_timeout: float = 300.0, quit_timeout: float = 30.0) -> None:
+    ``step_timeout`` bounds each boot step ACTION (the watchdog can only
+    observe a stalled sequence; without this a hung network connect parks
+    the process forever). ``None`` disables the bound.
+    """
+
+    def __init__(
+        self,
+        *,
+        startup_timeout: float = 300.0,
+        quit_timeout: float = 30.0,
+        step_timeout: float | None = None,
+    ) -> None:
         self.state = LifecycleState.PREPARE
         self._startup_timeout = startup_timeout
         self._quit_timeout = quit_timeout
+        self._step_timeout = step_timeout
         self._pending_waits: dict[str, float] = {}
         self._start_tasks: set[asyncio.Task[object]] = set()
         self._quit_tasks: set[asyncio.Task[object]] = set()
@@ -155,7 +167,18 @@ class LifecycleManager:
         self._last_advance = time.monotonic()
         action = self._step_actions.get(state)
         if action is not None:
-            await action()
+            if self._step_timeout is None:
+                await action()
+                return
+            try:
+                await asyncio.wait_for(action(), timeout=self._step_timeout)
+            except TimeoutError as exc:
+                # The watchdog only records a stall and run_boot can only see
+                # it BETWEEN steps; a hung action (e.g. a connect without its
+                # own timeout) needs a hard bound or the process parks forever.
+                raise StartupStuckError(
+                    f"boot step {state.name} exceeded {self._step_timeout:.0f}s"
+                ) from exc
 
     # ------------------------------------------------------------------ #
     # Start gates
@@ -211,7 +234,11 @@ class LifecycleManager:
         return task
 
     async def request_shutdown(self, reason: str) -> None:
-        """Begin graceful shutdown: run hooks and quit tasks under a deadline."""
+        """Begin graceful shutdown: run hooks and quit tasks under a deadline.
+
+        QUIT is the ONE transition allowed from any state (a half-booted
+        server must still be able to tear down); that is why it bypasses
+        ``_TRANSITIONS`` -- the table models the linear boot chain only."""
         if self._shutdown_requested:
             return
         self._shutdown_requested = True

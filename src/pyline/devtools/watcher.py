@@ -28,12 +28,16 @@ class FileWatcher:
         self._reload = reload_hook
         self._ignored = ignored_dirs or {".git", ".venv", "__pycache__", ".aiolog", "docs"}
         self._task: asyncio.Task[None] | None = None
+        self._stop_event = asyncio.Event()
 
     def start(self) -> None:
         if self._task is None:
             self._task = asyncio.get_running_loop().create_task(self._run())
 
     async def stop(self) -> None:
+        # Signal awatch's stop_event so the watch loop exits cleanly; the
+        # cancel below is belt-and-braces for a mid-callback stall.
+        self._stop_event.set()
         if self._task is not None:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -43,7 +47,7 @@ class FileWatcher:
     async def _run(self) -> None:
         async for changes in awatch(
             *[str(d) for d in self._dirs],
-            stop_event=asyncio.Event(),
+            stop_event=self._stop_event,
             debounce=300,
             step=200,
         ):
@@ -68,6 +72,10 @@ class FileWatcher:
 
     def _module_name(self, path: Path) -> str | None:
         abs_path = path.resolve()
+        # Longest matching sys.path entry wins: with shadowed paths (cwd plus
+        # a package root both on sys.path) the shortest prefix can map the
+        # file onto the wrong module name and trigger a surprise import.
+        best: tuple[int, list[str]] | None = None
         for base in (Path(p).resolve() for p in sys.path if p):
             try:
                 relative = abs_path.relative_to(base)
@@ -79,6 +87,10 @@ class FileWatcher:
             if parts[-1] == "__init__":
                 parts = parts[:-1]
             if not parts:
-                return None
-            return ".".join(parts)
-        return None
+                continue
+            depth = len(relative.parts)
+            if best is None or depth > best[0]:
+                best = (depth, parts)
+        if best is None:
+            return None
+        return ".".join(best[1])

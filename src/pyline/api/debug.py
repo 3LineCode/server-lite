@@ -3,8 +3,6 @@ RaiseError's local-variable dump, implemented WITHOUT global hooks)."""
 
 from __future__ import annotations
 
-import traceback
-
 _MAX_VALUE_LEN = 120
 
 
@@ -13,11 +11,6 @@ def _fmt_value(value: object) -> str:
     if len(text) > _MAX_VALUE_LEN:
         return f"{text[:_MAX_VALUE_LEN]}...[{len(text)} chars]"
     return text
-
-
-def _frame_locals(frame: traceback.FrameSummary) -> list[str]:
-    # FrameSummary has no locals; walk the real frames to match.
-    return []
 
 
 def format_exception(exc: BaseException) -> str:

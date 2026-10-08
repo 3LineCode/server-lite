@@ -319,3 +319,60 @@ class TestSaveScheduler:
         await scheduler.stop()  # shutdown path flushes everything
         assert scheduler.saved_total == 1
         assert ("tbl_player", 5) in db.rows
+
+    async def test_flush_all_does_not_starve_behind_failing_saver(self) -> None:
+        """F-33: a persistently failing saver used to keep its queue-head
+        position on every retry; the healthy saver behind it must still get
+        its shutdown flush inside the deadline."""
+        failing, healthy_key = "broken", "ok"
+        db = _SelectiveFailureDB(fail_for_key=failing)
+        scheduler = SaveScheduler(interval=60.0, shutdown_flush_timeout=0.5)
+        broken = DataSaver(db, make_schema(), "tbl_player", "data", failing, scheduler=scheduler)
+        good = DataSaver(db, make_schema(), "tbl_player", "data", healthy_key, scheduler=scheduler)
+        broken.set_data({"n": 1})  # enqueued first: owns the queue head
+        good.set_data({"n": 2})
+        assert await scheduler.stop() is False  # broken never flushes in time
+        assert ("tbl_player", healthy_key) in db.rows  # but good was flushed
+        assert ("tbl_player", failing) not in db.rows
+
+    async def test_flush_delete_race_no_resurrection(self) -> None:
+        """F-34: an upsert in flight when delete() runs used to land AFTER
+        the DELETE and resurrect the row; the flush lock serializes them."""
+        db = _SlowUpsertDB()
+        saver = DataSaver(db, make_schema(), "tbl_player", "data", 9)
+        saver.set_data({"gold": 5})
+        flush_task = asyncio.get_running_loop().create_task(saver.flush())
+        await asyncio.sleep(0.02)  # flush SQL is now in flight under the lock
+        await saver.delete()
+        await flush_task
+        key_stmts = [sql for sql, args in db.executed if args and args[0] == 9]
+        assert key_stmts[0].startswith("INSERT INTO")
+        assert key_stmts[-1].startswith("DELETE")  # no upsert after the DELETE
+        assert ("tbl_player", 9) not in db.rows  # row not resurrected
+
+
+class _SelectiveFailureDB(FakeDB):
+    """Fails every write for one key, succeeds for the rest."""
+
+    def __init__(self, fail_for_key: object) -> None:
+        super().__init__()
+        self._fail_key = fail_for_key
+
+    async def execute(self, sql: str, args: tuple = ()) -> int:
+        if args and args[0] == self._fail_key:
+            raise RuntimeError("write path broken for this row")
+        return await super().execute(sql, args)
+
+
+class _SlowUpsertDB(FakeDB):
+    """Upserts pause mid-flight; DELETEs actually remove the row."""
+
+    async def execute(self, sql: str, args: tuple = ()) -> int:
+        if sql.startswith("INSERT INTO"):
+            await asyncio.sleep(0.05)
+            return await super().execute(sql, args)
+        if sql.startswith("DELETE"):
+            self.executed.append((sql, args))
+            self.rows.pop(("tbl_player", args[0]), None)
+            return 1
+        return await super().execute(sql, args)

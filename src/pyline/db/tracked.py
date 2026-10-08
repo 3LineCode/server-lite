@@ -53,6 +53,15 @@ class TrackedDict[K, V](dict[K, V]):
         self._touch()
         return result
 
+    def __ior__(  # type: ignore[misc, override]
+        self, other: Mapping[K, V] | Iterable[tuple[K, V]]
+    ) -> TrackedDict[K, V]:
+        # dict.__ior__ bypasses update(); without this override ``d |= {...}``
+        # mutates without ever marking the owner dirty (silent data loss).
+        super().__ior__(other)
+        self._touch()
+        return self
+
 
 class TrackedList[V](list[V]):
     """A list that calls ``touch()`` on every mutation."""
@@ -107,5 +116,11 @@ class TrackedList[V](list[V]):
 
     def __iadd__(self, items: Iterable[V]) -> Any:  # type: ignore[misc,override]
         super().__iadd__(items)
+        self._changed()
+        return self
+
+    def __imul__(self, n: SupportsIndex) -> Any:
+        # list.__imul__ bypasses the tracked mutators; same class of bug as __ior__.
+        super().__imul__(n)
         self._changed()
         return self

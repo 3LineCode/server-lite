@@ -37,6 +37,16 @@ def test_corrupt_blob() -> None:
         peek_version(b"PLD1")
 
 
+def test_truncated_blob_raises_format_error() -> None:
+    """F-35: a truncated payload used to escape as a raw msgpack OutOfData
+    instead of the uniform BlobFormatError every caller expects."""
+    blob = dumps({"padding": "x" * 64})
+    with pytest.raises(BlobFormatError):
+        loads(blob[:-7])
+    with pytest.raises(BlobFormatError):
+        loads(blob[:6])  # cut at the header/payload boundary
+
+
 def test_migration_chain() -> None:
     # v1 payload -> v2 (add field) -> v3 (rename)
     migrations = {

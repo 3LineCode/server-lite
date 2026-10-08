@@ -51,7 +51,14 @@ def loads(blob: bytes | None) -> Any:
     _check_header(blob)
     try:
         return msgpack.unpackb(blob[HEADER_SIZE:], raw=False, strict_map_key=False)
-    except (ValueError, msgpack.exceptions.ExtraData) as exc:
+    except (
+        ValueError,
+        # F-35: msgpack's unpack failure hierarchy (OutOfData, StackError,
+        # ExtraData, ...) is rooted at UnpackException, not ValueError.  A
+        # truncated blob escaped as a raw OutOfData on the streaming path,
+        # so every unpack failure must funnel into BlobFormatError.
+        msgpack.exceptions.UnpackException,
+    ) as exc:
         raise BlobFormatError(f"corrupt blob: {exc}") from exc
 
 

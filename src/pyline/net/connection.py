@@ -5,20 +5,20 @@ Protocol names starting with ``@`` are reserved for connection control:
 
 * ``@auth``        -- first frame from the client, payload = token string.
 * ``@ping``/``@pong`` -- heartbeat probes (client probes, server answers).
-* ``@bye``         -- graceful close notice (payload = reason).
 
 Everything else is dispatched to the application ``on_message`` callback, but
 only after the server side has verified the handshake. One reader task owns
 the stream (handshake is enforced inside the read loop plus a deadline timer),
 one writer task drains a bounded send queue; when the peer stops reading and
-the queue fills up, the connection is closed -- slow-consumer protection the
-prototype lacked.
+the queue fills up -- by message count OR queued bytes -- the connection is
+closed -- slow-consumer protection the prototype lacked.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import logging
 import time
 from collections import deque
@@ -39,7 +39,6 @@ AUTH_FLAG = "@auth"
 WELCOME_FLAG = "@welcome"
 PING_FLAG = "@ping"
 PONG_FLAG = "@pong"
-BYE_FLAG = "@bye"
 
 MessageCallback = Callable[[str, bytes], None]
 
@@ -66,6 +65,7 @@ class Connection:
         send_queue_limit: int,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         max_frame: int = DEFAULT_MAX_FRAME,
+        send_queue_bytes: int = 64 * 1024 * 1024,
         is_server_side: bool,
         on_message: MessageCallback,
         on_verified: Callable[[Connection], None] | None = None,
@@ -78,6 +78,7 @@ class Connection:
         self._reader = reader
         self._writer = writer
         self._token = token
+        self._token_bytes = token.encode("utf-8")
         self._handshake_timeout = handshake_timeout
         self._idle_timeout = idle_timeout
         self._chunk_size = chunk_size
@@ -85,6 +86,13 @@ class Connection:
         self._on_verified = on_verified
         self._decoder = FrameDecoder(max_frame=max_frame)
         self._send_queue: asyncio.Queue[list[bytes]] = asyncio.Queue(send_queue_limit)
+        self._send_queue_bytes = send_queue_bytes
+        # F-21: bytes queued for the write loop. ``send_queue_limit`` counts
+        # messages only, so worst case ``limit * max_frame`` bytes (~16 GiB)
+        # could pile up before the count guard fired; this closes that hole.
+        # Incremented on enqueue, decremented once the write loop handed the
+        # frames to the transport (after drain returns).
+        self._queued_bytes = 0
         self._close_hooks: list[Callable[[Connection], None]] = []
         self._last_recv = time.monotonic()
         self._tasks: list[asyncio.Task[None]] = []
@@ -138,9 +146,11 @@ class Connection:
         """Route one decoded frame; returns False to stop the read loop."""
         if not self.verified:
             if self.is_server_side:
-                if (
-                    frame.flag == AUTH_FLAG
-                    and self._decode_text(frame.payload) == self._token
+                # F-22: constant-time token comparison. A plain ``==`` on the
+                # secret leaks a length/prefix timing channel; compare_digest
+                # on utf-8 bytes matches what the client sends byte for byte.
+                if frame.flag == AUTH_FLAG and hmac.compare_digest(
+                    frame.payload, self._token_bytes
                 ):
                     self.verified = True
                     self.send_message(WELCOME_FLAG, b"")
@@ -170,10 +180,6 @@ class Connection:
             return True
         if frame.flag == AUTH_FLAG or frame.flag == WELCOME_FLAG:
             return True
-        if frame.flag == BYE_FLAG:
-            reason = self._decode_text(frame.payload)
-            asyncio.get_running_loop().create_task(self.close(f"peer bye: {reason}"))
-            return False
         # F-13: dispatch isolation -- an application exception drops this one
         # frame; only a sustained storm of them takes the connection down.
         try:
@@ -210,6 +216,12 @@ class Connection:
                 for chunk in frames:
                     self._writer.write(chunk)
                 await self._writer.drain()
+                # F-21: the frames reached the transport -- release their
+                # bytes back to the budget. Bytes counted here (instead of at
+                # dequeue time) stay accounted while drain() is blocked on a
+                # peer that stopped reading, which is exactly the case the
+                # byte cap exists for.
+                self._queued_bytes -= sum(len(chunk) for chunk in frames)
         except asyncio.CancelledError:
             raise
         except ConnectionError:
@@ -249,15 +261,29 @@ class Connection:
 
     def send_message(self, flag: str, payload: bytes) -> None:
         """Queue one message (non-blocking). Raises ConnectionClosedError if
-        the connection is closed (or closing) or the peer consumes too slowly."""
+        the connection is closed (or closing) or the peer consumes too slowly
+        (send queue full by message count or queued bytes)."""
         if self.closed or self._closing:
             raise ConnectionClosedError(f"connection {self} closed ({self.close_reason})")
         frames = encode_message(flag, payload, chunk_size=self._chunk_size)
+        # F-21: budget check on the encoded wire size (frames include headers)
+        # before anything is queued -- the same close-and-raise path as the
+        # count-based limit below.
+        frame_bytes = sum(len(chunk) for chunk in frames)
+        if self._queued_bytes + frame_bytes > self._send_queue_bytes:
+            asyncio.get_running_loop().create_task(
+                self.close(f"send queue overflow (bytes > {self._send_queue_bytes})")
+            )
+            raise ConnectionClosedError(
+                f"send queue bytes exceeded for {self}; closing "
+                f"(queued={self._queued_bytes}, message={frame_bytes})"
+            ) from None
         try:
             self._send_queue.put_nowait(frames)
         except asyncio.QueueFull:
             asyncio.get_running_loop().create_task(self.close("send queue overflow"))
             raise ConnectionClosedError(f"send queue full for {self}; closing") from None
+        self._queued_bytes += frame_bytes
 
     # ------------------------------------------------------------------ #
     # Closing
@@ -271,8 +297,8 @@ class Connection:
 
     async def close(self, reason: str, *, flush_timeout: float = 2.0) -> None:
         """Close the connection, giving the writer a bounded chance to drain
-        queued frames first (F-17: graceful-close traffic like ``@bye`` used
-        to race the write-loop cancellation and could be lost).
+        queued frames first (F-17: graceful-close traffic used to race the
+        write-loop cancellation and could be lost).
 
         Two-phase: ``_closing`` rejects new sends while the writer keeps
         flushing; ``closed`` lands only once the queue drained (or the

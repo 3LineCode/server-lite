@@ -178,10 +178,13 @@ class SaveScheduler:
             except Exception:
                 self.failed_total += 1
                 self._metrics.save_failures.inc()
+                # F-33: delete-then-reinsert moves the saver to the tail.  A
+                # dict assignment on an existing key keeps its head position,
+                # so one persistently failing saver owned the queue head and
+                # starved every other dirty saver out of the whole deadline.
+                del self._dirty[saver]
                 self._dirty[saver] = failures + 1
-                logger.exception(
-                    "shutdown flush failed for %r (attempt %d)", saver, failures + 1
-                )
+                logger.exception("shutdown flush failed for %r (attempt %d)", saver, failures + 1)
                 if time.monotonic() >= deadline:
                     self._report_unflushed()
                     return False

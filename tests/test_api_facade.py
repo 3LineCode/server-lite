@@ -51,6 +51,17 @@ class TestFacade:
         assert fired == [2]  # old timer cancelled, only the new one ran
         assert api.timer.pending_flags() == []
 
+    async def test_timer_left_reports_remaining(self, bound_ctx) -> None:
+        # regression: left() used to return a constant 0.0
+        api.timer.call("later", 5.0, lambda: None)
+        api.timer.call("soon", 0.05, lambda: None)
+        remaining = api.timer.left("later")
+        assert 4.0 < remaining <= 5.0
+        assert 0.0 < api.timer.left("soon") <= 0.06  # 0.05 + float jitter
+        assert api.timer.left("missing") == 0.0
+        await asyncio.sleep(0.1)
+        assert api.timer.left("soon") == 0.0  # fired: self-removed
+
     async def test_unbound_facade_fails_loudly(self) -> None:
         api.unbind()
         with pytest.raises(api.ApiUnboundError, match=r"api\.bind"):
@@ -79,3 +90,19 @@ class TestTrackedContainers:
         items.remove(9)
         assert len(touches) == 5
         assert list(items) == [2, 3, 4]
+
+    def test_tracked_dict_ior_touches(self) -> None:
+        # regression: ``d |= {...}`` used to mutate via dict.__ior__ without touching
+        touches = []
+        data: TrackedDict[str, int] = TrackedDict({"a": 1}, touch=lambda: touches.append(1))
+        data |= {"b": 2}
+        assert dict(data) == {"a": 1, "b": 2}
+        assert len(touches) == 1
+
+    def test_tracked_list_imul_touches(self) -> None:
+        # regression: ``items *= 2`` used to mutate via list.__imul__ without touching
+        touches = []
+        items: TrackedList[int] = TrackedList([1, 2], touch=lambda: touches.append(1))
+        items *= 2
+        assert list(items) == [1, 2, 1, 2]
+        assert len(touches) == 1

@@ -3,19 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Coroutine
 from typing import Any
 
 from pyline import api
 
+logger = logging.getLogger(__name__)
+
 _bg: set[asyncio.Task[object]] = set()
+
+
+def _bg_done(task: asyncio.Task[object]) -> None:
+    _bg.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        # Same discipline as the scheduler: a fire-and-forget failure must be
+        # observed, not discovered as "exception was never retrieved" at GC.
+        logger.error("spawned task failed: %r", task, exc_info=task.exception())
 
 
 def spawn(coro: Coroutine[Any, Any, object], *, name: str = "") -> asyncio.Task[object]:
     """Fire-and-forget task with a kept reference (no GC of pending work)."""
     task = asyncio.get_running_loop().create_task(coro, name=name or None)
     _bg.add(task)
-    task.add_done_callback(_bg.discard)
+    task.add_done_callback(_bg_done)
     return task
 
 

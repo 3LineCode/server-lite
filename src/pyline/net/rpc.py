@@ -35,6 +35,11 @@ MSG_CALL = 1
 MSG_RESULT = 2
 MSG_CANCEL = 3
 
+# Sent back when an inbound CALL cannot acquire an execution slot within
+# ``inflight_wait``: the function is NOT executed and the caller sees this as
+# an RpcRemoteError instead of piling up tasks on the server.
+BUSY_MESSAGE = "server busy: rpc inflight limit reached, retry later"
+
 # Service number of the caller of the RPC currently executing (prototype
 # RpcFromServer); 0 outside an inbound RPC.
 _current_caller: contextvars.ContextVar[int] = contextvars.ContextVar(
@@ -86,7 +91,15 @@ class RpcManager(Network):
 
     flag = RPC_FLAG
 
-    def __init__(self, gateway: Any, sender: SenderProtocol, *, own_service_no: int) -> None:
+    def __init__(
+        self,
+        gateway: Any,
+        sender: SenderProtocol,
+        *,
+        own_service_no: int,
+        max_inflight: int = 128,
+        inflight_wait: float = 5.0,
+    ) -> None:
         super().__init__(gateway)
         self._sender = sender
         self._own_service_no = own_service_no
@@ -96,6 +109,14 @@ class RpcManager(Network):
         self._call_seq = itertools.count(1)
         self._metrics = get_metrics()
         self.timed_out_calls = 0
+        # F-19: inbound concurrency cap. A bare task per CALL let any
+        # authenticated peer stack unbounded work with a CALL storm; execution
+        # now queues on this semaphore, and callers that wait longer than
+        # ``inflight_wait`` get a busy error instead of executing.
+        self._max_inflight = max_inflight
+        self._inflight_wait = inflight_wait
+        self._inflight = asyncio.Semaphore(max_inflight)
+        self.busy_rejects = 0
 
     # ------------------------------------------------------------------ #
     # Registration
@@ -251,6 +272,11 @@ class RpcManager(Network):
         task = asyncio.get_running_loop().create_task(
             self._execute(call_id, from_service, func_path, args)
         )
+        # F-20: keep a strong reference + observe the outcome for EVERY task
+        # (call_id 0 used to leave the task unreferenced -- GC could kill it
+        # mid-run and exceptions were never retrieved).
+        self._inbound.add(task)
+        task.add_done_callback(self._inbound_done)
         if call_id:
             self._running[call_id] = task
 
@@ -265,37 +291,61 @@ class RpcManager(Network):
         result_kind = 0  # 0=error, 1=success, 2=unknown-function
         caller_token = _current_caller.set(from_service)
         try:
+            # F-19: wait bounded for an execution slot. On timeout the function
+            # is never touched -- the caller learns the server is busy instead
+            # of the task waiting forever (or the table growing unbounded).
+            # wait_for releases the slot again if the wait itself is cancelled
+            # (MSG_CANCEL), so CancelledError propagates untouched.
             try:
-                func = self._functions.get(func_path)
-                if func is None:
-                    result_kind = 2
-                    raise RpcUnknownFunctionError(func_path, "function not registered")
-                result = func(*args)
-                if asyncio.iscoroutine(result):
-                    result = await result
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if call_id:
-                    self._send(
-                        from_service,
-                        [MSG_RESULT, call_id, result_kind, f"{type(exc).__name__}: {exc}"],
-                    )
-                logger.warning("rpc %r raised on execution", func_path, exc_info=True)
+                await asyncio.wait_for(self._inflight.acquire(), timeout=self._inflight_wait)
+            except TimeoutError:
+                self.busy_rejects += 1
+                logger.warning(
+                    "rpc inflight limit (%d) reached; rejecting call %d to %r "
+                    "(waited %.1fs, rejects=%d)",
+                    self._max_inflight,
+                    call_id,
+                    func_path,
+                    self._inflight_wait,
+                    self.busy_rejects,
+                )
+                if call_id:  # notify-style calls (call_id 0) expect no reply
+                    self._send(from_service, [MSG_RESULT, call_id, 0, BUSY_MESSAGE])
                 return
-            if call_id:
-                # F-14: an unserializable result must reach the caller as an
-                # error, not as a silent swallow followed by a fake timeout.
+            try:
                 try:
-                    msgpack.packb(result, use_bin_type=True)
-                except (TypeError, ValueError) as exc:
-                    logger.error("rpc %r result not serializable: %s", func_path, exc)
-                    self._send(
-                        from_service,
-                        [MSG_RESULT, call_id, 0, f"result not serializable: {exc}"],
-                    )
+                    func = self._functions.get(func_path)
+                    if func is None:
+                        result_kind = 2
+                        raise RpcUnknownFunctionError(func_path, "function not registered")
+                    result = func(*args)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if call_id:
+                        self._send(
+                            from_service,
+                            [MSG_RESULT, call_id, result_kind, f"{type(exc).__name__}: {exc}"],
+                        )
+                    logger.warning("rpc %r raised on execution", func_path, exc_info=True)
                     return
-                self._send(from_service, [MSG_RESULT, call_id, 1, result])
+                if call_id:
+                    # F-14: an unserializable result must reach the caller as an
+                    # error, not as a silent swallow followed by a fake timeout.
+                    try:
+                        msgpack.packb(result, use_bin_type=True)
+                    except (TypeError, ValueError) as exc:
+                        logger.error("rpc %r result not serializable: %s", func_path, exc)
+                        self._send(
+                            from_service,
+                            [MSG_RESULT, call_id, 0, f"result not serializable: {exc}"],
+                        )
+                        return
+                    self._send(from_service, [MSG_RESULT, call_id, 1, result])
+            finally:
+                self._inflight.release()
         finally:
             _current_caller.reset(caller_token)
 

@@ -122,9 +122,7 @@ class TestKeepalive:
         monkeypatch.setattr(mysql_mod.asyncmy, "create_pool", fake_create_pool)
         return pool
 
-    async def test_keepalive_uses_dedicated_connection_and_alarms(
-        self, monkeypatch: Any
-    ) -> None:
+    async def test_keepalive_uses_dedicated_connection_and_alarms(self, monkeypatch: Any) -> None:
         """F-10: heartbeat on its own connection; lost -> flag + on_lost."""
         dead_conn = FakeConn(exc=ConnectionError("server gone"))
         async_pool = self._patch(monkeypatch, dead_conn)
@@ -161,4 +159,57 @@ class TestKeepalive:
         await pool.connect()
         await asyncio.sleep(0.1)
         assert not pool.lost
+        await pool.close()
+
+
+class TestRecovery:
+    async def test_pool_rebuilds_after_loss(self, monkeypatch: Any) -> None:
+        """F-32: keepalive loss arms a backoff recovery loop; the pool
+        rebuilds itself instead of running dead until a human restarts."""
+        monkeypatch.setattr(mysql_mod, "_RECOVER_BACKOFF_MIN", 0.01)
+        monkeypatch.setattr(mysql_mod, "_RECOVER_BACKOFF_MAX", 0.05)
+        settings = MySQLSettings(user="root", password="x", db_name="d")
+        pool = MySQLPool(settings)
+        builds = {"n": 0}
+
+        async def fake_build() -> None:
+            builds["n"] += 1
+            if builds["n"] == 1:
+                raise RuntimeError("still down")
+
+        async def fake_teardown() -> None:
+            pass
+
+        monkeypatch.setattr(pool, "_build_pool", fake_build)
+        monkeypatch.setattr(pool, "_teardown_pool", fake_teardown)
+        pool.lost = True
+        pool._start_recovery()
+        for _ in range(300):
+            if not pool.lost:
+                break
+            await asyncio.sleep(0.01)
+        assert builds["n"] == 2  # one failed attempt, then success
+        assert not pool.lost
+        await pool.close()
+
+    async def test_on_lost_fires_once_per_incident(self, monkeypatch: Any) -> None:
+        """The on_lost callback must fire on each False->True transition but
+        not re-fire while the pool is already declared lost."""
+        calls: list[int] = []
+        settings = MySQLSettings(user="root", password="x", db_name="d")
+        pool = MySQLPool(settings, on_lost=lambda: calls.append(1))
+
+        async def noop() -> None:
+            pass
+
+        async def boom() -> None:
+            raise ConnectionError("server gone")
+
+        monkeypatch.setattr(pool, "_build_pool", noop)
+        monkeypatch.setattr(pool, "_teardown_pool", noop)
+        task = asyncio.get_running_loop().create_task(boom())
+        await asyncio.sleep(0)  # let the task complete WITH its exception
+        pool._keepalive_done(task)  # first death: fires on_lost, arms recovery
+        pool._keepalive_done(task)  # repeat while already lost: no re-fire
+        assert calls == [1]
         await pool.close()

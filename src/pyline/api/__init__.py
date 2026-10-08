@@ -32,6 +32,11 @@ class ApiUnboundError(RuntimeError):
         )
 
 
+class ApiServiceUnavailableError(RuntimeError):
+    """A service name is not registered in the bound context (wrong process,
+    or called before the boot step that registers it)."""
+
+
 def bind(ctx: Context) -> None:
     """Bind the process context (idempotent; rebinding the same ctx is fine)."""
     global _BOUND
@@ -53,9 +58,8 @@ def service(name: str) -> object:
     """Fetch a runtime service handle registered by ServerRuntime."""
     value = ctx().services.get(name)
     if value is None:
-        raise RuntimeError(
-            f"service {name!r} is not available in this process (or not yet "
-            "at this boot stage)"
+        raise ApiServiceUnavailableError(
+            f"service {name!r} is not available in this process (or not yet at this boot stage)"
         )
     return value
 

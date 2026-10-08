@@ -137,6 +137,36 @@ async def test_ipc_send_order_preserved(config_dir, tmp_path) -> None:
 
 
 @pytest.mark.integration
+async def test_ipc_destination_cap(config_dir, tmp_path) -> None:
+    """F-24: the ROUTER caps tracked destinations -- a third unknown target is
+    dropped and counted, never allocated a queue or writer task."""
+    port = free_tcp_port()
+    ctx_main = make_ctx(config_dir, tmp_path, main=True, index=0, port=port)
+    ctx_sub = make_ctx(config_dir, tmp_path, main=False, index=1, port=port)
+    gw_main, gw_sub = ProtocolGateway(), ProtocolGateway()
+    bus_main = ZmqBus(ctx_main, gw_main, max_destinations=2)
+    bus_sub = ZmqBus(ctx_sub, gw_sub)
+    await bus_main.start()
+    await bus_sub.start()
+    try:
+        await asyncio.sleep(0.3)
+        # three same-machine targets no DEALER ever registered for
+        unknown = [5 * 100_000 + 10001, 6 * 100_000 + 10001, 7 * 100_000 + 10001]
+        for target in unknown:
+            bus_sub.send(target, "test", pack_call(1, "nobody-home"))
+        for _ in range(100):
+            if bus_main.dest_overflow >= 1:
+                break
+            await asyncio.sleep(0.05)
+        assert bus_main.dest_overflow == 1, "overflow message was not counted"
+        assert set(bus_main._peer_queues) == set(unknown[:2]), "third target allocated a queue"
+        assert len(bus_main._peer_tasks) == 2
+    finally:
+        await bus_sub.close()
+        await bus_main.close()
+
+
+@pytest.mark.integration
 async def test_ipc_slow_dealer_does_not_block_bus(config_dir, tmp_path) -> None:
     """F-15: a DEALER that never reads must not stall the ROUTER's recv loop
     (the old inline-forward design blocked the whole bus on one slow peer)."""
@@ -181,4 +211,3 @@ async def test_ipc_slow_dealer_does_not_block_bus(config_dir, tmp_path) -> None:
         slow.close(0)
         await bus_sub.close()
         await bus_main.close()
-

@@ -47,6 +47,7 @@ class Console:
         self._shutdown_hook = shutdown_hook
         self._kill_hook = kill_hook
         self._task: asyncio.Task[None] | None = None
+        self._emit_tasks: set[asyncio.Task[object]] = set()
 
     def start(self) -> None:
         if self._task is None:
@@ -106,9 +107,12 @@ class Console:
                     if module:
                         self._reload_hook(module)
             case "$" | "￥":  # fullwidth variant, prototype parity
-                asyncio.get_running_loop().create_task(
+                task = asyncio.get_running_loop().create_task(
                     self._bus.emit(ConsoleCommandEvent(command=rest))
                 )
+                # Strong ref: a bare create_task can be GC'd before emitting.
+                self._emit_tasks.add(task)
+                task.add_done_callback(self._emit_tasks.discard)
             case _:
                 if self._unsafe:
                     self._eval(line)

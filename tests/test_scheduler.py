@@ -56,6 +56,51 @@ async def test_repeating_and_cancel() -> None:
     await sched.close()
 
 
+async def test_repeating_reschedules_on_grid_not_on_fire_time() -> None:
+    # regression: re-arming from the actual fire time let a slow callback
+    # accumulate drift; the next deadline must stay on the original grid.
+    sched = Scheduler(loop=asyncio.get_running_loop())
+    fires: list[float] = []
+    interval = 0.05
+
+    def job() -> None:
+        fires.append(time.monotonic())
+        time.sleep(0.03)  # simulate slow work inside the tick
+
+    start = time.monotonic()
+    handle = sched.call_repeating(interval, job)
+    await asyncio.sleep(0.25)
+    handle.cancel()
+    await sched.close()
+    assert len(fires) >= 2
+    for i, ts in enumerate(fires):
+        expected = start + interval * (i + 1)
+        # On-grid (allowing tick jitter), NOT at fire_time + interval which
+        # would drift by the 30ms work time every round.
+        assert ts - expected < 0.045, f"fire {i} drifted: {ts - expected:.3f}s"
+
+
+async def test_close_cancels_running_coroutine_callbacks() -> None:
+    # regression: close() used to drop coroutine tasks without cancelling
+    # them, leaving them running against torn-down services.
+    sched = Scheduler(loop=asyncio.get_running_loop())
+    inside = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def hang() -> None:
+        inside.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    sched.call_after(0.01, hang)
+    await asyncio.wait_for(inside.wait(), 1.0)
+    await sched.close()
+    await asyncio.wait_for(cancelled.wait(), 1.0)
+
+
 async def test_exception_isolated() -> None:
     sched = Scheduler(loop=asyncio.get_running_loop())
 

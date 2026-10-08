@@ -93,7 +93,7 @@ class TestServerRegistry:
 """,
             encoding="utf-8",
         )
-        with pytest.raises(ValueError, match="duplicate advertise_ip"):
+        with pytest.raises(ConfigError, match="duplicate advertise_ip"):
             load_server_registry(config_dir)
 
     def test_unknown_base_rejected(self, config_dir: Path) -> None:
@@ -122,13 +122,17 @@ class TestMySQLSettingsHardening:
         from pyline.config.models import MySQLSettings
 
         good = MySQLSettings(
-            user="root", password="$plain:x", db_name="d",
+            user="root",
+            password="$plain:x",
+            db_name="d",
             isolation_level="READ UNCOMMITTED",
         )
         assert good.isolation_level == "READ UNCOMMITTED"
         with pytest.raises(Exception, match="isolation_level"):
             MySQLSettings(
-                user="root", password="$plain:x", db_name="d",
+                user="root",
+                password="$plain:x",
+                db_name="d",
                 isolation_level="SERIALIZABLE; DROP TABLE x",
             )
 
@@ -155,9 +159,11 @@ class TestLoaderHardeningF26:
 
     def test_inter_token_resolved_from_secrets(self, config_dir) -> None:
         (config_dir / "project.json5").write_text(
-            (config_dir / "project.json5").read_text(encoding="utf-8").replace(
+            (config_dir / "project.json5")
+            .read_text(encoding="utf-8")
+            .replace(
                 '"token": "$plain:unit-test-token",',
-                '"token": "$plain:unit-test-token",\n        "inter_token": "$plain:inner-token",'
+                '"token": "$plain:unit-test-token",\n        "inter_token": "$plain:inner-token",',
             ),
             encoding="utf-8",
         )

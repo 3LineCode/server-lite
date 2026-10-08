@@ -54,8 +54,11 @@ class TestIdentValidation:
         ctx = make_ctx(config_dir, tmp_path, main=True, index=0, port=0)
         server, srv, port = await start_proxy_server(ctx)
         client = await conn_mod.open_connection(
-            "127.0.0.1", port, token=proxy_mod.inter_token(ctx),
-            on_message=lambda f, p: None, **KW,  # type: ignore[arg-type]
+            "127.0.0.1",
+            port,
+            token=proxy_mod.inter_token(ctx),
+            on_message=lambda f, p: None,
+            **KW,  # type: ignore[arg-type]
         )
         await asyncio.sleep(0.05)
         client.send_message(IDENT_FLAG, (99999).to_bytes(4, "big"))
@@ -68,16 +71,22 @@ class TestIdentValidation:
         ctx = make_ctx(config_dir, tmp_path, main=True, index=0, port=0)
         server, srv, port = await start_proxy_server(ctx)
         first = await conn_mod.open_connection(
-            "127.0.0.1", port, token=proxy_mod.inter_token(ctx),
-            on_message=lambda f, p: None, **KW,  # type: ignore[arg-type]
+            "127.0.0.1",
+            port,
+            token=proxy_mod.inter_token(ctx),
+            on_message=lambda f, p: None,
+            **KW,  # type: ignore[arg-type]
         )
         await asyncio.sleep(0.05)
         first.send_message(IDENT_FLAG, (10001).to_bytes(4, "big"))  # loopback allowed
         await asyncio.sleep(0.1)
         assert 10001 in nodes(server)
         second = await conn_mod.open_connection(
-            "127.0.0.1", port, token=proxy_mod.inter_token(ctx),
-            on_message=lambda f, p: None, **KW,  # type: ignore[arg-type]
+            "127.0.0.1",
+            port,
+            token=proxy_mod.inter_token(ctx),
+            on_message=lambda f, p: None,
+            **KW,  # type: ignore[arg-type]
         )
         await asyncio.sleep(0.05)
         second.send_message(IDENT_FLAG, (10001).to_bytes(4, "big"))  # hijack attempt

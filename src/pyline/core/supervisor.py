@@ -18,6 +18,7 @@ import contextlib
 import logging
 import multiprocessing as mp
 import os
+import sys
 from collections.abc import Awaitable, Callable
 from multiprocessing.synchronize import Event as MpEvent
 
@@ -123,11 +124,29 @@ class ProcessSupervisor:
 
 
 def _pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        # os.kill(pid, 0) on Windows TERMINATES the target process (any
+        # non-CTRL signal maps to TerminateProcess); probe via
+        # OpenProcess/GetExitCodeProcess instead.
+        import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:  # pragma: no cover - non-CPython/broken ctypes
+            return True
+        kernel32 = windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
-        return False
-    except OSError:
+    except (ProcessLookupError, PermissionError, OSError):
         return False
     return True
 

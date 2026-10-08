@@ -20,18 +20,31 @@ executed for checking purposes, so import-time side effects run exactly once
 
 * **Inheritance change** -- `__bases__` of a live class cannot be re-pointed
   safely (the prototype allowed a narrow special case; pyline rejects all).
-* **`__slots__` presence change** -- the instance layout contract changes.
+  Subscripted/dotted bases (`list[int]`, `module.Base`) compare by their bare
+  name and are not false-rejected.
+* **`__slots__` presence or layout change** -- the instance layout contract
+  changes. Renaming a slot is rejected even though presence is unchanged:
+  existing instances keep the old layout and their data would be orphaned.
+  Statically unresolvable `__slots__` values (calls, name references) are
+  rejected conservatively -- restart required.
 * **Identity dunder change** (`__eq__`, `__ne__`, `__lt__`, `__le__`,
   `__gt__`, `__ge__`, `__hash__`) -- instances already sitting in dicts/sets
   would be looked up under the wrong hash/equality.
 * **Call-incompatible signature change** -- removed/renamed positional
   parameters, new parameters without defaults, removed keyword-only
-  parameters, `*args`/`**kwargs` shape change. Adding trailing optional
+  parameters, keyword-only parameters that become required (added without a
+  default, or their default removed), `*args`/`**kwargs` shape change. The
+  check covers plain methods **and** the inner functions of
+  `@staticmethod`/`@classmethod`/`@property`. Adding trailing optional
   parameters and new defaulted keyword-only parameters is allowed.
 * **Kind change** -- a module-level function becoming a class (or vice
   versa).
 * **Closure layout change** (`ReloadError` at swap time, rolled back) --
-  e.g. a nested function gaining a new free variable.
+  e.g. a nested function gaining a new free variable. Note: closure
+  *captured values* are preserved across reloads -- changing `factor = 2` to
+  `factor = 3` inside a factory does **not** re-bind cells created before the
+  reload (the closure attribute is read-only on functions; layout equality
+  keeps old cells self-consistent with the swapped code).
 
 ## Allowed but sharp
 
@@ -57,6 +70,6 @@ executed for checking purposes, so import-time side effects run exactly once
 
 ## Not supported
 
-C extension modules, `__slots__` re-layout, metaclass changes, decorated
-functions whose closure structure changes. Python version bumps must pass
-the reload regression suite (`tests/test_reload.py`) in CI before rollout.
+C extension modules, metaclass changes, decorated functions whose closure
+structure changes. Python version bumps must pass the reload regression
+suite (`tests/test_reload.py`) in CI before rollout.

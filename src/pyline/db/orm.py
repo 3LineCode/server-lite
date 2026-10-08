@@ -135,9 +135,7 @@ def dataclass_codec(
         known = {f.name for f in fields(model_cls)}
         return model_cls(**{k: v for k, v in data.items() if k in known})
 
-    return DataclassCodec(
-        to_dict, from_dict, schema_version=schema_version, migrations=migrations
-    )
+    return DataclassCodec(to_dict, from_dict, schema_version=schema_version, migrations=migrations)
 
 
 class DataSaver:
@@ -171,6 +169,12 @@ class DataSaver:
         # join the running operation instead of racing it.
         self._load_future: asyncio.Future[Any] | None = None
         self._delete_future: asyncio.Future[None] | None = None
+        # F-34: flush() and delete() serialize on this lock so an upsert that
+        # is already in flight can never land after a DELETE and resurrect
+        # the row.  asyncio.Lock no longer binds to a loop at creation
+        # (Python 3.10+), so constructing it here is safe even when the
+        # saver is built outside any running loop.
+        self._flush_lock = asyncio.Lock()
 
     # ------------------------------ data ------------------------------- #
 
@@ -265,40 +269,53 @@ class DataSaver:
             self._scheduler.mark(self)
 
     async def flush(self) -> None:
-        """Encode and upsert immediately."""
-        if self.state == SaveState.DELETED:
-            return
-        blob = self._codec.encode(self._data)
-        await self._db.execute(self._spec.upsert_sql(self._column), (self.key, blob))
+        """Encode and upsert immediately.
+
+        Serialized against delete() by the flush lock (F-34): the state is
+        re-checked *after* acquiring it, so a delete that won the lock makes
+        the in-waiting flush a no-op instead of resurrecting the row.
+        """
+        async with self._flush_lock:
+            if self.state == SaveState.DELETED:
+                return
+            blob = self._codec.encode(self._data)
+            await self._db.execute(self._spec.upsert_sql(self._column), (self.key, blob))
 
     async def delete(self) -> None:
         """Delete the row first, then flip to DELETED (F-04).
 
         The SQL runs before the state change so a failed delete leaves the
         saver usable and retryable; concurrent deletes join one DELETE.
+        The whole operation holds the flush lock (F-34) so no upsert is in
+        flight while the DELETE runs.
         """
         if self.state == SaveState.DELETED:
             return
-        if self._delete_future is not None:
-            await asyncio.shield(self._delete_future)
-            return
-        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self._delete_future = future
-        try:
-            await self._db.execute(self._spec.delete_sql(), (self.key,))
-        except asyncio.CancelledError:
+        async with self._flush_lock:
+            # A concurrent delete may have won the lock while we waited;
+            # mypy cannot see that ``state`` mutates across the await.
+            if self.state == SaveState.DELETED:  # type: ignore[comparison-overlap]
+                return  # a concurrent delete won the lock and already finished
+            if self._delete_future is not None:
+                await asyncio.shield(self._delete_future)
+                return
+            future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            self._delete_future = future
+            try:
+                await self._db.execute(self._spec.delete_sql(), (self.key,))
+            except asyncio.CancelledError:
+                if not future.done():
+                    future.set_exception(RuntimeError("delete interrupted by cancellation"))
+                raise
+            except BaseException as exc:
+                if not future.done():
+                    future.set_exception(exc)
+                raise
+            finally:
+                self._delete_future = None
+            self.state = SaveState.DELETED
             if not future.done():
-                future.set_exception(RuntimeError("delete interrupted by cancellation"))
-            raise
-        except BaseException as exc:
-            if not future.done():
-                future.set_exception(exc)
-            raise
-        finally:
-            self._delete_future = None
-        self.state = SaveState.DELETED
-        if not future.done():
-            future.set_result(None)
+                future.set_result(None)
 
     def __repr__(self) -> str:
         return f"DataSaver({self._spec.name}.{self._column}[{self.key!r}], {self.state.value})"

@@ -93,6 +93,89 @@ async def test_send_on_closed_raises() -> None:
     await conn_mod.close_server(server)
 
 
+class TestSendQueueBytesF21:
+    async def test_byte_overflow_closes_connection(self) -> None:
+        """F-21: a peer that accepts but never reads trips the BYTE cap (the
+        message-count cap stays far away) and the sender closes with an
+        error instead of buffering gigabytes."""
+
+        async def silent(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            await asyncio.sleep(10)  # accept, never read, never close
+
+        server = await asyncio.start_server(silent, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        client = await conn_mod.open_connection(
+            "127.0.0.1",
+            port,
+            token=TOKEN,
+            on_message=lambda f, p: None,
+            handshake_timeout=5.0,
+            idle_timeout=30.0,
+            send_queue_limit=4096,  # count guard must never fire first
+            send_queue_bytes=8 * 1024,
+        )
+        overflowed = False
+        blob = b"x" * (64 * 1024)
+        # 8 MiB total: OS socket buffers absorb the first chunk (drain returns
+        # and bytes are released), then drain blocks and the next send sees
+        # queued bytes far past the 8 KiB budget.
+        for _ in range(128):
+            try:
+                client.send_message("flood", blob)
+            except conn_mod.ConnectionClosedError:
+                overflowed = True
+                break
+        assert overflowed, "byte cap never fired"
+        for _ in range(100):
+            if client.closed:
+                break
+            await asyncio.sleep(0.05)
+        assert client.closed
+        assert "bytes" in client.close_reason
+        await conn_mod.close_server(server)
+
+    async def test_small_traffic_within_budget_survives(self) -> None:
+        """F-21 sanity: with a small-but-sane byte budget, ordinary traffic
+        (written out continuously) never trips the cap."""
+        got: dict = {}
+        server, port = await start_echo_server(got)
+        client = await conn_mod.open_connection(
+            "127.0.0.1",
+            port,
+            token=TOKEN,
+            on_message=lambda f, p: None,
+            send_queue_bytes=16 * 1024,
+            **KW,
+        )
+        await asyncio.sleep(0.1)
+        for i in range(50):
+            client.send_message("chat", str(i).encode())
+        await asyncio.sleep(0.3)
+        assert not client.closed
+        assert len(got.get("chat", [])) == 50
+        await client.close("done")
+        await conn_mod.close_server(server)
+
+
+class TestAuthCompareF22:
+    async def test_near_miss_tokens_rejected(self) -> None:
+        """F-22: constant-time comparison must still reject wrong tokens --
+        including same-length off-by-one and prefix/suffix variants (an
+        implementation that compared lengths or prefixes would accept)."""
+        for bad in ("test-tokenX", "test", "test-token-extra", ""):
+            got: dict = {}
+            server, port = await start_echo_server(got)
+            client = await conn_mod.open_connection(
+                "127.0.0.1", port, token=bad, on_message=lambda f, p: None, **KW
+            )
+            for _ in range(50):
+                if client.closed:
+                    break
+                await asyncio.sleep(0.05)
+            assert client.closed, f"token {bad!r} was accepted"
+            await conn_mod.close_server(server)
+
+
 class TestDispatchIsolationF13:
     async def test_handler_exception_keeps_connection(self) -> None:
         """F-13: a crashing handler drops frames; the connection survives."""
@@ -179,6 +262,7 @@ class TestLifecycleF17:
 
     async def test_client_verified_requires_welcome(self) -> None:
         """F-17: a server that never confirms the handshake times the client out."""
+
         async def silent(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             await asyncio.sleep(10)  # never reply, never close
 

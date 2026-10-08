@@ -11,6 +11,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from pyline.config.errors import ConfigError
+
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -34,6 +36,14 @@ class SocketSettings(_StrictModel):
     server_port: int = Field(ge=1, le=65535)
     max_frame_size: int = Field(default=16 * 1024 * 1024, ge=1024)
     send_queue_limit: int = Field(default=1024, ge=1)
+    # Byte-based companion to send_queue_limit: a count-only bound lets
+    # ``send_queue_limit * max_frame_size`` bytes accumulate before the
+    # overflow guard fires. Default 64 MiB.
+    send_queue_bytes: int = Field(default=64 * 1024 * 1024, ge=1024)
+    # In-flight cap for inbound RPC CALLs (per RPC service): a token-holding
+    # peer must not be able to pile up unbounded tasks.
+    rpc_max_inflight: int = Field(default=128, ge=1)
+    rpc_inflight_wait: float = Field(default=5.0, gt=0)
     handshake_timeout: float = Field(default=5.0, gt=0)
     idle_timeout: float = Field(default=60.0, gt=0)
 
@@ -47,6 +57,9 @@ class ZeroMQSettings(_StrictModel):
     # Per-destination outbound queue bound (F-15): bounds memory when a peer
     # is slow; overflow drops and counts, mirroring ZMQ's own HWM semantics.
     queue_bound: int = Field(default=1000, ge=1)
+    # Upper bound on simultaneously tracked destinations: the ROUTER must not
+    # grow an unbounded queue+writer per arbitrary target value.
+    max_destinations: int = Field(default=256, ge=1)
 
 
 class MySQLSettings(_StrictModel):
@@ -66,6 +79,10 @@ class MySQLSettings(_StrictModel):
     min_conn: int = Field(default=1, ge=0)
     keepalive_interval: float = Field(default=5.0, gt=0)
     keepalive_miss_limit: int = Field(default=3, ge=1)
+    # Symmetric with the redis socket_timeout fix (F-11): without a read
+    # timeout a half-dead server parks every awaiting query forever.
+    # (asyncmy has no write_timeout parameter -- read side only.)
+    read_timeout: float = Field(default=30.0, gt=0)
 
 
 class RedisSettings(_StrictModel):
@@ -91,6 +108,10 @@ class ProjectSettings(_StrictModel):
     redis: RedisSettings
     # Prometheus export port on the MAIN process (F-28); null disables.
     metrics_port: int | None = Field(default=9100, ge=1, le=65535)
+    # Hard bound per boot-step action: a hung connect aborts the boot
+    # (the startup watchdog only observes stalls between steps).
+    # None disables. Default is generous enough for schema migrations.
+    boot_step_timeout: float | None = Field(default=300.0, gt=0)
 
 
 class TableFieldDef(_StrictModel):
@@ -163,7 +184,7 @@ class ServerRegistry:
         self._by_ip: dict[str, int] = {}
         for no, entry in entries.items():
             if entry.advertise_ip in self._by_ip:
-                raise ValueError(
+                raise ConfigError(
                     f"duplicate advertise_ip {entry.advertise_ip} in servers config "
                     f"(servers {self._by_ip[entry.advertise_ip]} and {no})"
                 )

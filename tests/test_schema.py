@@ -225,6 +225,40 @@ class TestVersionedMigration:
         with pytest.raises(SchemaError, match="type drift"):
             await manager.ensure_all()
 
+    async def test_not_null_blob_no_self_drift(self) -> None:
+        # F-38: ddl() creates TEXT/BLOB nullable (F-36), so a `not_null: true`
+        # blob column whose live row is nullable is exactly what this framework
+        # itself created -- the drift check must expect that, not the raw flag.
+        blob_def = TableDef(
+            fields={
+                "id": TableFieldDef(type="BIGINT", primary=True),
+                "data": TableFieldDef(type="MEDIUMBLOB", not_null=True),
+            }
+        )
+        pool = SchemaFakePool(
+            tables={"tbl_player"},
+            columns={"tbl_player": [("id", "bigint", "NO"), ("data", "mediumblob", "YES")]},
+        )
+        manager = SchemaManager(pool, {"tbl_player": blob_def}, "test_db")
+        await manager.ensure_all()  # must not raise nullability drift
+
+    async def test_genuinely_wrong_nullability_still_detected(self) -> None:
+        # the F-38 fix must not silence real drift: a non-blob column declared
+        # NOT NULL but nullable live still fails startup
+        pool = SchemaFakePool(
+            tables={"tbl_player"},
+            columns={"tbl_player": [("id", "bigint", "NO"), ("name", "varchar(64)", "YES")]},
+        )
+        strict_def = TableDef(
+            fields={
+                "id": TableFieldDef(type="BIGINT", primary=True),
+                "name": TableFieldDef(type="VARCHAR(64)", not_null=True),
+            }
+        )
+        manager = SchemaManager(pool, {"tbl_player": strict_def}, "test_db")
+        with pytest.raises(SchemaError, match="nullability drift"):
+            await manager.ensure_all()
+
     async def test_add_column_pins_instant_algorithm(self) -> None:
         pool = SchemaFakePool(
             tables={"tbl_player"},

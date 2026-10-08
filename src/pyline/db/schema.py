@@ -321,7 +321,7 @@ class SchemaManager:
                 problems.append(
                     f"{name}.{col.name}: type drift, declared {col.column_type()}, live {live_type}"
                 )
-            expected_nullable = "YES" if col.nullable else "NO"
+            expected_nullable = "NO" if col.expects_not_null() else "YES"
             if live_nullable != expected_nullable:
                 problems.append(
                     f"{name}.{col.name}: nullability drift, declared "

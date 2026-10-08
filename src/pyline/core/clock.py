@@ -8,6 +8,14 @@ numbers 0-based (2024-01 == 0), anchored at host-local midnight 2024-01-01 --
 these values are persisted inside business data, so the bases are frozen.
 ``tz`` only pins the wall-clock derivations (hour, month label, boundaries);
 with no tz the host's local time is used, exactly like the prototype.
+
+Day/week numbers derive from the *calendar* day in the effective timezone
+(F-44): the prototype's fixed 86,400-second grid rolls at a constant UTC
+instant, which under a DST timezone drifts an hour off local midnight -- the
+frozen calendar and ``NewDayEvent`` (fired at local midnight) then disagreed,
+splitting one local day into two day numbers. Calendar derivation keeps the
+frozen anchors (2024-01-01, a Monday) and only changes values across DST
+edges, where the old grid was already inconsistent.
 """
 
 from __future__ import annotations
@@ -25,7 +33,6 @@ class GameClock:
         tz: str | None = None,
     ) -> None:
         self._epoch = epoch or dt.datetime(2024, 1, 1)
-        self._epoch_ts = int(time.mktime(self._epoch.timetuple()))
         self._offset = 0.0
         self._tz = zoneinfo.ZoneInfo(tz) if tz else None
 
@@ -60,13 +67,22 @@ class GameClock:
 
     # --------------------------- game calendar -------------------------- #
 
+    def _calendar_days_since_epoch(self, ts: float) -> int:
+        """Whole calendar days between the epoch date and ``ts``'s local date.
+
+        Both the anchor (2024-01-01, a Monday) and the 1-basing are frozen
+        (F-25); deriving through :meth:`local` keeps the grid aligned with
+        actual local midnights across DST transitions (F-44).
+        """
+        return (self.local(ts).date() - self._epoch.date()).days
+
     def day_no(self, timestamp: float | None = None) -> int:
         ts = self.now() if timestamp is None else timestamp
-        return int((ts - self._epoch_ts) // 86_400) + 1
+        return self._calendar_days_since_epoch(ts) + 1
 
     def week_no(self, timestamp: float | None = None) -> int:
         ts = self.now() if timestamp is None else timestamp
-        return int((ts - self._epoch_ts) // 604_800) + 1
+        return self._calendar_days_since_epoch(ts) // 7 + 1
 
     def month_no(self, timestamp: float | None = None) -> int:
         ts = self.now() if timestamp is None else timestamp

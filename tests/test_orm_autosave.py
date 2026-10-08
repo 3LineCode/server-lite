@@ -238,7 +238,7 @@ class TestSaveScheduler:
         assert db.attempts == 1
         assert scheduler.queue_depth() == 1
 
-        await asyncio.sleep(0.06)  # backoff expires
+        await asyncio.sleep(0.15)  # backoff expires (generous margin)
         await scheduler.flush_batch()  # attempt 2 fails -> deferred 0.1s
         assert db.attempts == 2
         assert scheduler.queue_depth() == 1  # still queued, never dropped
@@ -247,7 +247,7 @@ class TestSaveScheduler:
 
         # database recovers: the next due retry succeeds and drains the queue
         db.fail = False
-        await asyncio.sleep(0.11)
+        await asyncio.sleep(0.25)  # second-stage backoff (0.1s) expires
         await scheduler.flush_batch()
         assert scheduler.queue_depth() == 0
         assert scheduler.saved_total == 1

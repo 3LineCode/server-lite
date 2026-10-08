@@ -41,7 +41,7 @@ jobs:
       - name: Run unit tests with coverage
         run: |
           uv run coverage run -m pytest -m "not mysql and not redis"
-          uv run coverage report --fail-under=65
+          uv run coverage report --fail-under=75
       - name: Hot-reload regression suite
         run: uv run pytest tests/test_reload.py -v
 

@@ -47,5 +47,7 @@ uv run mypy src
 
 ## Status
 
-Phase-by-phase rebuild in progress; see `docs/plan.md` for the approved master
-plan and the known-issues -> fix mapping.
+v1.0.0-rc.1: P0-P5 core plus the full migration-finish pass (F-01..F-30 in
+`docs/migration-plan.md` -- data safety, network robustness, kernel,
+hot-reload guards, business facade). See `CHANGELOG.md`, `docs/plan.md`
+(master plan) and `docs/hot-reload.md` (reload contract).

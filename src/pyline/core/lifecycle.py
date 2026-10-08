@@ -126,11 +126,25 @@ class LifecycleManager:
         self.start_watchdog()
         for state in BOOT_STEPS:
             await self._enter(state)
-            while self._pending_waits or self._start_tasks:
+            while True:
                 if self.stuck_error is not None:
                     self._watchdog_task = None
                     raise self.stuck_error
+                if self.state == LifecycleState.QUIT:
+                    # F-19: shutdown requested mid-boot -- stop gating, cancel
+                    # the remaining start tasks and let teardown run (this
+                    # loop previously never exited and hung the process).
+                    for task in list(self._start_tasks):
+                        task.cancel()
+                    self._pending_waits.clear()
+                    logger.warning("boot aborted by shutdown request in %s", state.name)
+                    return
+                if not self._pending_waits and not self._start_tasks:
+                    break
                 await asyncio.sleep(0.05)
+        if self.stuck_error is not None:
+            self._watchdog_task = None
+            raise self.stuck_error
         logger.info("startup finished: %s", self.state.name)
 
     async def _enter(self, state: LifecycleState) -> None:
@@ -155,8 +169,17 @@ class LifecycleManager:
 
     def _start_task_done(self, task: asyncio.Task[object]) -> None:
         self._start_tasks.discard(task)
-        if not task.cancelled() and task.exception() is not None:
-            # Startup coroutines fail fast: surface the exception to the runner.
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            # F-19: a failed startup task aborts the boot -- the runner sees
+            # the failure instead of a "successfully" started half-server
+            # (the comment used to promise this but the code only logged).
+            if self.stuck_error is None:
+                self.stuck_error = StartupStuckError(
+                    f"start task failed during {self.state.name}: {exc!r}"
+                )
             logger.error("start task failed: %r", task)
 
     def add_start_wait(self, flag: str) -> Callable[[], None]:

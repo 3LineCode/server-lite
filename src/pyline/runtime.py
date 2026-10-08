@@ -103,6 +103,7 @@ class ServerRuntime:
         # Set False by teardown when the shutdown flush deadline passes with
         # dirty savers remaining; the process then exits non-zero (F-01).
         self.save_flush_ok = True
+        self.shutdown_timeout = 90.0
         self.monitor: LoopLatencyMonitor | None = None
         self.console: Console | None = None
         self.watcher: FileWatcher | None = None
@@ -331,28 +332,46 @@ class ServerRuntime:
         await self.lifecycle.request_shutdown(reason)
 
     async def _shutdown_teardown(self) -> None:
-        await self.bus.emit(FuncQuitEvent(), reverse=True)
-        self.save_flush_ok = await self.save_scheduler.stop()
-        if self.console is not None:
-            await self.console.stop()
-        if self.watcher is not None:
-            await self.watcher.stop()
-        if self.monitor is not None:
-            await self.monitor.stop()
-        if self._client_server is not None:
-            await close_server(self._client_server)
-            self._client_server = None
-        if self.proxy_server is not None:
-            await self.proxy_server.close()
-        if self.proxy_client is not None:
-            await self.proxy_client.close()
-        if self.bus_zmq is not None:
-            await self.bus_zmq.close()
-        if self.redis is not None:
-            await self.redis.close()
-        if self.mysql is not None:
-            await self.mysql.close()
-        await self.scheduler.close()
+        """Tear down in order; every step is guarded so a failure in one
+        cannot skip the rest (F-20: mysql.close must always get its chance),
+        and the whole sequence is bounded by ``shutdown_timeout``."""
+
+        async def guarded(name: str, step: Coroutine[Any, Any, object]) -> None:
+            try:
+                await step
+            except Exception:
+                logger.exception("shutdown step %r failed (continuing)", name)
+
+        async def sequence() -> None:
+            await guarded("func-quit", self.bus.emit(FuncQuitEvent(), reverse=True))
+            self.save_flush_ok = await self.save_scheduler.stop()
+            if self.console is not None:
+                await guarded("console", self.console.stop())
+            if self.watcher is not None:
+                await guarded("watcher", self.watcher.stop())
+            if self.monitor is not None:
+                await guarded("monitor", self.monitor.stop())
+            if self._client_server is not None:
+                await guarded("client-listener", close_server(self._client_server))
+                self._client_server = None
+            if self.proxy_server is not None:
+                await guarded("proxy-server", self.proxy_server.close())
+            if self.proxy_client is not None:
+                await guarded("proxy-client", self.proxy_client.close())
+            if self.bus_zmq is not None:
+                await guarded("zmq-bus", self.bus_zmq.close())
+            if self.redis is not None:
+                await guarded("redis", self.redis.close())
+            if self.mysql is not None:
+                await guarded("mysql", self.mysql.close())
+            await guarded("scheduler", self.scheduler.close())
+
+        try:
+            await asyncio.wait_for(sequence(), timeout=self.shutdown_timeout)
+        except TimeoutError:
+            logger.critical(
+                "shutdown teardown exceeded %.0fs; continuing exit", self.shutdown_timeout
+            )
 
 
 def build_context(
@@ -401,8 +420,15 @@ async def run_process(ctx: Context, config_dir: Path) -> None:
 
 def _install_signal_handlers(runtime: ServerRuntime) -> None:
     loop = asyncio.get_running_loop()
+    signal_count = {"n": 0}
 
     def handle_signal(sig: signal.Signals) -> None:
+        signal_count["n"] += 1
+        if signal_count["n"] >= 2:
+            # F-19: one signal graceful, two signals immediate (industry
+            # convention) -- the first shutdown may itself be stuck.
+            logger.warning("second signal %s; forcing immediate exit", sig.name)
+            os._exit(1)
         logger.info("received signal %s", sig.name)
         runtime._spawn(runtime.shutdown(f"signal {sig.name}"))
 
@@ -474,6 +500,7 @@ def main(argv: list[str] | None = None) -> None:
                 run_dir=Path(ctx.settings.log.log_dir),
             )
             main_runtime = ServerRuntime(ctx)
+            _install_signal_handlers(main_runtime)  # F-20: main process too
             await main_runtime.boot()
             while not main_runtime.lifecycle.in_quit():
                 await asyncio.sleep(0.5)

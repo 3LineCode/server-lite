@@ -85,3 +85,44 @@ async def test_shutdown_runs_hooks_and_quits_tasks() -> None:
     manager.track_quit_task(task)
     task.cancel()
     assert manager.state == LifecycleState.QUIT
+
+
+class TestBootHardeningF19:
+    async def test_boot_fails_when_start_task_fails(self) -> None:
+        """F-19: a failed startup task aborts the boot (was only logged)."""
+        manager = LifecycleManager(startup_timeout=10.0)
+
+        async def failing() -> None:
+            raise ConnectionError("db warmup died")
+
+        async def loop_init() -> None:
+            task = asyncio.get_running_loop().create_task(failing())
+            manager.track_start_task(task)
+
+        manager.on_step(LifecycleState.LOOP_INIT, loop_init)
+        with pytest.raises(StartupStuckError, match="db warmup died"):
+            await asyncio.wait_for(manager.run_boot(), 5.0)
+
+    async def test_shutdown_during_boot_exits_cleanly(self) -> None:
+        """F-19: a shutdown request mid-boot no longer hangs the boot loop."""
+        manager = LifecycleManager(startup_timeout=10.0)
+        cancelled: list[bool] = []
+
+        async def parked() -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+        async def loop_init() -> None:
+            task = asyncio.get_running_loop().create_task(parked())
+            manager.track_start_task(task)
+
+        manager.on_step(LifecycleState.LOOP_INIT, loop_init)
+        boot = asyncio.get_running_loop().create_task(manager.run_boot())
+        await asyncio.sleep(0.15)  # boot is now gating on the parked task
+        await manager.request_shutdown("test")
+        await asyncio.wait_for(boot, 3.0)  # used to hang forever
+        assert cancelled == [True]
+        assert manager.state == LifecycleState.QUIT

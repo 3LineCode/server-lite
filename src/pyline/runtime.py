@@ -1,7 +1,11 @@
 """Server runtime: assembles every component along the boot state machine.
 
 This replaces the prototype's launch.py / aiolaunch.py / asyncos.py / flowctrl
-wiring with one explicit, testable composition root.
+wiring with one explicit, testable composition root. The heavy machineries
+live in :mod:`pyline.runtime_wiring` (F-45): clock-event derivation, the DB
+topology layer, the operator surface, and the declarative teardown plan;
+ServerRuntime itself only orchestrates boot steps, business loading, the
+client listener and reload-and-rebind.
 """
 
 from __future__ import annotations
@@ -35,12 +39,6 @@ from pyline.core.events import (
     FuncDoneEvent,
     FuncInitEvent,
     FuncQuitEvent,
-    HalfHourEvent,
-    NewDayEvent,
-    NewHourEvent,
-    NewMonthEvent,
-    NewWeekEvent,
-    NewYearEvent,
     OnReloadEvent,
     PreReloadEvent,
 )
@@ -48,18 +46,7 @@ from pyline.core.lifecycle import LifecycleManager, LifecycleState
 from pyline.core.scheduler import Scheduler
 from pyline.core.supervisor import ProcessSupervisor
 from pyline.db.autosave import SaveScheduler
-from pyline.db.mysql import MySQLPool
-from pyline.db.orm import DataSaver
-from pyline.db.redis import RedisClient
-from pyline.db.schema import SchemaManager
-from pyline.db.service import (
-    DatabaseAccess,
-    DatabaseService,
-    NullPool,
-    NullRedis,
-)
-from pyline.devtools.console import Console
-from pyline.devtools.watcher import FileWatcher
+from pyline.db.service import DatabaseAccess
 from pyline.net import (
     Connection,
     MessageRouter,
@@ -71,14 +58,19 @@ from pyline.net import (
     close_server,
     serve,
 )
-from pyline.obs import LoopLatencyMonitor
 from pyline.obs.metrics import AlarmHub
 from pyline.reload.inplace import reload_module
+from pyline.runtime_wiring import (
+    ENV_UNSAFE_CONSOLE,
+    ClockEventEmitter,
+    DbLayer,
+    DevtoolsLayer,
+    TeardownPlan,
+)
 
 logger = logging.getLogger(__name__)
 
 ENV_SERVER_NO = "PYLINE_SERVER"
-ENV_UNSAFE_CONSOLE = "PYLINE_UNSAFE_CONSOLE"
 
 
 class ServerRuntime:
@@ -102,10 +94,18 @@ class ServerRuntime:
         self.proxy_client: ProxyClient | None = None
         self.proxy_server: ProxyServer | None = None
         self.db: DatabaseAccess | None = None
-        self.db_service: DatabaseService | None = None
-        self.mysql: MySQLPool | None = None
-        self.redis: RedisClient | None = None
         self.alarms = AlarmHub()
+        # F-45 wiring collaborators (clock chain, DB topology, operator
+        # surface); ServerRuntime orchestrates them.
+        self.db_layer = DbLayer(ctx, self.alarms)
+        self.devtools = DevtoolsLayer(ctx, self.alarms, self.bus)
+        self.clock_events = ClockEventEmitter(
+            self.clock,
+            self.scheduler,
+            self.bus,
+            log_dir=Path(ctx.settings.log.log_dir),
+            spawn=self._spawn,
+        )
         self.save_scheduler = SaveScheduler(
             on_alarm=lambda kind, payload: self.alarms.emit(kind, payload)
         )  # queue-depth alarm (F-42) rides the same hub; thresholds stay at
@@ -115,13 +115,8 @@ class ServerRuntime:
         self.save_flush_ok = True
         self._flush_completed = False
         self.shutdown_timeout = 90.0
-        self.monitor: LoopLatencyMonitor | None = None
-        self.console: Console | None = None
-        self.watcher: FileWatcher | None = None
         self._client_server: asyncio.AbstractServer | None = None
         self._client_control_rejected = 0
-        self._last_boundary = 0.0
-        self._clock_channel = logging.getLogger("pyline.channel.clock")
         self._bg_tasks: set[asyncio.Task[object]] = set()
 
     # ------------------------------------------------------------------ #
@@ -150,7 +145,7 @@ class ServerRuntime:
 
     async def _step_loop_init(self) -> None:
         self.scheduler.bind_loop(asyncio.get_running_loop())
-        self._start_clock_events()
+        self.clock_events.start()
 
     async def _step_frame_init(self) -> None:
         self._load_business()
@@ -178,41 +173,8 @@ class ServerRuntime:
         await self.bus.emit(FrameInitEvent())
 
     async def _step_conn_db(self) -> None:
-        if not self.ctx.entry.use_mysql and not self.ctx.entry.use_redis:
-            self.db = DatabaseAccess(remote=self.rpc, db_service_no=self.ctx.db_service_no())
-            return
-        owns_db = self.ctx.is_db_process or not self.ctx.entry.sub_process
-        if owns_db:
-            await self._connect_local_db()
-        else:
-            self.db = DatabaseAccess(remote=self.rpc, db_service_no=self.ctx.db_service_no())
-
-    async def _connect_local_db(self) -> None:
-        s = self.ctx.settings
-        if self.ctx.entry.use_mysql:
-            self.mysql = MySQLPool(
-                s.mysql,
-                # Pool loss raises the mysql_lost alarm (recovery itself runs
-                # inside the pool); the hub is wired from __init__, so this
-                # works even though CONN_DB precedes FUNC_DONE.
-                on_lost=lambda: self.alarms.emit(
-                    "mysql_lost", {"host": s.mysql.host, "port": s.mysql.port}
-                ),
-            )
-            await self.mysql.connect()
-            schema = SchemaManager(self.mysql, self.ctx.tables, s.mysql.db_name)
-            await schema.ensure_all()
-            self.ctx.services["schema"] = schema
-        if self.ctx.entry.use_redis:
-            self.redis = RedisClient(s.redis)
-            await self.redis.connect()
-        self.db_service = DatabaseService(
-            self.mysql if self.mysql is not None else NullPool(),
-            self.redis if self.redis is not None else NullRedis(),
-        )
-        assert self.rpc is not None
-        self.db_service.expose(self.rpc)
-        self.db = DatabaseAccess(local=self.db_service)
+        assert self.rpc is not None  # FRAME_INIT runs before CONN_DB
+        self.db = await self.db_layer.connect(self.rpc)
 
     async def _step_base_init(self) -> None:
         if self.ctx.is_db_process:
@@ -249,62 +211,21 @@ class ServerRuntime:
         self.save_scheduler.start()
         self._register_api_services()
         self._expose_saver_factory()
-        self.monitor = LoopLatencyMonitor(
-            on_alert=lambda delay: self.alarms.emit("loop_latency", {"delay": delay})
+        self.devtools.start(
+            reload_hook=self._reload_and_rebind,
+            shutdown_hook=lambda reason: asyncio.get_running_loop().create_task(
+                self.shutdown(reason)
+            ),
         )
-        self.monitor.start()
         self.ctx.services["alarms"] = self.alarms
-        self._start_metrics_server()
-        if self.ctx.is_develop:
-            # Terminal console on the main process only (F-27): sub-processes
-            # share one stdin and would fight over it.
-            if self.ctx.is_main_process:
-                self.console = Console(
-                    self.bus,
-                    unsafe=os.environ.get(ENV_UNSAFE_CONSOLE, "") == "1",
-                    reload_hook=self._reload_and_rebind,
-                    shutdown_hook=lambda reason: asyncio.get_running_loop().create_task(
-                        self.shutdown(reason)
-                    ),
-                )
-                self.console.start()
-            self.watcher = FileWatcher([Path.cwd()])
-            self.watcher.start()
         await self.bus.emit(FuncDoneEvent())
-
-    def _start_metrics_server(self) -> None:
-        """Export Prometheus metrics on the main process (F-28)."""
-        port = self.ctx.settings.metrics_port
-        if port is None or not self.ctx.is_main_process:
-            return
-        from prometheus_client import start_http_server
-
-        start_http_server(port)
-        logger.info("prometheus metrics on :%d", port)
 
     def _expose_saver_factory(self) -> None:
         """Provide a configured DataSaver factory for business code."""
-        schema = self.ctx.services.get("schema")
-        if isinstance(schema, SchemaManager) and self.db is not None:
-
-            def make_saver(
-                table: str,
-                column: str,
-                key: object,
-                codec: object = None,
-                **kwargs: object,
-            ) -> DataSaver:
-                return DataSaver(
-                    self.db,  # type: ignore[arg-type]
-                    schema,
-                    table,
-                    column,
-                    key,
-                    codec=codec,  # type: ignore[arg-type]
-                    scheduler=self.save_scheduler,
-                    **kwargs,  # type: ignore[arg-type]
-                )
-
+        if self.db is None:
+            return
+        make_saver = self.db_layer.saver_factory(self.db, self.save_scheduler)
+        if make_saver is not None:
             self.ctx.services["make_saver"] = make_saver
 
     async def _step_open_login(self) -> None:
@@ -365,60 +286,6 @@ class ServerRuntime:
             self.ctx.service_no,
         )
 
-    # ------------------------------------------------------------------ #
-    # Clock events (half-hour / hour / day / week / month / year)
-    # ------------------------------------------------------------------ #
-
-    def _start_clock_events(self) -> None:
-        self._last_boundary = self.clock.now()
-        self._clock_channel = pyline_log.file_logger("clock", Path(self.ctx.settings.log.log_dir))
-
-        def on_boundary() -> None:
-            self._emit_clock_events()
-            deadline = self.clock.next_halfhour_after(self.clock.now())
-            self.scheduler.call_after(
-                max(deadline - self.clock.now(), 0.1), on_boundary, label="clock-boundary"
-            )
-
-        deadline = self.clock.next_halfhour_after(self.clock.now())
-        self.scheduler.call_after(
-            max(deadline - self.clock.now(), 0.1), on_boundary, label="clock-boundary"
-        )
-
-    def _emit_clock_events(self) -> None:
-        """Fire every :00/:30 boundary since the last one emitted (F-25: a
-        delayed tick used to silently swallow whole hours)."""
-        now_ts = self.clock.now()
-        cursor = self._last_boundary
-        for _ in range(96):  # at most two days of catch-up per tick
-            boundary = self.clock.next_halfhour_after(cursor)
-            if boundary > now_ts:
-                break
-            self._fire_boundary_events(boundary)
-            cursor = boundary
-        self._last_boundary = now_ts
-
-    def _fire_boundary_events(self, ts: float) -> None:
-        # Derive wall-clock fields through the clock itself so a pinned tz can
-        # never disagree with next_halfhour_after's boundary math.
-        local = self.clock.local(ts)
-        events: list[object] = []
-        if local.minute == 0:
-            events.append(NewHourEvent(hour=local.hour))
-            if local.hour == 0:
-                events.append(NewDayEvent(day=self.clock.day_no(ts)))
-                if local.day == 1:
-                    events.append(NewMonthEvent(month=local.month))
-                    if local.month == 1:
-                        events.append(NewYearEvent(year=local.year))
-                if local.weekday() == 0:
-                    events.append(NewWeekEvent(week_no=self.clock.week_no(ts)))
-        elif local.minute == 30:
-            events.append(HalfHourEvent(hour=local.hour))
-        for event in events:
-            self._clock_channel.info("event: %s", type(event).__name__)
-            self._spawn(self.bus.emit(event))
-
     def _spawn(self, coro: Coroutine[Any, Any, object]) -> None:
         """Fire-and-forget background work with a kept reference."""
         task = asyncio.get_running_loop().create_task(coro)
@@ -436,41 +303,38 @@ class ServerRuntime:
         """Tear down in order; every step is guarded so a failure in one
         cannot skip the rest (F-20: mysql.close must always get its chance),
         and the whole sequence is bounded by ``shutdown_timeout``."""
+        plan = TeardownPlan()
 
-        async def guarded(name: str, step: Coroutine[Any, Any, object]) -> None:
-            try:
-                await step
-            except Exception:
-                logger.exception("shutdown step %r failed (continuing)", name)
-
-        async def sequence() -> None:
-            await guarded("func-quit", self.bus.emit(FuncQuitEvent(), reverse=True))
+        async def flush_step() -> None:
             flush_ok = await self.save_scheduler.stop()
             self._flush_completed = True
             self.save_flush_ok = flush_ok
-            if self.console is not None:
-                await guarded("console", self.console.stop())
-            if self.watcher is not None:
-                await guarded("watcher", self.watcher.stop())
-            if self.monitor is not None:
-                await guarded("monitor", self.monitor.stop())
-            if self._client_server is not None:
-                await guarded("client-listener", close_server(self._client_server))
-                self._client_server = None
-            if self.proxy_server is not None:
-                await guarded("proxy-server", self.proxy_server.close())
-            if self.proxy_client is not None:
-                await guarded("proxy-client", self.proxy_client.close())
-            if self.bus_zmq is not None:
-                await guarded("zmq-bus", self.bus_zmq.close())
-            if self.redis is not None:
-                await guarded("redis", self.redis.close())
-            if self.mysql is not None:
-                await guarded("mysql", self.mysql.close())
-            await guarded("scheduler", self.scheduler.close())
+
+        plan.add("func-quit", lambda: self.bus.emit(FuncQuitEvent(), reverse=True))
+        plan.add("save-flush", flush_step)
+        if self.devtools.console is not None:
+            plan.add("console", self.devtools.console.stop)
+        if self.devtools.watcher is not None:
+            plan.add("watcher", self.devtools.watcher.stop)
+        if self.devtools.monitor is not None:
+            plan.add("monitor", self.devtools.monitor.stop)
+        if self._client_server is not None:
+            server, self._client_server = self._client_server, None
+            plan.add("client-listener", lambda: close_server(server))
+        if self.proxy_server is not None:
+            plan.add("proxy-server", self.proxy_server.close)
+        if self.proxy_client is not None:
+            plan.add("proxy-client", self.proxy_client.close)
+        if self.bus_zmq is not None:
+            plan.add("zmq-bus", self.bus_zmq.close)
+        if self.db_layer.redis is not None:
+            plan.add("redis", self.db_layer.redis.close)
+        if self.db_layer.mysql is not None:
+            plan.add("mysql", self.db_layer.mysql.close)
+        plan.add("scheduler", self.scheduler.close)
 
         try:
-            await asyncio.wait_for(sequence(), timeout=self.shutdown_timeout)
+            await asyncio.wait_for(plan.run(), timeout=self.shutdown_timeout)
         except TimeoutError:
             if not self._flush_completed:
                 # The deadline hit before the flush step finished (or started):

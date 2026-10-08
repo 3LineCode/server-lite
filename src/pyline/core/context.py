@@ -86,5 +86,8 @@ class Context:
             return 0
         subs = list(self.entry.sub_process)
         if process_type not in subs:
-            return 0
+            raise ValueError(
+                f"unknown process type {process_type!r}; configured sub-processes: "
+                f"{[*subs, PROCESS_MAIN]}"
+            )
         return subs.index(process_type) + 1

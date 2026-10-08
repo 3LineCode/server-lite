@@ -138,3 +138,28 @@ class TestMySQLSettingsHardening:
         assert TableFieldDef(type="BIGINT", default="7").default == "7"
         field = TableFieldDef(type="VARCHAR(8)", default="'a'")
         assert field.default == "'a'"
+
+
+class TestLoaderHardeningF26:
+    def test_duplicate_server_number_rejected(self, config_dir) -> None:
+        (config_dir / "servers.json5").write_text(
+            '{"1": {"name": "a", "advertise_ip": "10.0.0.1"}, '
+            '"0001": {"name": "b", "advertise_ip": "10.0.0.2"}}',
+            encoding="utf-8",
+        )
+        with pytest.raises(Exception, match="duplicate server number 1"):
+            load_server_registry(config_dir)
+
+    def test_plain_empty_allowed_for_noauth(self) -> None:
+        assert resolve_secret("$plain:") == ""
+
+    def test_inter_token_resolved_from_secrets(self, config_dir) -> None:
+        (config_dir / "project.json5").write_text(
+            (config_dir / "project.json5").read_text(encoding="utf-8").replace(
+                '"token": "$plain:unit-test-token",',
+                '"token": "$plain:unit-test-token",\n        "inter_token": "$plain:inner-token",'
+            ),
+            encoding="utf-8",
+        )
+        settings = load_project_settings(config_dir)
+        assert settings.socket.inter_token == "inner-token"

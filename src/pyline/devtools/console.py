@@ -7,7 +7,7 @@ Built-in commands::
     kill | stop          -- immediate process kill
     clear | cls          -- clear screen
     update <mod,...>     -- hot-reload modules
-    $ <text>             -- forward to the business ConsoleCommandEvent
+    $ <text> | ￥ <text> -- forward to the business ConsoleCommandEvent
 
 Arbitrary ``eval``/``exec`` of typed lines is **disabled by default**
 (prototype issue #11); pass ``unsafe=True`` (wired to ``--unsafe-console``)
@@ -105,7 +105,7 @@ class Console:
                 for module in rest.replace(" ", "").split(","):
                     if module:
                         self._reload_hook(module)
-            case "$":
+            case "$" | "￥":  # fullwidth variant, prototype parity
                 asyncio.get_running_loop().create_task(
                     self._bus.emit(ConsoleCommandEvent(command=rest))
                 )

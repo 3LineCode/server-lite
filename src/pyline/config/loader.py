@@ -20,6 +20,7 @@ from pyline.config.secrets import resolve_secret
 # Paths (section, key) inside project.json5 that hold secret references.
 _SECRET_PATHS: tuple[tuple[str, str], ...] = (
     ("socket", "token"),
+    ("socket", "inter_token"),
     ("mysql", "password"),
     ("redis", "password"),
 )
@@ -72,6 +73,11 @@ def load_server_registry(config_dir: Path) -> ServerRegistry:
     entries: dict[int, ServerEntry] = {}
     for key, server in servers.items():
         server_no = int(key)
+        if server_no in entries:
+            raise ConfigError(
+                f"servers.json5: duplicate server number {server_no} "
+                f"(keys {key!r} collide after int conversion)"
+            )
         merged: dict[str, Any] = {}
         base_name = server.pop("base", None)
         if base_name is not None:

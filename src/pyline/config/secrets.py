@@ -34,6 +34,10 @@ def resolve_secret(value: str, *, config_dir: Path | None = None) -> str:
             f"value of {len(value)} chars; use $env:VAR or $file:key instead"
         )
     kind, _, ref = value.partition(":")
+    if kind == "$plain":
+        # Empty $plain: means "explicitly no secret" (e.g. no-auth Redis),
+        # matching the RedisSettings docs; all other kinds require a ref.
+        return ref
     if not ref:
         raise ConfigError(f"malformed secret reference: {value!r}")
     match kind:

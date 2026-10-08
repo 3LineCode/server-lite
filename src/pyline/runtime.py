@@ -203,15 +203,18 @@ class ServerRuntime:
         self.monitor = LoopLatencyMonitor()
         self.monitor.start()
         if self.ctx.is_develop:
-            self.console = Console(
-                self.bus,
-                unsafe=os.environ.get(ENV_UNSAFE_CONSOLE, "") == "1",
-                reload_hook=reload_module,
-                shutdown_hook=lambda reason: asyncio.get_running_loop().create_task(
-                    self.shutdown(reason)
-                ),
-            )
-            self.console.start()
+            # Terminal console on the main process only (F-27): sub-processes
+            # share one stdin and would fight over it.
+            if self.ctx.is_main_process:
+                self.console = Console(
+                    self.bus,
+                    unsafe=os.environ.get(ENV_UNSAFE_CONSOLE, "") == "1",
+                    reload_hook=reload_module,
+                    shutdown_hook=lambda reason: asyncio.get_running_loop().create_task(
+                        self.shutdown(reason)
+                    ),
+                )
+                self.console.start()
             self.watcher = FileWatcher([Path.cwd()])
             self.watcher.start()
         await self.bus.emit(FuncDoneEvent())

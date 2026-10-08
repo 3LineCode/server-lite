@@ -36,6 +36,7 @@ class Metrics:
         self.rpc_timeouts = Counter(f"{namespace}_rpc_timeouts_total", "Timed-out RPC calls")
         self.save_queue = Gauge(f"{namespace}_save_queue", "Pending auto-save entries")
         self.save_flushed = Counter(f"{namespace}_save_flushed_total", "Flushed save entries")
+        self.save_failures = Counter(f"{namespace}_save_failures_total", "Failed save flushes")
         self.reload_total = Counter(f"{namespace}_reload_total", "Hot reloads", ("result",))
 
 

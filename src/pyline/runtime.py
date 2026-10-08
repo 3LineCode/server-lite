@@ -99,6 +99,9 @@ class ServerRuntime:
         self.mysql: MySQLPool | None = None
         self.redis: RedisClient | None = None
         self.save_scheduler = SaveScheduler()
+        # Set False by teardown when the shutdown flush deadline passes with
+        # dirty savers remaining; the process then exits non-zero (F-01).
+        self.save_flush_ok = True
         self.monitor: LoopLatencyMonitor | None = None
         self.console: Console | None = None
         self.watcher: FileWatcher | None = None
@@ -312,7 +315,7 @@ class ServerRuntime:
 
     async def _shutdown_teardown(self) -> None:
         await self.bus.emit(FuncQuitEvent(), reverse=True)
-        await self.save_scheduler.stop()
+        self.save_flush_ok = await self.save_scheduler.stop()
         if self.console is not None:
             await self.console.stop()
         if self.watcher is not None:
@@ -375,6 +378,8 @@ async def run_process(ctx: Context, config_dir: Path) -> None:
     finally:
         if not runtime.lifecycle.in_quit():
             await runtime.shutdown("main loop exit")
+    if not runtime.save_flush_ok:
+        raise SystemExit(3)  # dirty data could not be flushed at shutdown
 
 
 def _install_signal_handlers(runtime: ServerRuntime) -> None:
@@ -456,6 +461,8 @@ def main(argv: list[str] | None = None) -> None:
             while not main_runtime.lifecycle.in_quit():
                 await asyncio.sleep(0.5)
             await supervisor.terminate_children()
+            if not main_runtime.save_flush_ok:
+                raise SystemExit(3)  # dirty data could not be flushed at shutdown
 
         asyncio.run(main_proc())
     else:

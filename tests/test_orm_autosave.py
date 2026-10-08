@@ -129,23 +129,111 @@ class TestSaveScheduler:
         assert scheduler.saved_total == 5
         assert len(db.rows) == 5
 
-    async def test_failure_retry_then_drop(self) -> None:
-        class FailingDB(FakeDB):
+    async def test_autosave_retry_keeps_dirty(self) -> None:
+        """F-01: a failing saver is never dropped; retries back off exponentially."""
+
+        class FlakyDB(FakeDB):
             fail = True
+            attempts = 0
 
             async def execute(self, sql: str, args: tuple = ()) -> int:
+                self.attempts += 1
                 if self.fail:
                     raise ConnectionError("db down")
                 return await super().execute(sql, args)
 
-        db = FailingDB()
-        scheduler = SaveScheduler(interval=0.05, batch_size=10, retry_cooldown=0.01, max_attempts=2)
-        scheduler.start()
+        db = FlakyDB()
+        alarms: list[tuple[str, dict]] = []
+        scheduler = SaveScheduler(
+            interval=60.0,  # drive flush_batch() manually
+            retry_cooldown=0.05,
+            retry_cap=1.0,
+            alarm_threshold=2,
+            on_alarm=lambda kind, payload: alarms.append((kind, payload)),
+        )
         saver = DataSaver(db, make_schema(), "tbl_player", "data", 9, scheduler=scheduler)
         saver.set_data({"x": 1})
-        await asyncio.sleep(0.3)
-        assert scheduler.dropped_total == 1
+
+        await scheduler.flush_batch()  # attempt 1 fails -> deferred 0.05s
+        assert scheduler.queue_depth() == 1
+        assert db.attempts == 1
+
+        await scheduler.flush_batch()  # not due yet: backoff gates the retry
+        assert db.attempts == 1
+        assert scheduler.queue_depth() == 1
+
+        await asyncio.sleep(0.06)  # backoff expires
+        await scheduler.flush_batch()  # attempt 2 fails -> deferred 0.1s
+        assert db.attempts == 2
+        assert scheduler.queue_depth() == 1  # still queued, never dropped
+        assert alarms and alarms[0][0] == "save_retry"
         assert scheduler.saved_total == 0
+
+        # database recovers: the next due retry succeeds and drains the queue
+        db.fail = False
+        await asyncio.sleep(0.11)
+        await scheduler.flush_batch()
+        assert scheduler.queue_depth() == 0
+        assert scheduler.saved_total == 1
+        assert ("tbl_player", 9) in db.rows
+
+    async def test_autosave_shutdown_flush_retries(self) -> None:
+        """F-02: shutdown draining retries until the database recovers."""
+
+        class FlakyDB(FakeDB):
+            fail_remaining = 2
+
+            async def execute(self, sql: str, args: tuple = ()) -> int:
+                if self.fail_remaining > 0:
+                    self.fail_remaining -= 1
+                    raise ConnectionError("db down")
+                return await super().execute(sql, args)
+
+        db = FlakyDB()
+        scheduler = SaveScheduler(interval=60.0, shutdown_flush_timeout=2.0)
+        saver = DataSaver(db, make_schema(), "tbl_player", "data", 4, scheduler=scheduler)
+        saver.set_data({"final": True})
+        assert await scheduler.stop() is True
+        assert ("tbl_player", 4) in db.rows
+        assert scheduler.saved_total == 1
+
+    async def test_autosave_shutdown_deadline_reports_loss(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """F-02: deadline exceeded -> per-saver CRITICAL report and False."""
+
+        class DeadDB(FakeDB):
+            async def execute(self, sql: str, args: tuple = ()) -> int:
+                raise ConnectionError("db down")
+
+        scheduler = SaveScheduler(interval=60.0, shutdown_flush_timeout=0.05)
+        saver = DataSaver(DeadDB(), make_schema(), "tbl_player", "data", 5, scheduler=scheduler)
+        saver.set_data({"lost": True})
+        with caplog.at_level("CRITICAL", logger="pyline.db.autosave"):
+            assert await scheduler.stop() is False
+        assert any("UNFLUSHED DATA AT SHUTDOWN" in r.message for r in caplog.records)
+        assert any(repr(saver) in r.message for r in caplog.records)
+
+    async def test_autosave_stop_drains_inflight(self) -> None:
+        """F-02: cancellation mid-flush requeues the saver; stop() still flushes it."""
+
+        class SlowDB(FakeDB):
+            async def execute(self, sql: str, args: tuple = ()) -> int:
+                await asyncio.sleep(0.2)
+                return await super().execute(sql, args)
+
+        db = SlowDB()
+        scheduler = SaveScheduler(interval=0.01, batch_size=10)
+        scheduler.start()
+        saver = DataSaver(db, make_schema(), "tbl_player", "data", 7, scheduler=scheduler)
+        saver.set_data({"x": 1})
+        for _ in range(200):  # wait until the loop task is mid-flush
+            if scheduler._inflight:
+                break
+            await asyncio.sleep(0.005)
+        assert scheduler._inflight  # cancellation will land inside saver.flush()
+        assert await scheduler.stop() is True
+        assert ("tbl_player", 7) in db.rows
 
     async def test_flush_all_on_stop(self) -> None:
         db = FakeDB()

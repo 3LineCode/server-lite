@@ -16,7 +16,7 @@ import contextlib
 import logging
 import re
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any, cast
 
 import asyncmy
@@ -61,6 +61,74 @@ class MySQLError(Exception):
 
 class MySQLLostError(MySQLError):
     """Keepalive missed its limit; the pool is considered dead."""
+
+
+class _TxSession:
+    """Statement pair running on one already-acquired connection (F-43)."""
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    async def execute(self, sql: str, args: Sequence[Any] = ()) -> int:
+        async with self._conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(args))
+            return cast(int, cursor.rowcount)
+
+    async def query(self, sql: str, args: Sequence[Any] = ()) -> list[tuple[Any, ...]]:
+        async with self._conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(args))
+            rows = await cursor.fetchall()
+            return [tuple(row) for row in rows]
+
+
+class MySQLSession:
+    """Dedicated out-of-pool connection for a multi-statement transaction.
+
+    Used by the DB process to serve remote transactions over RPC (F-43): the
+    session must outlive each individual RPC round-trip, so it cannot ride
+    the per-statement pool. Concurrency is capped by the service layer.
+    """
+
+    def __init__(self, settings: MySQLSettings) -> None:
+        self._settings = settings
+        self._conn: Any = None
+
+    async def open(self) -> None:
+        s = self._settings
+        self._conn = await asyncmy.connect(
+            host=s.host,
+            port=s.port,
+            user=s.user,
+            password=s.password,
+            db=s.db_name,
+            charset=s.charset,
+            autocommit=True,
+            read_timeout=s.read_timeout,
+        )
+
+    async def begin(self) -> None:
+        async with self._conn.cursor() as cursor:
+            await cursor.execute("BEGIN")
+
+    async def commit(self) -> None:
+        async with self._conn.cursor() as cursor:
+            await cursor.execute("COMMIT")
+
+    async def rollback(self) -> None:
+        async with self._conn.cursor() as cursor:
+            await cursor.execute("ROLLBACK")
+
+    async def execute(self, sql: str, args: Sequence[Any] = ()) -> int:
+        return await _TxSession(self._conn).execute(sql, args)
+
+    async def query(self, sql: str, args: Sequence[Any] = ()) -> list[tuple[Any, ...]]:
+        return await _TxSession(self._conn).query(sql, args)
+
+    async def close(self) -> None:
+        if self._conn is not None:
+            with contextlib.suppress(Exception):
+                await self._conn.ensure_closed()
+            self._conn = None
 
 
 # Recovery retries back off exponentially between these bounds so a long
@@ -156,6 +224,42 @@ class MySQLPool:
                     return [tuple(row) for row in await cursor.fetchall()]
                 await conn.commit()
                 return cursor.rowcount
+
+    @contextlib.asynccontextmanager
+    async def transaction(self) -> AsyncIterator[_TxSession]:
+        """One transaction on a dedicated pooled connection (F-43).
+
+        The connection is held for the whole block and returned to the pool
+        afterwards; an exception body-side rolls back before propagating, and
+        a failed COMMIT also attempts a rollback so the connection cannot go
+        back into the pool with an open transaction.
+        """
+        if self._pool is None or self._closed:
+            raise MySQLError("mysql pool is not connected")
+        async with self._pool.acquire() as conn:
+            await self._ensure_isolation(conn)
+            session = _TxSession(conn)
+            await session.execute("BEGIN")
+            try:
+                yield session
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await session.execute("ROLLBACK")
+                raise
+            try:
+                await session.execute("COMMIT")
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await session.execute("ROLLBACK")
+                raise
+
+    async def open_session(self) -> MySQLSession:
+        """Open a dedicated transaction session (F-43); see :class:`MySQLSession`."""
+        if self._pool is None or self._closed:
+            raise MySQLError("mysql pool is not connected")
+        session = MySQLSession(self._settings)
+        await session.open()
+        return session
 
     async def _ensure_isolation(self, conn: Any) -> None:
         if conn in self._configured_conns:

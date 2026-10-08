@@ -173,3 +173,60 @@ class TestFreshBoot:
         finally:
             await pool.close()
             await _drop_database(settings)
+
+
+@requires_mysql
+class TestTransactionsF43:
+    async def test_pool_transaction_commits_and_rolls_back(
+        self, mysql_settings: MySQLSettings
+    ) -> None:
+        """F-43: a dedicated pooled connection runs BEGIN..COMMIT / ROLLBACK;
+        a second connection sees nothing until the unit commits."""
+        settings = mysql_settings
+        pool = MySQLPool(settings)
+        try:
+            await pool.connect()
+            manager = SchemaManager(pool, _player_tables(), settings.db_name)
+            await manager.ensure_all()
+            async with pool.transaction() as tx:
+                await tx.execute("INSERT INTO `tbl_player` (`id`) VALUES (1)")
+                # uncommitted write invisible from the autocommit pool path
+                rows = await pool.query("SELECT `id` FROM `tbl_player` WHERE `id` = 1")
+                assert rows == []
+                rows_in_tx = await tx.query("SELECT `id` FROM `tbl_player` WHERE `id` = 1")
+                assert rows_in_tx == [(1,)]
+            rows = await pool.query("SELECT `id` FROM `tbl_player` WHERE `id` = 1")
+            assert rows == [(1,)]
+
+            class Boom(Exception):
+                pass
+
+            with pytest.raises(Boom):
+                async with pool.transaction() as tx:
+                    await tx.execute("DELETE FROM `tbl_player` WHERE `id` = 1")
+                    raise Boom()
+            rows = await pool.query("SELECT `id` FROM `tbl_player` WHERE `id` = 1")
+            assert rows == [(1,)]  # rolled back
+        finally:
+            await pool.close()
+            await _drop_database(settings)
+
+    async def test_open_session_round_trip(self, mysql_settings: MySQLSettings) -> None:
+        """F-43: the RPC-session primitive (dedicated out-of-pool connection)
+        begins, executes, commits and closes."""
+        settings = mysql_settings
+        pool = MySQLPool(settings)
+        try:
+            await pool.connect()
+            manager = SchemaManager(pool, _player_tables(), settings.db_name)
+            await manager.ensure_all()
+            session = await pool.open_session()
+            await session.begin()
+            await session.execute("INSERT INTO `tbl_player` (`id`) VALUES (2)")
+            await session.commit()
+            await session.close()
+            rows = await pool.query("SELECT `id` FROM `tbl_player` WHERE `id` = 2")
+            assert rows == [(2,)]
+        finally:
+            await pool.close()
+            await _drop_database(settings)

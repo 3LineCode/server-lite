@@ -11,7 +11,7 @@ from pyline.core.scheduler import Scheduler
 
 
 async def test_short_delay_fires() -> None:
-    sched = Scheduler()
+    sched = Scheduler(loop=asyncio.get_running_loop())
     fired = asyncio.Event()
     sched.call_after(0.02, fired.set, label="t")
     await asyncio.wait_for(fired.wait(), 1.0)
@@ -20,7 +20,7 @@ async def test_short_delay_fires() -> None:
 
 async def test_long_delay_via_wheel(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("pyline.core.scheduler.SHORT_DELAY", 0.3)
-    sched = Scheduler()
+    sched = Scheduler(loop=asyncio.get_running_loop())
     fired = asyncio.Event()
     sched.call_after(0.8, fired.set, label="wheel")  # > SHORT_DELAY -> wheel path
     assert sched.pending_count() == 1
@@ -34,7 +34,7 @@ async def test_long_delay_via_wheel(monkeypatch: pytest.MonkeyPatch) -> None:
 
 async def test_wheel_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("pyline.core.scheduler.SHORT_DELAY", 0.3)
-    sched = Scheduler()
+    sched = Scheduler(loop=asyncio.get_running_loop())
     fired = asyncio.Event()
     handle = sched.call_after(0.8, fired.set, label="wheel")
     handle.cancel()
@@ -44,7 +44,7 @@ async def test_wheel_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def test_repeating_and_cancel() -> None:
-    sched = Scheduler()
+    sched = Scheduler(loop=asyncio.get_running_loop())
     counter = {"n": 0}
     handle = sched.call_repeating(0.05, lambda: counter.__setitem__("n", counter["n"] + 1))
     await asyncio.sleep(0.25)
@@ -57,7 +57,7 @@ async def test_repeating_and_cancel() -> None:
 
 
 async def test_exception_isolated() -> None:
-    sched = Scheduler()
+    sched = Scheduler(loop=asyncio.get_running_loop())
 
     def boom() -> None:
         raise RuntimeError("boom")

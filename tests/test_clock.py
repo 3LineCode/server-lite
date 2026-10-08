@@ -37,3 +37,28 @@ def test_next_halfhour_boundary() -> None:
     assert after.second == 0
     assert hour == after.hour
     assert deadline > clock.now()
+
+
+class TestClockF25:
+    def test_next_halfhour_after_strictly_increases(self) -> None:
+        clock = GameClock()
+        ts = clock.now()
+        first = clock.next_halfhour_after(ts)
+        assert first > ts
+        assert clock.next_halfhour_after(first) > first
+
+    def test_numbering_bases_frozen(self) -> None:
+        """F-25 compat: day/week 1-based from 2024-01-01, month 0-based."""
+        import time as _time
+
+        clock = GameClock()
+        epoch_ts = _time.mktime(__import__("datetime").datetime(2024, 1, 1).timetuple())
+        assert clock.day_no(epoch_ts + 1) == 1
+        assert clock.week_no(epoch_ts + 1) == 1
+        assert clock.month_no(epoch_ts + 1) == 0
+        assert clock.month_no(epoch_ts + 32 * 86400) == 1
+
+    def test_tz_pinned_wall_clock(self) -> None:
+        clock = GameClock(tz="Asia/Shanghai")
+        # 2024-07-01 00:30 UTC == 08:30 in Shanghai
+        assert clock.hour(1719793800) == 8

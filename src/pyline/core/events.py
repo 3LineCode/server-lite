@@ -32,10 +32,17 @@ _VALID_LAYERS = (LAYER_FRAMEWORK, LAYER_PUBLIC, LAYER_BUSINESS)
 
 EventHandler = Callable[[Any], Any]
 
-
 # --------------------------------------------------------------------------- #
 # Framework-defined event types
 # --------------------------------------------------------------------------- #
+
+
+@dataclass(slots=True)
+class EnvReadyEvent:
+    """Config + Context are built; fires before any boot step runs.
+
+    The async replacement for the prototype's pre-loop ``OnEnvInit`` hook.
+    """
 
 
 @dataclass(slots=True)
@@ -80,7 +87,10 @@ class NewDayEvent:
 
 @dataclass(slots=True)
 class NewWeekEvent:
-    week_day: int
+    """A new ISO week started (Monday). ``week_no`` is the 1-based game week
+    number (the prototype passed the constant 1 as ``week_day``)."""
+
+    week_no: int
 
 
 @dataclass(slots=True)
@@ -121,12 +131,18 @@ class StartupContextEvent:
 
 
 class EventBus:
-    """In-process, single-loop event bus."""
+    """In-process, single-loop event bus.
+
+    Subscribing a base class receives its subclasses too (F-24: subscription
+    matching walks ``type(event).__mro__``); that is what makes
+    ``StartupContextEvent``-style base subscriptions usable.
+    """
 
     def __init__(self) -> None:
-        # (event_type_name, layer) -> [handlers]
+        # (event_type, layer) -> [handlers]
         self._handlers: dict[tuple[type, int], list[EventHandler]] = {}
         self._failure_counts: dict[str, int] = {}
+        self._mro_cache: dict[type, tuple[tuple[type, int], ...]] = {}
 
     def subscribe(
         self,
@@ -139,19 +155,40 @@ class EventBus:
         if layer not in _VALID_LAYERS:
             raise ValueError(f"invalid layer {layer!r}")
         self._handlers.setdefault((event_type, layer), []).append(handler)
+        self._mro_cache.clear()
         return lambda: self._unsubscribe(event_type, layer, handler)
 
     def _unsubscribe(self, event_type: type, layer: int, handler: EventHandler) -> None:
         handlers = self._handlers.get((event_type, layer))
         if handlers and handler in handlers:
             handlers.remove(handler)
+            self._mro_cache.clear()
+
+    def _subscription_keys(self, event_type: type) -> tuple[tuple[type, int], ...]:
+        """Subscribed keys whose type is event_type or a base of it."""
+        cached = self._mro_cache.get(event_type)
+        if cached is not None:
+            return cached
+        keys = [
+            (klass, layer)
+            for klass in event_type.__mro__
+            if klass is not object
+            for layer in _VALID_LAYERS
+            if (klass, layer) in self._handlers
+        ]
+        self._mro_cache[event_type] = tuple(keys)
+        return self._mro_cache[event_type]
 
     async def emit(self, event: Any, *, reverse: bool = False) -> None:
         """Dispatch ``event`` to all layers, in layer order (or reverse)."""
         layers = reversed(_VALID_LAYERS) if reverse else iter(_VALID_LAYERS)
+        keys = self._subscription_keys(type(event))
         for layer in layers:
-            for handler in list(self._handlers.get((type(event), layer), [])):
-                await self._invoke(event, handler)
+            for key in keys:
+                if key[1] != layer:
+                    continue
+                for handler in list(self._handlers.get(key, [])):
+                    await self._invoke(event, handler)
 
     async def _invoke(self, event: Any, handler: EventHandler) -> None:
         name = getattr(handler, "__qualname__", repr(handler))
@@ -169,6 +206,7 @@ class EventBus:
 
     def clear(self) -> None:
         self._handlers.clear()
+        self._mro_cache.clear()
 
 
 def describe_event_file(path: Path) -> str:

@@ -64,6 +64,11 @@ class Scheduler:
         self._seq = itertools.count(1)
         self._tick_task: asyncio.Task[None] | None = None
         self._closed = False
+        # F-23: short-path loop timers are tracked so close() can cancel them
+        # (they used to keep firing -- and erroring -- after shutdown), and
+        # coroutine callbacks keep a strong ref + done-callback.
+        self._short_timers: set[asyncio.TimerHandle] = set()
+        self._async_tasks: set[asyncio.Task[object]] = set()
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         if self._loop is not None and self._loop is not loop:
@@ -73,7 +78,10 @@ class Scheduler:
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
         if self._loop is None:
-            self._loop = asyncio.get_event_loop_policy().get_event_loop()
+            # Explicit binding only (F-23): the lazy deprecated
+            # get_event_loop() fallback explodes when called off-loop and
+            # hides missing-bind bugs.
+            raise RuntimeError("scheduler is not bound; call bind_loop() inside the loop")
         return self._loop
 
     # ------------------------------------------------------------------ #
@@ -95,6 +103,8 @@ class Scheduler:
         self, interval: float, func: Callable[..., object], *args: object, label: str = ""
     ) -> TimerHandle:
         """Repeat ``func`` every ``interval`` seconds until cancelled."""
+        if interval <= 0:
+            raise ValueError(f"repeating interval must be > 0, got {interval}")
         stopped = {"v": False}
 
         def run_once() -> None:
@@ -114,7 +124,8 @@ class Scheduler:
         self.loop.call_soon(func, *args)
 
     def pending_count(self) -> int:
-        return len(self._entries)
+        """Total pending timers: wheel entries + live short-path timers."""
+        return len(self._entries) + len(self._short_timers)
 
     async def close(self) -> None:
         self._closed = True
@@ -123,8 +134,12 @@ class Scheduler:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._tick_task
             self._tick_task = None
+        for timer in self._short_timers:
+            timer.cancel()
+        self._short_timers.clear()
         self._wheel.clear()
         self._entries.clear()
+        self._async_tasks.clear()
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -137,16 +152,40 @@ class Scheduler:
         args: tuple[object, ...],
         label: str,
     ) -> TimerHandle:
-        loop_timer = self.loop.call_later(delay, self._fire, func, args, label)
-        return TimerHandle(loop_timer.cancel)
+        holder: dict[str, asyncio.TimerHandle | None] = {"h": None}
+
+        def fire() -> None:
+            handle = holder["h"]
+            if handle is not None:
+                self._short_timers.discard(handle)
+            self._fire(func, args, label)
+
+        loop_timer = self.loop.call_later(delay, fire)
+        holder["h"] = loop_timer
+        self._short_timers.add(loop_timer)
+
+        def cancel() -> None:
+            loop_timer.cancel()
+            self._short_timers.discard(loop_timer)
+
+        return TimerHandle(cancel)
 
     def _fire(self, func: Callable[..., object], args: tuple[object, ...], label: str) -> None:
         try:
             result = func(*args)
             if asyncio.iscoroutine(result):
-                self.loop.create_task(result)
+                # F-23: hold the reference and observe the outcome (a bare
+                # create_task died with "exception was never retrieved").
+                task = self.loop.create_task(result)
+                self._async_tasks.add(task)
+                task.add_done_callback(self._async_task_done)
         except Exception:
             logger.exception("timer %r failed", label or func)
+
+    def _async_task_done(self, task: asyncio.Task[object]) -> None:
+        self._async_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("timer coroutine failed: %r", task)
 
     def _schedule_wheel(
         self,

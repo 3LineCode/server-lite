@@ -63,7 +63,10 @@ def _set_handlers(root: logging.Logger, *handlers: logging.Handler) -> None:
         root.addHandler(handler)
 
 
-_file_channels: dict[str, logging.Logger] = {}
+# Keyed by (name, target path, rotation): the same channel name requested
+# with a different run_dir (multi-setup tests, re-init) used to silently
+# return the OLD channel writing to the OLD file (F-22).
+_file_channels: dict[tuple[str, str, int], logging.Logger] = {}
 
 
 def file_logger(name: str, run_dir: Path, *, rotation_mb: int = 64) -> logging.Logger:
@@ -72,7 +75,9 @@ def file_logger(name: str, run_dir: Path, *, rotation_mb: int = 64) -> logging.L
     Writes to ``<run_dir>/<name>.log`` with size-based rotation; used for
     operational channels like verify/audit/save in the prototype.
     """
-    channel = _file_channels.get(name)
+    target = run_dir / f"{name}.log"
+    key = (name, str(target), rotation_mb)
+    channel = _file_channels.get(key)
     if channel is not None:
         return channel
     channel = logging.getLogger(f"pyline.channel.{name}")
@@ -87,8 +92,13 @@ def file_logger(name: str, run_dir: Path, *, rotation_mb: int = 64) -> logging.L
     )
     handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s"))
     channel.addHandler(handler)
-    _file_channels[name] = channel
+    _file_channels[key] = channel
     return channel
+
+
+def clear_file_channels() -> None:
+    """Drop cached channels (test isolation / re-setup)."""
+    _file_channels.clear()
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:

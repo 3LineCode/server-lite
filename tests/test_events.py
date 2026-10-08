@@ -79,3 +79,23 @@ def test_invalid_layer_rejected() -> None:
     bus = EventBus()
     with pytest.raises(ValueError):
         bus.subscribe(Ping, lambda e: None, layer=99)
+
+
+class TestPolymorphicDispatchF24:
+    async def test_base_class_subscription_receives_subclasses(self) -> None:
+        """F-24: subscribing a base class used to never fire for subclasses."""
+        from pyline.core.events import EventBus, StartupContextEvent
+
+        @dataclass
+        class MyStartup(StartupContextEvent):
+            pass
+
+        bus = EventBus()
+        seen: list[object] = []
+
+        async def on_startup(event: StartupContextEvent) -> None:
+            seen.append(event)
+
+        bus.subscribe(StartupContextEvent, on_startup)
+        await bus.emit(MyStartup(context="ctx"))
+        assert len(seen) == 1

@@ -27,6 +27,7 @@ from pyline.core.context import PROCESS_MAIN, Context
 from pyline.core.events import (
     BaseInitEvent,
     ClientConnectedEvent,
+    EnvReadyEvent,
     EventBus,
     FrameInitEvent,
     FuncDoneEvent,
@@ -109,6 +110,8 @@ class ServerRuntime:
         self.watcher: FileWatcher | None = None
         self._client_server: asyncio.AbstractServer | None = None
         self._client_control_rejected = 0
+        self._last_boundary = 0.0
+        self._clock_channel = logging.getLogger("pyline.channel.clock")
         self._bg_tasks: set[asyncio.Task[object]] = set()
 
     # ------------------------------------------------------------------ #
@@ -117,6 +120,7 @@ class ServerRuntime:
 
     async def boot(self) -> None:
         self._register_boot_steps()
+        await self.bus.emit(EnvReadyEvent())  # F-24: pre-boot hook point
         await self.lifecycle.run_boot()
 
     def _register_boot_steps(self) -> None:
@@ -288,34 +292,53 @@ class ServerRuntime:
     # ------------------------------------------------------------------ #
 
     def _start_clock_events(self) -> None:
+        self._last_boundary = self.clock.now()
+        self._clock_channel = pyline_log.file_logger(
+            "clock", Path(self.ctx.settings.log.log_dir)
+        )
+
         def on_boundary() -> None:
             self._emit_clock_events()
-            deadline, _ = self.clock.next_halfhour_boundary()
+            deadline = self.clock.next_halfhour_after(self.clock.now())
             self.scheduler.call_after(
                 max(deadline - self.clock.now(), 0.1), on_boundary, label="clock-boundary"
             )
 
-        deadline, _ = self.clock.next_halfhour_boundary()
+        deadline = self.clock.next_halfhour_after(self.clock.now())
         self.scheduler.call_after(
             max(deadline - self.clock.now(), 0.1), on_boundary, label="clock-boundary"
         )
 
     def _emit_clock_events(self) -> None:
-        now = dt.datetime.fromtimestamp(self.clock.now())
+        """Fire every :00/:30 boundary since the last one emitted (F-25: a
+        delayed tick used to silently swallow whole hours)."""
+        now_ts = self.clock.now()
+        cursor = self._last_boundary
+        for _ in range(96):  # at most two days of catch-up per tick
+            boundary = self.clock.next_halfhour_after(cursor)
+            if boundary > now_ts:
+                break
+            self._fire_boundary_events(boundary)
+            cursor = boundary
+        self._last_boundary = now_ts
+
+    def _fire_boundary_events(self, ts: float) -> None:
+        local = dt.datetime.fromtimestamp(ts)
         events: list[object] = []
-        if now.minute == 0:
-            events.append(NewHourEvent(hour=now.hour))
-            if now.hour == 0:
-                events.append(NewDayEvent(day=now.day))
-                if now.day == 1:
-                    events.append(NewMonthEvent(month=now.month))
-                    if now.month == 1:
-                        events.append(NewYearEvent(year=now.year))
-                if now.weekday() == 0:
-                    events.append(NewWeekEvent(week_day=1))
-        elif now.minute == 30:
-            events.append(HalfHourEvent(hour=now.hour))
+        if local.minute == 0:
+            events.append(NewHourEvent(hour=local.hour))
+            if local.hour == 0:
+                events.append(NewDayEvent(day=local.day))
+                if local.day == 1:
+                    events.append(NewMonthEvent(month=local.month))
+                    if local.month == 1:
+                        events.append(NewYearEvent(year=local.year))
+                if local.weekday() == 0:
+                    events.append(NewWeekEvent(week_no=self.clock.week_no(ts)))
+        elif local.minute == 30:
+            events.append(HalfHourEvent(hour=local.hour))
         for event in events:
+            self._clock_channel.info("event: %s", type(event).__name__)
             self._spawn(self.bus.emit(event))
 
     def _spawn(self, coro: Coroutine[Any, Any, object]) -> None:

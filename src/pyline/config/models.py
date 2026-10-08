@@ -44,7 +44,11 @@ class ZeroMQSettings(_StrictModel):
 
 
 class MySQLSettings(_StrictModel):
-    isolation_level: str = "READ COMMITTED"
+    # Whitelist, not free text: the value is interpolated into
+    # "SET SESSION TRANSACTION ISOLATION LEVEL {...}" (F-09).
+    isolation_level: Literal[
+        "READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"
+    ] = "READ COMMITTED"
     host: str = "127.0.0.1"
     port: int = Field(default=3306, ge=1, le=65535)
     user: str
@@ -78,9 +82,19 @@ class ProjectSettings(_StrictModel):
 
 
 class TableFieldDef(_StrictModel):
+    """One column declaration in ``tables.json5``.
+
+    ``default`` is a SQL literal (number, ``'quoted string'``, ``NULL``,
+    ``CURRENT_TIMESTAMP``) validated against a whitelist before it may
+    reach DDL -- never a placeholder or expression (F-09).
+    """
+
     type: str
     primary: bool = False
     comment: str = ""
+    unique: bool = False
+    not_null: bool = False
+    default: str | None = None
 
 
 class TableDef(_StrictModel):

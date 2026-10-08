@@ -111,6 +111,59 @@ class TestTableSpec:
         assert spec.columns["id"].column_type() == "int"  # display width stripped
 
 
+class TestDDLHardening:
+    def test_create_sql_escapes_table_comment(self) -> None:
+        spec = TableSpec.from_def("tbl_player", make_def())
+        spec.comment = "player's data"
+        sql = spec.create_sql()
+        assert "COMMENT 'player''s data'" in sql
+
+    def test_default_literal_whitelist(self) -> None:
+        from pyline.db.schema import check_default_literal
+
+        assert check_default_literal("42") == "42"
+        assert check_default_literal("-1.5") == "-1.5"
+        assert check_default_literal("null") == "NULL"
+        assert check_default_literal("'it''s'") == "'it''s'"  # already-escaped passes
+        for bad in ["1; DROP TABLE x", "now()", "x'y", "'a\\b'", "", "'unbalanced"]:
+            with pytest.raises(SchemaError, match="DEFAULT literal"):
+                check_default_literal(bad)
+
+    def test_field_flags_wired_into_ddl(self) -> None:
+        spec = TableSpec.from_def(
+            "t",
+            TableDef(
+                fields={
+                    "id": TableFieldDef(type="BIGINT", primary=True),
+                    "name": TableFieldDef(
+                        type="VARCHAR(64)",
+                        not_null=True,
+                        unique=True,
+                        default="'anon'",
+                    ),
+                }
+            ),
+        )
+        ddl = spec.columns["name"].ddl()
+        assert "UNIQUE KEY" in ddl
+        assert "NOT NULL" in ddl
+        assert "DEFAULT 'anon'" in ddl
+        assert spec.columns["name"].nullable is False
+
+    def test_blob_columns_stay_nullable(self) -> None:
+        # prototype semantics: TEXT/BLOB never get NOT NULL even if asked
+        spec = TableSpec.from_def(
+            "t",
+            TableDef(
+                fields={
+                    "id": TableFieldDef(type="BIGINT", primary=True),
+                    "data": TableFieldDef(type="MEDIUMBLOB", not_null=True),
+                }
+            ),
+        )
+        assert "NOT NULL" not in spec.columns["data"].ddl()
+
+
 class TestVersionedMigration:
     async def test_schema_version_table(self) -> None:
         pool = SchemaFakePool()

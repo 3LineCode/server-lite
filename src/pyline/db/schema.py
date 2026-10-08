@@ -52,6 +52,33 @@ def check_identifier(name: str) -> str:
     return name
 
 
+_NUM_LITERAL_RE = re.compile(r"^-?\d+(\.\d+)?$")
+# An already-valid SQL string literal: quotes inside must be doubled, no backslashes.
+_STR_LITERAL_RE = re.compile(r"^'(?:[^'\\]|'')*'$")
+_KEYWORD_LITERALS = frozenset({"NULL", "CURRENT_TIMESTAMP"})
+
+
+def check_default_literal(default: str) -> str:
+    """Validate a DEFAULT literal; returns the safe SQL text (F-09).
+
+    Accepts numbers, single-quoted strings (inner quotes doubled, no
+    backslashes), NULL and CURRENT_TIMESTAMP.  Anything else -- expressions,
+    function calls, injection attempts -- is rejected before it can reach DDL.
+    """
+    text = default.strip()
+    upper = text.upper()
+    if upper in _KEYWORD_LITERALS:
+        return upper
+    if _NUM_LITERAL_RE.fullmatch(text):
+        return text
+    if _STR_LITERAL_RE.fullmatch(text):
+        return text  # already a well-formed literal; pass through unchanged
+    raise SchemaError(
+        f"invalid DEFAULT literal: {default!r} (allowed: number, "
+        "'quoted string', NULL, CURRENT_TIMESTAMP)"
+    )
+
+
 @dataclass(slots=True)
 class ColumnSpec:
     name: str
@@ -74,7 +101,7 @@ class ColumnSpec:
         if self.unique:
             part += " UNIQUE KEY"
         if self.default is not None:
-            part += f" DEFAULT {self.default}"
+            part += f" DEFAULT {check_default_literal(self.default)}"
         if not self.nullable and self.data_type not in ("MEDIUMTEXT", "MEDIUMBLOB"):
             part += " NOT NULL"
         if self.comment:
@@ -107,8 +134,9 @@ class TableSpec:
                 data_type=data_type,
                 length=length,
                 primary=col_def.primary,
-                unique=col_def.primary,
-                nullable=not col_def.primary,
+                unique=col_def.primary or col_def.unique,
+                nullable=not (col_def.primary or col_def.not_null),
+                default=col_def.default,
                 comment=col_def.comment,
             )
         if not any(col.primary for col in spec.columns.values()):
@@ -121,7 +149,8 @@ class TableSpec:
     def create_sql(self) -> str:
         check_identifier(self.name)
         parts = ",\n  ".join(col.ddl() for col in self.columns.values())
-        return f"CREATE TABLE `{self.name}` (\n  {parts}\n) COMMENT '{self.comment}'"
+        comment = self.comment.replace(chr(39), chr(39) * 2) if self.comment else ""
+        return f"CREATE TABLE `{self.name}` (\n  {parts}\n) COMMENT '{comment}'"
 
     def query_sql(self, column: str) -> str:
         check_identifier(self.name)

@@ -115,3 +115,26 @@ class TestTables:
         tables = load_table_defs(config_dir)
         assert "tbl_player" in tables
         assert tables["tbl_player"].fields["id"].primary is True
+
+
+class TestMySQLSettingsHardening:
+    def test_isolation_level_whitelist(self) -> None:
+        from pyline.config.models import MySQLSettings
+
+        good = MySQLSettings(
+            user="root", password="$plain:x", db_name="d",
+            isolation_level="READ UNCOMMITTED",
+        )
+        assert good.isolation_level == "READ UNCOMMITTED"
+        with pytest.raises(Exception, match="isolation_level"):
+            MySQLSettings(
+                user="root", password="$plain:x", db_name="d",
+                isolation_level="SERIALIZABLE; DROP TABLE x",
+            )
+
+    def test_table_field_default_literal(self) -> None:
+        from pyline.config.models import TableFieldDef
+
+        assert TableFieldDef(type="BIGINT", default="7").default == "7"
+        field = TableFieldDef(type="VARCHAR(8)", default="'a'")
+        assert field.default == "'a'"

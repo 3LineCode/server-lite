@@ -49,5 +49,7 @@ uv run mypy src
 
 v1.0.0-rc.1: P0-P5 core plus the full migration-finish pass (F-01..F-30 in
 `docs/migration-plan.md` -- data safety, network robustness, kernel,
-hot-reload guards, business facade). See `CHANGELOG.md`, `docs/plan.md`
-(master plan) and `docs/hot-reload.md` (reload contract).
+hot-reload guards, business facade) and the two code-review passes on top
+(F-31..F-37, F-38..F-45 -- see `CHANGELOG.md`). See `docs/plan.md`
+(master plan), `docs/hot-reload.md` (reload contract) and
+`docs/deployment.md` (trust model and platform limits before going public).

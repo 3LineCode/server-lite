@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased: third review pass (F-38..F-45)
+
+Every fix carries a regression test; ruff format+check and mypy --strict
+clean; 260 unit tests passing (vs 212 before).
+
+### Data safety / correctness
+- F-38: schema drift detection now expects exactly what `ddl()` emits for
+  nullability -- a `not_null: true` TEXT/BLOB column (created nullable by
+  F-36's own rule) no longer permanently fails startup on the tables this
+  framework itself created (completes the half-done F-36)
+- F-42: auto-save coalesces dirty rows sharing (table, column) into one
+  multi-row upsert per round-trip (32-row / 4 MiB chunk caps; single-row
+  groups keep the direct path; a failing group falls back to per-saver
+  flushes so F-33's poison-row isolation survives); edge-triggered
+  `save_queue_depth` alarm when the never-drop backlog crosses 1000
+- F-43: cross-saver transaction API -- `async with db.transaction():` binds
+  a context-local session so statements *and* DataSaver flushes join one
+  atomic unit; locally a dedicated pooled connection, remotely a
+  TTL-bounded (60 s, lazy-reaped) dedicated session in the DB process with
+  a 32-session cap; nesting rejected
+- F-44: game calendar `day_no`/`week_no` derive from the local calendar
+  date instead of a fixed 86,400-second grid -- a pinned DST timezone no
+  longer splits one local day into two day numbers or disagrees with
+  `NewDayEvent`; anchors stay frozen (F-25)
+
+### Trust model (mesh hardening, round 1)
+- F-39: the ZMQ ROUTER drops any message whose claimed `from` service
+  number differs from the sender's socket identity (`ipc_spoofed_total`);
+  the validated origin now flows through gateway dispatch
+- F-40: RPC results/cancels are only accepted from the service the caller
+  actually invoked (`rpc_origin_rejects_total{reason}`) -- a guessed
+  call_id can no longer resolve a pending future with attacker data, and a
+  forged CANCEL can no longer kill arbitrary running calls; the `@fwd`
+  proxy envelope carries the original sender (legacy 4-field envelopes
+  parse as origin-unknown = untrusted)
+
+### Hot reload
+- F-41: rollback now catches `BaseException` (a `SystemExit` from the
+  re-executed top level used to leave the module half-updated); protocol
+  dunder signatures (`__exit__`/`__call__`/`__aiter__`/...) and module-level
+  `__getattr__` are validated like any other callable (name-mangled privates
+  stay exempt -- their live names cannot be matched statically)
+
+### Maintainability / docs
+- F-45: ServerRuntime split -- clock-event derivation, the DB topology
+  layer, the operator surface (monitor/metrics/console/watcher) and the
+  shutdown sequence moved to `runtime_wiring.py` as explicit collaborators;
+  the composition root is a ~500-line orchestrator instead of a ~650-line
+  god class
+- `docs/deployment.md`: the trust-model decision (safe on single-operator
+  trusted networks; CURVE/ZAP + TLS required for anything hostile), the
+  Windows selector-loop ~512 fd ceiling and its mitigation ladder, and the
+  sub-process metrics gap
+
 ## Unreleased: full code-review fix pass (F-31..F-37 + kernel/net hardening)
 
 Second review pass over the whole tree; every fix carries a regression test

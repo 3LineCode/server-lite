@@ -13,7 +13,7 @@ executed for checking purposes, so import-time side effects run exactly once
 | Identity preservation | old objects receive new code; `from mod import f` keeps working |
 | Live instances follow new methods | class dict diff on the OLD class object |
 | Single source read | validation and application compile the SAME bytes (no TOCTOU) |
-| True rollback | deep snapshot (module dict + class dicts + function state) restored on any failure |
+| True rollback | deep snapshot (module dict + class dicts + function state) restored on any failure, including `BaseException`s like `SystemExit` raised by the re-executed top level (F-41) |
 | Runtime invariants | closure-layout mismatch aborts the reload before any swap |
 
 ## Forbidden (rejected with `ReloadRejected` -- restart required)
@@ -35,8 +35,14 @@ executed for checking purposes, so import-time side effects run exactly once
   parameters, keyword-only parameters that become required (added without a
   default, or their default removed), `*args`/`**kwargs` shape change. The
   check covers plain methods **and** the inner functions of
-  `@staticmethod`/`@classmethod`/`@property`. Adding trailing optional
-  parameters and new defaulted keyword-only parameters is allowed.
+  `@staticmethod`/`@classmethod`/`@property`, **and** protocol dunders
+  (`__exit__`, `__call__`, `__aiter__`, `__enter__`, ... -- F-41: they are
+  invoked by the language with fixed arity, so a silent signature change
+  broke every caller at swap time) as well as module-level `__getattr__`.
+  Name-mangled privates (`__helper`) are exempt: their live names
+  (`_Cls__helper`) cannot be matched against the AST statically. Adding
+  trailing optional parameters and new defaulted keyword-only parameters is
+  allowed.
 * **Kind change** -- a module-level function becoming a class (or vice
   versa).
 * **Closure layout change** (`ReloadError` at swap time, rolled back) --

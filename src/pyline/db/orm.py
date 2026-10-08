@@ -13,6 +13,7 @@ ObsDict/ObsList wrappers) is replaced by a small explicit protocol:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import asdict, fields
@@ -120,6 +121,10 @@ class DataSaver:
         self._data: Any = None
         self._load_hooks: list[Callable[[DataSaver], None]] = []
         self._scheduler = scheduler
+        # F-03/F-04: in-flight futures make concurrent load()/delete() calls
+        # join the running operation instead of racing it.
+        self._load_future: asyncio.Future[Any] | None = None
+        self._delete_future: asyncio.Future[None] | None = None
 
     # ------------------------------ data ------------------------------- #
 
@@ -133,14 +138,48 @@ class DataSaver:
         self.mark_dirty()
 
     async def load(self, *, force: bool = False) -> Any:
+        """Load the blob, single-flight: concurrent callers join one query.
+
+        Callers that arrive while a load is running await the same future
+        (they previously observed a transient ``None`` and could mistake it
+        for "no data" and overwrite real data via ``set_data``).
+        """
         if self.state == SaveState.DELETED:
             return None
         if self.state in (SaveState.LOADED, SaveState.MISSING) and not force:
             return self._data
-        if self.state == SaveState.LOADING:
-            return self._data
+        if self._load_future is not None:
+            return await asyncio.shield(self._load_future)
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        self._load_future = future
+        try:
+            await self._load_once(future)
+        finally:
+            self._load_future = None
+        return self._data
+
+    async def _load_once(self, future: asyncio.Future[Any]) -> None:
         self.state = SaveState.LOADING
-        rows = await self._db.query(self._spec.query_sql(self._column), (self.key,))
+        try:
+            rows = await self._db.query(self._spec.query_sql(self._column), (self.key,))
+        except asyncio.CancelledError:
+            self.state = SaveState.NEW
+            if not future.done():
+                # The loading task was cancelled; joiners must not inherit a
+                # CancelledError they did not ask for.
+                future.set_exception(RuntimeError("load interrupted by cancellation"))
+            raise
+        except BaseException as exc:
+            self.state = SaveState.NEW
+            if not future.done():
+                future.set_exception(exc)
+            raise
+        if self.state != SaveState.LOADING:
+            # set_data()/delete() landed while the query was in flight: the
+            # in-memory state is newer than the row -- keep it.
+            if not future.done():
+                future.set_result(self._data)
+            return
         if rows and rows[0][0] is not None:
             self._data = self._codec.decode(rows[0][0])
             self.state = SaveState.LOADED
@@ -153,7 +192,8 @@ class DataSaver:
             except Exception:
                 logger.exception("load hook failed for %s[%s]", self._column, self.key)
         self._load_hooks.clear()
-        return self._data
+        if not future.done():
+            future.set_result(self._data)
 
     def add_load_hook(self, hook: Callable[[DataSaver], None]) -> None:
         if self.state in (SaveState.LOADED, SaveState.MISSING):
@@ -186,8 +226,33 @@ class DataSaver:
         await self._db.execute(self._spec.upsert_sql(self._column), (self.key, blob))
 
     async def delete(self) -> None:
+        """Delete the row first, then flip to DELETED (F-04).
+
+        The SQL runs before the state change so a failed delete leaves the
+        saver usable and retryable; concurrent deletes join one DELETE.
+        """
+        if self.state == SaveState.DELETED:
+            return
+        if self._delete_future is not None:
+            await asyncio.shield(self._delete_future)
+            return
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._delete_future = future
+        try:
+            await self._db.execute(self._spec.delete_sql(), (self.key,))
+        except asyncio.CancelledError:
+            if not future.done():
+                future.set_exception(RuntimeError("delete interrupted by cancellation"))
+            raise
+        except BaseException as exc:
+            if not future.done():
+                future.set_exception(exc)
+            raise
+        finally:
+            self._delete_future = None
         self.state = SaveState.DELETED
-        await self._db.execute(self._spec.delete_sql(), (self.key,))
+        if not future.done():
+            future.set_result(None)
 
     def __repr__(self) -> str:
         return f"DataSaver({self._spec.name}.{self._column}[{self.key!r}], {self.state.value})"

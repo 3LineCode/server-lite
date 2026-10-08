@@ -12,6 +12,11 @@ from pyline.config.models import TableDef, TableFieldDef
 from pyline.db.autosave import SaveScheduler
 from pyline.db.orm import DataSaver, SaveState, TrackableModel, dataclass_codec
 from pyline.db.schema import SchemaManager
+from pyline.db.serialization import dumps
+
+
+def dumps_versioned(data: object) -> bytes:
+    return dumps(data, schema_version=1)
 
 
 class FakeDB:
@@ -113,6 +118,77 @@ class TestDataSaver:
         saver.add_load_hook(lambda s: called.append("hook"))
         await saver.load()
         assert called == ["hook"]
+
+    async def test_orm_concurrent_load_singleflight(self) -> None:
+        """F-03: 50 concurrent loads issue one query and agree on the result."""
+        db = FakeDB()
+        db.rows[("tbl_player", 3)] = {"data": b""}  # placeholder, set below
+
+        class CountingDB(FakeDB):
+            queries = 0
+
+            async def query(self, sql: str, args: tuple = ()) -> list[tuple]:
+                self.queries += 1
+                await asyncio.sleep(0.02)  # widen the join window
+                return await super().query(sql, args)
+
+        cdb = CountingDB()
+        cdb.rows[("tbl_player", 3)] = {"data": dumps_versioned({"gold": 42})}
+        saver = DataSaver(cdb, make_schema(), "tbl_player", "data", 3)
+        results = await asyncio.gather(*(saver.load() for _ in range(50)))
+        assert cdb.queries == 1
+        assert all(r == {"gold": 42} for r in results)
+
+    async def test_set_data_during_load_not_clobbered(self) -> None:
+        """F-03: a set_data() that lands mid-query must not be overwritten."""
+
+        class SlowDB(FakeDB):
+            async def query(self, sql: str, args: tuple = ()) -> list[tuple]:
+                await asyncio.sleep(0.05)
+                return await super().query(sql, args)
+
+        db = SlowDB()
+        db.rows[("tbl_player", 8)] = {"data": dumps_versioned({"stale": True})}
+        saver = DataSaver(db, make_schema(), "tbl_player", "data", 8)
+        task = asyncio.get_running_loop().create_task(saver.load())
+        await asyncio.sleep(0.01)  # query now in flight
+        saver.set_data({"fresh": True})
+        await task
+        assert saver.data == {"fresh": True}
+
+    async def test_orm_delete_failure_keeps_state(self) -> None:
+        """F-04: a failed DELETE leaves the saver loaded and retryable."""
+
+        class FlakyDB(FakeDB):
+            fail = True
+
+            async def execute(self, sql: str, args: tuple = ()) -> int:
+                if self.fail and sql.startswith("DELETE"):
+                    raise ConnectionError("db down")
+                return await super().execute(sql, args)
+
+        db = FlakyDB()
+        saver = DataSaver(db, make_schema(), "tbl_player", "data", 6)
+        saver.set_data({"x": 1})
+        with pytest.raises(ConnectionError):
+            await saver.delete()
+        assert saver.state == SaveState.LOADED  # unchanged, retryable
+        saver.mark_dirty()  # still usable
+        db.fail = False
+        await saver.delete()
+        assert saver.state == SaveState.DELETED
+
+    async def test_orm_delete_idempotent(self) -> None:
+        """F-04: concurrent deletes join one DELETE; a second call is a no-op."""
+        db = FakeDB()
+        saver = DataSaver(db, make_schema(), "tbl_player", "data", 6)
+        saver.set_data({"x": 1})
+        await asyncio.gather(saver.delete(), saver.delete())
+        deletes = [sql for sql, _ in db.executed if sql.startswith("DELETE")]
+        assert len(deletes) == 1
+        await saver.delete()  # already deleted: no extra SQL
+        deletes = [sql for sql, _ in db.executed if sql.startswith("DELETE")]
+        assert len(deletes) == 1
 
 
 class TestSaveScheduler:

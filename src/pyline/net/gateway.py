@@ -38,6 +38,10 @@ class ProtocolGateway:
 
         Unknown protocols are counted and dropped, never raised: a single bad
         flag must not be able to kill the dispatch path.
+
+        For *registered* networks this may raise out of the handler; the
+        transport edge (TCP Connection / ZMQ bus) isolates handler exceptions
+        so one bad frame drops the frame, not the connection (F-13).
         """
         network = self._networks.get(flag)
         if network is None:

@@ -90,9 +90,10 @@ class FrameDecoder:
             frame = self._try_decode_one()
             if frame is None:
                 break
-            if frame.flag.startswith("@"):
-                frames.append(frame)
-                continue
+            # Reassembly is a transport concern and applies to EVERY flag,
+            # ``@``-prefixed control/RPC messages included (F-12): the
+            # encoder chunks them like anything else, so bypassing
+            # reassembly here used to corrupt >1MB RPC messages silently.
             if frame.chunk_more:
                 self._accumulate_chunk(frame)
                 continue
@@ -127,7 +128,10 @@ class FrameDecoder:
             raise ProtocolError("reassembled message exceeds max frame size")
         if len(buffer) < total:
             return None
-        flag = bytes(buffer[HEADER_BASE : HEADER_BASE + flag_len]).decode("utf-8")
+        try:
+            flag = bytes(buffer[HEADER_BASE : HEADER_BASE + flag_len]).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProtocolError(f"flag is not valid utf-8: {exc}") from exc
         payload = bytes(buffer[HEADER_BASE + flag_len : total])
         del buffer[:total]
         return Frame(flag=flag, payload=payload, chunk_more=bool(flags & FLAG_CHUNK_MORE))

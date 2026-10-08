@@ -62,6 +62,7 @@ class ProxyServer:
             handshake_timeout=self._ctx.settings.socket.handshake_timeout,
             idle_timeout=self._ctx.settings.socket.idle_timeout,
             send_queue_limit=self._ctx.settings.socket.send_queue_limit,
+            max_frame=self._ctx.settings.socket.max_frame_size,
             on_message=lambda flag, payload: None,
             on_connected=self._on_connected,
         )
@@ -162,6 +163,7 @@ class ProxyClient:
                     handshake_timeout=self._ctx.settings.socket.handshake_timeout,
                     idle_timeout=self._ctx.settings.socket.idle_timeout,
                     send_queue_limit=self._ctx.settings.socket.send_queue_limit,
+                    max_frame=self._ctx.settings.socket.max_frame_size,
                     on_message=self._on_frame,
                 )
             except (TimeoutError, ConnectionError, OSError) as exc:

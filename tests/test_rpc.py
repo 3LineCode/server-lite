@@ -127,3 +127,101 @@ async def test_expose_duplicate_rejected(loopback) -> None:
 
     with pytest.raises(ValueError, match="already registered"):
         rpc.register(one.__module__ + "." + one.__qualname__, one)
+
+
+class TestHardeningF13F14F18:
+    async def test_rpc_message_arity_validation(self, loopback) -> None:
+        """F-13: malformed messages are counted and dropped, never raised."""
+        import msgpack
+
+        rpc, _ = loopback
+        rpc.handle_message("@rpc", msgpack.packb([1, 2]))  # CALL arity 2
+        rpc.handle_message("@rpc", msgpack.packb([2, 9]))  # RESULT arity 2
+        rpc.handle_message("@rpc", msgpack.packb([3]))  # CANCEL arity 1
+        rpc.handle_message("@rpc", msgpack.packb([1, "x", "y", "z", []]))  # bad types
+        rpc.handle_message("@rpc", msgpack.packb([9]))  # unknown kind
+        assert rpc.pending_count() == 0  # nothing exploded, nothing leaked
+
+    async def test_rpc_send_failure_cleans_pending(self, loopback) -> None:
+        """F-14: a send exception fails the call now, not via a stray timer."""
+
+        class BrokenRouter(LoopbackRouter):
+            def route(self, flag: str, payload: bytes, target_service_no: int) -> None:
+                raise ConnectionError("bus gone")
+
+        router = BrokenRouter()
+        rpc = RpcManager(ProtocolGateway(), router, own_service_no=1)
+        router.rpc = rpc
+
+        @rpc.expose
+        def hello() -> str:
+            return "hi"
+
+        with pytest.raises(ConnectionError):
+            await rpc.call(1, hello)
+        assert rpc.pending_count() == 0
+
+    async def test_rpc_unserializable_args_fail_fast(self, loopback) -> None:
+        """F-14: bad arguments raise TypeError immediately (was fake timeout)."""
+        rpc, _ = loopback
+
+        @rpc.expose
+        def show(x: object) -> object:
+            return x
+
+        with pytest.raises(TypeError, match="not serializable"):
+            await rpc.call(1, show, {1, 2, 3})  # set is not msgpack-compatible
+        assert rpc.pending_count() == 0
+
+    async def test_rpc_unserializable_result_raises_rpcerror(self, loopback) -> None:
+        """F-14: the caller sees a remote error, not a timeout."""
+        rpc, _ = loopback
+
+        @rpc.expose
+        def weird() -> object:
+            return {"unserializable": {1, 2}}
+
+        with pytest.raises(RpcRemoteError, match="not serializable"):
+            await rpc.call(1, weird)
+
+    async def test_timeout_sends_cancel_to_remote(self, loopback) -> None:
+        """F-18: a timed-out call best-effort cancels remote execution."""
+        import msgpack
+
+        rpc, router = loopback
+        started = asyncio.Event()
+
+        @rpc.expose
+        async def hang() -> str:
+            started.set()
+            await asyncio.sleep(5)
+            return "late"
+
+        task = asyncio.get_running_loop().create_task(rpc.call(1, hang, timeout=0.1))
+        await asyncio.wait_for(started.wait(), 1)
+        with pytest.raises(RpcTimeoutError):
+            await task
+        cancels = [
+            msgpack.unpackb(p)
+            for (_t, f, p) in router.sent
+            if f == "@rpc" and isinstance(msgpack.unpackb(p), list)
+            and msgpack.unpackb(p)[:1] == [3]
+        ]
+        assert cancels, "expected a MSG_CANCEL after timeout"
+
+    async def test_current_caller(self, loopback) -> None:
+        """Old-repo RpcFromServer equivalent: caller visible inside handler."""
+        from pyline.net.rpc import current_caller
+
+        rpc, _ = loopback
+        seen: list[int] = []
+
+        @rpc.expose
+        def who_calls() -> int:
+            seen.append(current_caller())
+            return current_caller()
+
+        # loopback delivers back to self, so the caller is own service no 1
+        assert await rpc.call(7, who_calls) == 1
+        assert seen == [1]
+        assert current_caller() == 0  # reset after the call

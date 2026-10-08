@@ -20,9 +20,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import Callable
 
-from pyline.net.protocol import DEFAULT_CHUNK_SIZE, Frame, FrameDecoder, encode_message
+from pyline.net.protocol import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_FRAME,
+    Frame,
+    FrameDecoder,
+    encode_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +39,11 @@ PONG_FLAG = "@pong"
 BYE_FLAG = "@bye"
 
 MessageCallback = Callable[[str, bytes], None]
+
+# F-13: application handler exceptions drop the frame, never the connection;
+# but a peer spraying malformed messages must not turn that into a log flood.
+DISPATCH_ERROR_LIMIT = 10
+DISPATCH_ERROR_WINDOW = 1.0
 
 
 class ConnectionClosedError(ConnectionError):
@@ -50,6 +62,7 @@ class Connection:
         idle_timeout: float,
         send_queue_limit: int,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
+        max_frame: int = DEFAULT_MAX_FRAME,
         is_server_side: bool,
         on_message: MessageCallback,
         on_verified: Callable[[Connection], None] | None = None,
@@ -67,11 +80,13 @@ class Connection:
         self._chunk_size = chunk_size
         self._on_message = on_message
         self._on_verified = on_verified
-        self._decoder = FrameDecoder()
+        self._decoder = FrameDecoder(max_frame=max_frame)
         self._send_queue: asyncio.Queue[list[bytes]] = asyncio.Queue(send_queue_limit)
         self._close_hooks: list[Callable[[Connection], None]] = []
         self._last_recv = time.monotonic()
         self._tasks: list[asyncio.Task[None]] = []
+        self._dispatch_errors = 0
+        self._error_times: deque[float] = deque()
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -113,7 +128,7 @@ class Connection:
     def _handle_frame(self, frame: Frame) -> bool:
         """Route one decoded frame; returns False to stop the read loop."""
         if self.is_server_side and not self.verified:
-            if frame.flag == AUTH_FLAG and frame.payload.decode("utf-8") == self._token:
+            if frame.flag == AUTH_FLAG and self._decode_text(frame.payload) == self._token:
                 self.verified = True
                 if self._on_verified is not None:
                     try:
@@ -132,11 +147,36 @@ class Connection:
         if frame.flag == AUTH_FLAG:
             return True
         if frame.flag == BYE_FLAG:
-            reason = frame.payload.decode("utf-8", "replace")
+            reason = self._decode_text(frame.payload)
             asyncio.get_running_loop().create_task(self.close(f"peer bye: {reason}"))
             return False
-        self._on_message(frame.flag, frame.payload)
+        # F-13: dispatch isolation -- an application exception drops this one
+        # frame; only a sustained storm of them takes the connection down.
+        try:
+            self._on_message(frame.flag, frame.payload)
+        except Exception:
+            self._dispatch_errors += 1
+            now = time.monotonic()
+            self._error_times.append(now)
+            while self._error_times and now - self._error_times[0] > DISPATCH_ERROR_WINDOW:
+                self._error_times.popleft()
+            logger.exception(
+                "message handler crashed for %s flag=%r (dropping frame; errors=%d)",
+                self,
+                frame.flag,
+                self._dispatch_errors,
+            )
+            if len(self._error_times) >= DISPATCH_ERROR_LIMIT:
+                asyncio.get_running_loop().create_task(self.close("dispatch error storm"))
+                return False
         return True
+
+    @staticmethod
+    def _decode_text(payload: bytes) -> str:
+        try:
+            return payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return payload.decode("utf-8", "replace")
 
     async def _write_loop(self) -> None:
         try:

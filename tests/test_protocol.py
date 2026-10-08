@@ -68,3 +68,34 @@ class TestMalformed:
 
     def test_partial_header_waits(self) -> None:
         assert FrameDecoder().feed(b"PL\x01") == []
+
+
+class TestChunkingF12:
+    def test_at_flag_chunk_round_trip(self) -> None:
+        """F-12: >1MB @-flag messages reassemble like any other flag."""
+        payload = b"q" * (128 * 1024)  # force chunking with a small chunk size
+        frames = encode_message("@rpc", payload, chunk_size=16 * 1024)
+        assert len(frames) > 1
+        out = FrameDecoder().feed(b"".join(frames))
+        assert len(out) == 1
+        assert out[0].flag == "@rpc"
+        assert out[0].payload == payload
+
+    def test_at_flag_default_chunk_size_round_trip(self) -> None:
+        payload = b"r" * (1024 * 1024 + 5)  # just over the 1MB default
+        blob = b"".join(encode_message("@fwd", payload))
+        out = FrameDecoder().feed(blob)
+        assert len(out) == 1 and out[0].payload == payload
+
+    def test_non_utf8_flag_raises_protocol_error(self) -> None:
+        from pyline.net.protocol import MAGIC, VERSION
+
+        blob = bytearray()
+        blob += MAGIC
+        blob.append(VERSION)
+        blob.append(0)
+        blob.append(2)  # flag length
+        blob += (0).to_bytes(4, "big")
+        blob += b"\xff\xfe"  # invalid utf-8 flag bytes
+        with pytest.raises(ProtocolError, match="utf-8"):
+            FrameDecoder().feed(bytes(blob))

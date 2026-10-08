@@ -243,6 +243,7 @@ class ServerRuntime:
             entry.client_listen_port(self.ctx.process_index),
             token=self.ctx.settings.socket.token,
             handshake_timeout=self.ctx.settings.socket.handshake_timeout,
+            max_frame=self.ctx.settings.socket.max_frame_size,
             idle_timeout=self.ctx.settings.socket.idle_timeout,
             send_queue_limit=self.ctx.settings.socket.send_queue_limit,
             on_message=lambda flag, payload: self.gateway.dispatch(flag, payload),

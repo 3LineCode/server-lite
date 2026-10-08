@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 AlarmCallback = Callable[[str, dict[str, Any]], None]
 
+# F-42 coalescing caps: chunk a group's rows so one statement stays well
+# inside the 16 MiB RPC frame limit even for large blobs.
+_COALESCE_MAX_ROWS = 32
+_COALESCE_MAX_BYTES = 4 * 1024 * 1024
+
 
 class SaveScheduler:
     """Batched flusher for dirty :class:`DataSaver` objects.
@@ -42,6 +47,7 @@ class SaveScheduler:
         retry_cap: float = 300.0,
         alarm_threshold: int = 3,
         shutdown_flush_timeout: float = 60.0,
+        queue_alarm_threshold: int = 1000,
         on_alarm: AlarmCallback | None = None,
     ) -> None:
         self._interval = interval
@@ -50,12 +56,14 @@ class SaveScheduler:
         self._retry_cap = retry_cap
         self._alarm_threshold = alarm_threshold
         self._shutdown_flush_timeout = shutdown_flush_timeout
+        self._queue_alarm_threshold = queue_alarm_threshold
         self._on_alarm = on_alarm
         self._dirty: dict[DataSaver, int] = {}  # saver -> consecutive failures
         self._deferred: dict[DataSaver, float] = {}  # saver -> retry-not-before
         self._inflight: set[DataSaver] = set()
         self._task: asyncio.Task[None] | None = None
         self._quitting = False
+        self._queue_alarm_active = False
         # metrics / stats
         self.saved_total = 0
         self.failed_total = 0
@@ -73,6 +81,25 @@ class SaveScheduler:
 
     def _sync_metrics(self) -> None:
         self._metrics.save_queue.set(self.queue_depth())
+        self._check_queue_alarm()
+
+    def _check_queue_alarm(self) -> None:
+        """F-42: edge-triggered alarm when the dirty queue keeps growing.
+
+        A long database outage turns the never-drop queue into an unbounded
+        backlog (strong refs to savers and their blobs) racing the 60 s
+        shutdown drain -- ops needs to see that forming, not discover it at
+        shutdown.
+        """
+        depth = self.queue_depth()
+        if depth >= self._queue_alarm_threshold:
+            if not self._queue_alarm_active:
+                self._queue_alarm_active = True
+                self._alarm(
+                    "save_queue_depth", {"depth": depth, "threshold": self._queue_alarm_threshold}
+                )
+        else:
+            self._queue_alarm_active = False
 
     # ------------------------------ queue ------------------------------- #
 
@@ -120,6 +147,7 @@ class SaveScheduler:
         return None
 
     async def flush_batch(self) -> None:
+        batch: list[tuple[DataSaver, int]] = []
         for _ in range(self._batch_size):
             saver = self._next_due(time.monotonic())
             if saver is None:
@@ -127,16 +155,107 @@ class SaveScheduler:
             failures = self._dirty.pop(saver)
             self._deferred.pop(saver, None)
             self._inflight.add(saver)
-            try:
-                await self._flush_one(saver, failures)
-            except asyncio.CancelledError:
-                # Cancellation mid-flush (shutdown racing the loop task):
-                # the upsert may not have landed, so requeue for flush_all.
-                self._dirty.setdefault(saver, failures)
-                raise
-            finally:
+            batch.append((saver, failures))
+        if not batch:
+            return
+        # Savers whose outcome is not yet resolved; on cancellation they must
+        # go back to the queue (the upsert may not have landed).
+        unresolved: set[DataSaver] = {saver for saver, _ in batch}
+        try:
+            # F-42: rows sharing (executor, table, column) coalesce into one
+            # multi-row upsert -- one round-trip per table per batch instead
+            # of one per saver (~batch_size/interval upserts/s before).
+            groups: dict[tuple[int, str, str], list[tuple[DataSaver, int, Any, bytes]]] = {}
+            for saver, failures in batch:
+                row = await saver.flush_row()
+                if row is None:
+                    # deleted while waiting: nothing to persist, same as the
+                    # old flush() no-op path
+                    unresolved.discard(saver)
+                    self.saved_total += 1
+                    self._metrics.save_flushed.inc()
+                    continue
+                groups.setdefault((id(saver.executor), saver.table, saver.column), []).append(
+                    (saver, failures, row[0], row[1])
+                )
+            for members in groups.values():
+                resolved = await self._flush_group(members)
+                unresolved -= resolved
+        except asyncio.CancelledError:
+            # Cancellation mid-flush (shutdown racing the loop task): requeue
+            # everything unresolved for flush_all.
+            for saver, failures in batch:
+                if saver in unresolved:
+                    self._dirty.setdefault(saver, failures)
+            raise
+        finally:
+            for saver, _ in batch:
                 self._inflight.discard(saver)
         self._sync_metrics()
+
+    async def _flush_group(
+        self, members: list[tuple[DataSaver, int, Any, bytes]]
+    ) -> set[DataSaver]:
+        """Coalesced multi-row upsert for one (executor, table, column) group.
+
+        Returns the savers whose outcome was resolved (saved or requeued for
+        retry). One poisoned row fails the whole statement, so on failure the
+        group falls back to per-saver flushes -- preserving F-33's
+        isolate-the-poison-row semantics and per-saver backoff accounting.
+        """
+        resolved: set[DataSaver] = set()
+
+        if len(members) == 1:
+            # One row: the per-saver path IS the coalesced path (and a failure
+            # must not be counted twice by a pointless multi->single retry).
+            saver, failures, _k, _b = members[0]
+            await self._flush_one(saver, failures)
+            return {saver}
+
+        chunk: list[tuple[DataSaver, int, Any, bytes]] = []
+        chunk_bytes = 0
+
+        async def flush_chunk() -> None:
+            nonlocal chunk, chunk_bytes
+            if not chunk:
+                return
+            head = chunk[0][0]
+            params: list[Any] = []
+            for _saver, _failures, key, blob in chunk:
+                params.append(key)
+                params.append(blob)
+            try:
+                await head.executor.execute(head.upsert_many_sql(len(chunk)), tuple(params))
+                for saver, _f, _k, _b in chunk:
+                    resolved.add(saver)
+                    self.saved_total += 1
+                    self._metrics.save_flushed.inc()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "coalesced upsert into %s.%s failed; falling back to per-saver "
+                    "flushes to isolate the failing row",
+                    head.table,
+                    head.column,
+                    exc_info=True,
+                )
+                for saver, failures, _k, _b in chunk:
+                    await self._flush_one(saver, failures)
+                    resolved.add(saver)
+            chunk = []
+            chunk_bytes = 0
+
+        for member in members:
+            blob_size = len(member[3])
+            if chunk and (
+                len(chunk) >= _COALESCE_MAX_ROWS or chunk_bytes + blob_size > _COALESCE_MAX_BYTES
+            ):
+                await flush_chunk()
+            chunk.append(member)
+            chunk_bytes += blob_size
+        await flush_chunk()
+        return resolved
 
     async def _flush_one(self, saver: DataSaver, failures: int) -> None:
         try:

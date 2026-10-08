@@ -108,7 +108,8 @@ class ServerRuntime:
         self.alarms = AlarmHub()
         self.save_scheduler = SaveScheduler(
             on_alarm=lambda kind, payload: self.alarms.emit(kind, payload)
-        )
+        )  # queue-depth alarm (F-42) rides the same hub; thresholds stay at
+        # scheduler defaults until a deployment needs to tune them
         # Set False by teardown when the shutdown flush deadline passes with
         # dirty savers remaining; the process then exits non-zero (F-01).
         self.save_flush_ok = True

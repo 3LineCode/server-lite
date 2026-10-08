@@ -179,6 +179,18 @@ class DataSaver:
     # ------------------------------ data ------------------------------- #
 
     @property
+    def table(self) -> str:
+        return self._spec.name
+
+    @property
+    def column(self) -> str:
+        return self._column
+
+    @property
+    def executor(self) -> QueryExecutor:
+        return self._db
+
+    @property
     def data(self) -> Any:
         return self._data
 
@@ -280,6 +292,22 @@ class DataSaver:
                 return
             blob = self._codec.encode(self._data)
             await self._db.execute(self._spec.upsert_sql(self._column), (self.key, blob))
+
+    async def flush_row(self) -> tuple[Any, bytes] | None:
+        """Encode this saver's row for coalesced multi-row flushing (F-42).
+
+        Returns ``(key, blob)``, or None when the row must be skipped (it was
+        deleted while waiting). Holds the same flush lock as flush()/delete()
+        so the F-34 serialization is preserved; the caller owns the SQL.
+        """
+        async with self._flush_lock:
+            if self.state == SaveState.DELETED:
+                return None
+            return (self.key, self._codec.encode(self._data))
+
+    def upsert_many_sql(self, rows: int) -> str:
+        """Multi-row upsert for this saver's ``(table, column)`` (F-42)."""
+        return self._spec.upsert_many_sql(self._column, rows)
 
     async def delete(self) -> None:
         """Delete the row first, then flip to DELETED (F-04).

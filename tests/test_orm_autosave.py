@@ -39,8 +39,11 @@ class FakeDB:
     async def execute(self, sql: str, args: tuple = ()) -> int:
         self.executed.append((sql, args))
         if sql.startswith("INSERT INTO"):
-            self.rows.setdefault(("tbl_player", args[0]), {})["data"] = args[1]
-            return 1
+            # single-row and coalesced multi-row upserts (F-42) both arrive
+            # as flattened (key, blob) pairs
+            for i in range(0, len(args), 2):
+                self.rows.setdefault(("tbl_player", args[i]), {})["data"] = args[i + 1]
+            return len(args) // 2
         return 0
 
 
@@ -376,3 +379,97 @@ class _SlowUpsertDB(FakeDB):
             self.rows.pop(("tbl_player", args[0]), None)
             return 1
         return await super().execute(sql, args)
+
+
+class TestCoalescedFlushF42:
+    async def test_same_table_flushes_as_one_statement(self) -> None:
+        """F-42: rows sharing (table, column) coalesce into one multi-row
+        upsert -- one round-trip per batch, not one per saver."""
+        db = FakeDB()
+        scheduler = SaveScheduler(interval=60.0, batch_size=50)
+        for i in range(10):
+            saver = DataSaver(db, make_schema(), "tbl_player", "data", i, scheduler=scheduler)
+            saver.set_data({"i": i})
+        await scheduler.flush_batch()
+        inserts = [sql for sql, _ in db.executed if sql.startswith("INSERT INTO")]
+        assert len(inserts) == 1
+        assert inserts[0].count("(%s, %s)") == 10
+        assert scheduler.saved_total == 10
+        assert len(db.rows) == 10
+
+    async def test_group_failure_falls_back_to_per_saver(self) -> None:
+        """F-42: one poisoned row fails the multi-row statement; the fallback
+        isolates rows individually, preserving F-33 retry semantics."""
+
+        class NoMultiRowDB(FakeDB):
+            rejected_multi = 0
+
+            async def execute(self, sql: str, args: tuple = ()) -> int:
+                if sql.count("(%s, %s)") > 1:
+                    self.rejected_multi += 1
+                    raise ConnectionError("packet too large")
+                return await super().execute(sql, args)
+
+        db = NoMultiRowDB()
+        scheduler = SaveScheduler(interval=60.0, batch_size=50)
+        for i in range(3):
+            saver = DataSaver(db, make_schema(), "tbl_player", "data", 100 + i, scheduler=scheduler)
+            saver.set_data({"i": i})
+        await scheduler.flush_batch()
+        assert scheduler.queue_depth() == 0
+        assert scheduler.saved_total == 3
+        assert db.rejected_multi == 1  # the coalesced statement was attempted once
+        singles = [sql for sql, _ in db.executed if sql.count("(%s, %s)") == 1]
+        assert len(singles) == 3
+        assert len(db.rows) == 3
+
+    async def test_row_cap_chunks_groups(self) -> None:
+        """F-42: the 32-row chunk cap keeps one statement bounded."""
+        db = FakeDB()
+        scheduler = SaveScheduler(interval=60.0, batch_size=100)
+        for i in range(70):
+            saver = DataSaver(db, make_schema(), "tbl_player", "data", i, scheduler=scheduler)
+            saver.set_data({"i": i})
+        await scheduler.flush_batch()
+        inserts = [sql for sql, _ in db.executed if sql.startswith("INSERT INTO")]
+        assert len(inserts) == 3  # 32 + 32 + 6
+        assert scheduler.saved_total == 70
+        assert len(db.rows) == 70
+
+    async def test_deleted_mid_batch_counts_as_saved(self) -> None:
+        """A saver deleted while its batch is being encoded is skipped, not
+        resurrected (F-34 semantics inside the coalesced path)."""
+        db = FakeDB()
+        scheduler = SaveScheduler(interval=60.0, batch_size=10)
+        keep = DataSaver(db, make_schema(), "tbl_player", "data", 1, scheduler=scheduler)
+        keep.set_data({"k": 1})
+        gone = DataSaver(db, make_schema(), "tbl_player", "data", 2, scheduler=scheduler)
+        gone.set_data({"g": 2})
+        await gone.delete()  # wins the lock before flush_row runs
+        await scheduler.flush_batch()
+        assert scheduler.saved_total == 2  # keep flushed + gone no-op'd
+        assert ("tbl_player", 2) not in db.rows
+
+    async def test_queue_depth_alarm_edge_triggered(self) -> None:
+        """F-42: crossing the threshold alarms once (not per mark); recovering
+        below it re-arms the alarm."""
+        alarms: list[tuple[str, dict]] = []
+        scheduler = SaveScheduler(
+            interval=60.0,
+            queue_alarm_threshold=5,
+            on_alarm=lambda kind, payload: alarms.append((kind, payload)),
+        )
+        db = FakeDB()
+        for i in range(6):
+            saver = DataSaver(db, make_schema(), "tbl_player", "data", i, scheduler=scheduler)
+            saver.set_data({"i": i})
+        depth_alarms = [a for a in alarms if a[0] == "save_queue_depth"]
+        assert len(depth_alarms) == 1  # fired when crossing 5, silent at 6
+        assert depth_alarms[0][1]["depth"] == 5
+
+        await scheduler.flush_batch()
+        assert scheduler.queue_depth() == 0
+        for i in range(6, 9):  # below threshold again: stays silent
+            saver = DataSaver(db, make_schema(), "tbl_player", "data", i, scheduler=scheduler)
+            saver.set_data({"i": i})
+        assert len([a for a in alarms if a[0] == "save_queue_depth"]) == 1

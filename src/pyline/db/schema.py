@@ -195,6 +195,20 @@ class TableSpec:
             f"ON DUPLICATE KEY UPDATE `{column}` = VALUES(`{column}`)"
         )
 
+    def upsert_many_sql(self, column: str, rows: int) -> str:
+        """Multi-row form of :meth:`upsert_sql` (F-42): one round-trip for a
+        whole dirty batch instead of one per saver."""
+        check_identifier(self.name)
+        check_identifier(column)
+        if rows < 1:
+            raise ValueError("rows must be >= 1")
+        pk = self.primary_column().name
+        values = ", ".join(["(%s, %s)"] * rows)
+        return (
+            f"INSERT INTO `{self.name}` (`{pk}`, `{column}`) VALUES {values} "
+            f"ON DUPLICATE KEY UPDATE `{column}` = VALUES(`{column}`)"
+        )
+
     def insert_row_sql(self) -> str:
         check_identifier(self.name)
         pk = self.primary_column().name

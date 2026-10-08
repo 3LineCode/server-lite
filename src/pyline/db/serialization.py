@@ -25,6 +25,10 @@ class BlobFormatError(ValueError):
     pass
 
 
+class BlobVersionError(BlobFormatError):
+    """Payload was written by a NEWER schema than this code understands."""
+
+
 def dumps(data: Any, *, schema_version: int = 1) -> bytes:
     if not 0 < schema_version < 0x10000:
         raise ValueError(f"schema_version {schema_version} out of range")

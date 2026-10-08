@@ -21,7 +21,15 @@ from enum import Enum
 from typing import Any, Protocol
 
 from pyline.db.schema import SchemaManager
-from pyline.db.serialization import dumps, loads
+from pyline.db.serialization import (
+    BlobFormatError,
+    BlobVersionError,
+    Migration,
+    dumps,
+    loads,
+    loads_migrated,
+    peek_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,20 +55,50 @@ class Codec(Protocol):
 
 
 class MsgpackCodec:
-    """Default codec: versioned msgpack blobs."""
+    """Default codec: versioned msgpack blobs with a migration chain (F-07).
 
-    def __init__(self, *, schema_version: int = 1) -> None:
+    Decoding peeks the stored version: equal -> direct load; older -> the
+    migration chain upgrades it; newer -> ``BlobVersionError`` (fail fast:
+    code older than data must not silently misread it).
+    """
+
+    def __init__(
+        self,
+        *,
+        schema_version: int = 1,
+        migrations: dict[int, Migration] | None = None,
+    ) -> None:
         self.schema_version = schema_version
+        self._migrations = migrations
 
     def encode(self, data: Any) -> bytes:
         return dumps(data, schema_version=self.schema_version)
 
     def decode(self, blob: bytes | None) -> Any:
-        return loads(blob)
+        if blob is None:
+            return None
+        version = peek_version(blob)
+        if version > self.schema_version:
+            raise BlobVersionError(
+                f"blob schema version {version} is newer than this code's "
+                f"{self.schema_version}; refusing to load (deploy the newer "
+                "code first, or migrate the data down explicitly)"
+            )
+        if version == self.schema_version:
+            return loads(blob)
+        if self._migrations is None:
+            raise BlobFormatError(
+                f"blob schema version {version} is older than {self.schema_version} "
+                "and no migration chain is configured"
+            )
+        return loads_migrated(blob, self._migrations, latest_version=self.schema_version)
 
 
 class DataclassCodec:
-    """Codec for dataclass models via ``to_dict``/``from_dict`` adapters."""
+    """Codec for dataclass models via ``to_dict``/``from_dict`` adapters.
+
+    Migrations (if given) run on the dict form before ``from_dict``.
+    """
 
     def __init__(
         self,
@@ -68,10 +106,11 @@ class DataclassCodec:
         from_dict: Callable[[dict[str, Any]], Any],
         *,
         schema_version: int = 1,
+        migrations: dict[int, Migration] | None = None,
     ) -> None:
         self._to_dict = to_dict
         self._from_dict = from_dict
-        self._inner = MsgpackCodec(schema_version=schema_version)
+        self._inner = MsgpackCodec(schema_version=schema_version, migrations=migrations)
 
     def encode(self, data: Any) -> bytes:
         return self._inner.encode(self._to_dict(data))
@@ -81,7 +120,12 @@ class DataclassCodec:
         return None if raw is None else self._from_dict(raw)
 
 
-def dataclass_codec(model_cls: type, *, schema_version: int = 1) -> DataclassCodec:
+def dataclass_codec(
+    model_cls: type,
+    *,
+    schema_version: int = 1,
+    migrations: dict[int, Migration] | None = None,
+) -> DataclassCodec:
     """Build a codec for a dataclass model using asdict/kwargs reconstruction."""
 
     def to_dict(instance: Any) -> dict[str, Any]:
@@ -91,7 +135,9 @@ def dataclass_codec(model_cls: type, *, schema_version: int = 1) -> DataclassCod
         known = {f.name for f in fields(model_cls)}
         return model_cls(**{k: v for k, v in data.items() if k in known})
 
-    return DataclassCodec(to_dict, from_dict, schema_version=schema_version)
+    return DataclassCodec(
+        to_dict, from_dict, schema_version=schema_version, migrations=migrations
+    )
 
 
 class DataSaver:

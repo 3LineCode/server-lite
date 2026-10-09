@@ -20,14 +20,18 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Callable
-from typing import Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import msgpack
 
 from pyline.log.ratelimit import WindowLogLimiter
 from pyline.net.gateway import ProtocolGateway
 from pyline.net.protocol import decode_payload
+from pyline.net.session import current_connection
 from pyline.obs.metrics import get_metrics
+
+if TYPE_CHECKING:
+    from pyline.net.connection import Connection
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +46,14 @@ def pack_call(sub: int, *args: Any) -> bytes:
 def unpack_call(payload: bytes) -> tuple[int, list[Any]]:
     """Split an inbound payload into ``(sub, args)``."""
     data = decode_payload(payload)
-    if not isinstance(data, list) or not data or not isinstance(data[0], int):
+    # F-194: reject bool -- msgpack encodes it as an int subtype, so ``True``
+    # used to dispatch as sub-protocol 1.
+    if (
+        not isinstance(data, list)
+        or not data
+        or not isinstance(data[0], int)
+        or isinstance(data[0], bool)
+    ):
         raise ValueError("malformed network payload: expected [sub, *args]")
     return data[0], list(data[1:])
 
@@ -174,9 +185,45 @@ class Network:
                 except Exception:
                     logger.exception("overflow hook failed for %s", type(self).__qualname__)
             return
+        # F-224: per-CONNECTION fairness. The cap above is process-global:
+        # one authenticated client could stack max_inflight frames of its own
+        # and every other connection's dispatch would drop. The dispatch
+        # contextvar names the client connection this frame arrived on (the
+        # bus/RPC faces have none, so they are unaffected).
+        source = current_connection()
+        if source is not None and not source.admit_inflight():
+            self._overflowed += 1
+            self._metrics.handler_overflow.inc()
+            if self._overflow_log.allow():
+                logger.warning(
+                    "%s: per-connection inflight cap (%d) reached for %r; dropped sub %d "
+                    "(dropped total=%d, suppressed=%d)",
+                    type(self).__qualname__,
+                    source.max_inflight,
+                    source,
+                    sub,
+                    self._overflowed,
+                    self._overflow_log.take_suppressed(),
+                )
+            hook = self._on_overflow
+            if hook is not None:
+                try:
+                    hook(sub, self._overflowed)
+                except Exception:
+                    logger.exception("overflow hook failed for %s", type(self).__qualname__)
+            return
         task = asyncio.get_running_loop().create_task(self._run_handler(handler, sub, args))
         self._inbound.add(task)
-        task.add_done_callback(self._inbound_done)
+        if source is not None:
+            # Release the per-connection slot with the same done callback
+            # that releases the set slot -- one exit path, both resources.
+            def _done(t: asyncio.Task[None], conn: Connection = source) -> None:
+                self._inbound_done(t)
+                conn.release_inflight()
+
+            task.add_done_callback(_done)
+        else:
+            task.add_done_callback(self._inbound_done)
 
     async def _run_handler(self, handler: Handler, sub: int, args: list[Any]) -> None:
         try:

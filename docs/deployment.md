@@ -57,9 +57,11 @@ not by encryption*:
   process via `@relay` (F-70); the relay re-validates that a claimed origin
   belongs to the sending machine's local mesh, so a sub-process cannot
   launder a third machine's identity.
-- The DB proxy's RPC face is **full SQL passthrough** by design: any
-  process that can speak on the mesh can execute arbitrary SQL with the DB
-  process's credentials. The mesh identity checks (F-39/F-40/F-48/F-70)
+- The DB proxy's RPC face is **full SQL passthrough** by design (F-210
+  documents this as the contract): any process that can speak on the mesh
+  can execute arbitrary SQL with the DB process's credentials -- every
+  process in the topology is fully trusted, there is no per-statement
+  allowlist. The mesh identity checks (F-39/F-40/F-48/F-70)
   bound *who* can get there (your own processes), not *what* they can do.
   **Token separation is therefore load-bearing**: when
   `socket.inter_token` is unset it falls back to the CLIENT token (F-16) --
@@ -67,8 +69,9 @@ not by encryption*:
   that authenticates server-to-server links and the DB SQL plane, and the
   blast radius of any client-token leak is the entire database. Since
   F-160 the fallback is **enforced**: `srv_type=production` refuses to boot
-  without an explicit `$env:`-referenced `inter_token` (develop mode keeps
-  the once-per-process warning). Do not bridge the mesh onto a network you
+  without an explicitly referenced `inter_token` (`$env:` or `$file:`;
+  an inline `$plain:` literal is refused in production too, F-226 --
+  develop mode keeps the once-per-process warning). Do not bridge the mesh onto a network you
   do not fully control.
 
 **Safe today**: a single-operator cluster on trusted hosts (dedicated LAN,

@@ -45,7 +45,12 @@ def peek_version(blob: bytes) -> int:
 
 
 def loads(blob: bytes | None) -> Any:
-    """Load without migration; returns ``None`` for NULL columns."""
+    """Load without migration; returns ``None`` for NULL columns.
+
+    F-214: ``strict_map_key`` stays False HERE deliberately -- blobs are own
+    trusted data, and prototype-era rows may legitimately carry non-str keys;
+    the network face (net.protocol.decode_payload) is the boundary that
+    rejects them."""
     if blob is None:
         return None
     _check_header(blob)

@@ -457,9 +457,11 @@ class TestCoalescedFlushF42:
         assert scheduler.saved_total == 70
         assert len(db.rows) == 70
 
-    async def test_deleted_mid_batch_counts_as_saved(self) -> None:
+    async def test_deleted_mid_batch_counts_as_skipped(self) -> None:
         """A saver deleted while its batch is being encoded is skipped, not
-        resurrected (F-34 semantics inside the coalesced path)."""
+        resurrected (F-34 semantics inside the coalesced path). F-212: the
+        skip is NOT a save -- nothing was written, so the flushed counter
+        must not claim durability for it."""
         db = FakeDB()
         scheduler = SaveScheduler(interval=60.0, batch_size=10)
         keep = DataSaver(db, make_schema(), "tbl_player", "data", 1, scheduler=scheduler)
@@ -468,7 +470,8 @@ class TestCoalescedFlushF42:
         gone.set_data({"g": 2})
         await gone.delete()  # wins the lock before flush_row runs
         await scheduler.flush_batch()
-        assert scheduler.saved_total == 2  # keep flushed + gone no-op'd
+        assert scheduler.saved_total == 1  # keep flushed
+        assert scheduler.skipped_deleted == 1  # gone skipped: no row written
         assert ("tbl_player", 2) not in db.rows
 
     async def test_queue_depth_alarm_edge_triggered(self) -> None:
@@ -563,6 +566,7 @@ class TestLoopGuardF46:
         async def broken_flush_group(
             members: list[tuple[DataSaver, int, Any, bytes]],
             held: set[DataSaver],
+            deadline: float,
         ) -> set[DataSaver]:
             raise RuntimeError("bug in flush path")
 

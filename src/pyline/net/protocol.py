@@ -107,7 +107,12 @@ def decode_payload(payload: bytes) -> Any:
     return msgpack.unpackb(
         payload,
         raw=False,
-        strict_map_key=False,
+        # F-214: reject non-str map keys on the NETWORK face (the msgpack
+        # project's own recommendation -- attacker-chosen keys can exploit
+        # hash collisions). Own-data blobs in db.serialization keep
+        # strict_map_key=False for prototype-era compatibility; frames that
+        # legitimately need int keys should carry them as values.
+        strict_map_key=True,
         max_str_len=MAX_DECODE_STR,
         max_bin_len=MAX_DECODE_BIN,
         max_ext_len=MAX_DECODE_EXT,
@@ -206,6 +211,12 @@ class FrameDecoder:
                 continue
             if self._pending_flag is not None:
                 self._accumulate_chunk(frame)
+                # The bytes() copy is deliberate (F-221, evaluated and kept):
+                # Frame.payload's contract is an IMMUTABLE bytes object, and
+                # the buffer below is reset/reused right after -- handing it
+                # out would let one slow handler's bytearray alias the next
+                # message's accumulation. One memcpy on a >1 MiB reassembled
+                # message is noise next to its msgpack decode.
                 frames.append(Frame(flag=self._pending_flag, payload=bytes(self._pending_data)))
                 self._reset_pending()
             else:

@@ -114,7 +114,7 @@ def check_comment(comment: str) -> str:
 class ColumnSpec:
     name: str
     data_type: str  # e.g. VARCHAR, BIGINT, MEDIUMBLOB
-    length: int | None = None
+    length: str | None = None
     primary: bool = False
     unique: bool = False
     nullable: bool = True
@@ -249,12 +249,30 @@ class TableSpec:
         return f"DELETE FROM `{self.name}` WHERE `{pk}` = %s"
 
 
-def _parse_type(type_str: str) -> tuple[str, int | None]:
-    match = re.fullmatch(r"([A-Za-z]+)(?:\((\d+)\))?", type_str.strip())
+def _parse_type(type_str: str) -> tuple[str, str | None]:
+    """F-207: parse a tables-config column type into ``(name, length)``.
+
+    Accepts the forms MySQL itself spells: ``INT UNSIGNED`` (attribute
+    words after the base name), ``DECIMAL(10,2)`` (multi-argument widths),
+    and ENUM/SET value lists ``ENUM('a','b')``. The parenthesised payload is
+    strictly validated -- digits and commas, or single-quoted values -- so
+    no arbitrary text can ride a "length" into generated DDL."""
+    match = re.fullmatch(r"([A-Za-z]+(?:\s+[A-Za-z]+)*)\s*(?:\(([^)]*)\))?", type_str.strip())
     if not match:
         raise SchemaError(f"unparseable column type: {type_str!r}")
     name = match.group(1).upper()
-    length = int(match.group(2)) if match.group(2) else None
+    raw_len = match.group(2)
+    length: str | None = None
+    if raw_len:
+        if re.fullmatch(r"\d+(?:\s*,\s*\d+)*", raw_len):
+            length = re.sub(r"\s+", "", raw_len)  # "10, 2" -> "10,2"
+        elif re.fullmatch(r"'[^']*'(?:\s*,\s*'[^']*')*", raw_len):
+            length = raw_len  # ENUM/SET values: keep verbatim
+        else:
+            raise SchemaError(
+                f"column type {type_str!r}: the parenthesised part must be "
+                "numeric widths or single-quoted values"
+            )
     return name, length
 
 
@@ -359,14 +377,21 @@ class TableCatalog:
     same ``tables.json5`` the DB process manages DDL against, which is all a
     saver needs to validate ``(table, column)`` and generate SQL; every
     statement still executes through ``DatabaseAccess`` -> RPC -> the DB
-    process. Upserts from remote processes keep the legacy ``VALUES()``
-    ODKU form -- it executes on every supported server (see
-    ``SchemaManager._select_odku_syntax``); only the pool-owning process can
-    afford the version probe.
+    process.
+
+    F-211: ``odku_alias`` mirrors ``mysql.odku_row_alias`` from the shared
+    config so remote upserts can use the same row-alias ODKU syntax the DB
+    process selected by version probe -- set it true on MySQL >= 8.0.19 and
+    the deprecation-warning noise (and eventual VALUES() removal risk) goes
+    away on BOTH write paths. Default False keeps the legacy form working
+    everywhere.
     """
 
-    def __init__(self, tables: dict[str, TableDef]) -> None:
+    def __init__(self, tables: dict[str, TableDef], *, odku_alias: bool = False) -> None:
         self._tables = {name: TableSpec.from_def(name, tdef) for name, tdef in tables.items()}
+        if odku_alias:
+            for spec in self._tables.values():
+                spec.odku_alias = True
 
     def table(self, name: str) -> TableSpec:
         try:
@@ -513,18 +538,23 @@ class SchemaManager:
             self.alter_statements.append(statement)
 
     async def _check_drift(self, name: str, spec: TableSpec) -> None:
-        """Declared config vs live columns: mismatch fails startup (F-06)."""
+        """Declared config vs live columns: mismatch fails startup (F-06).
+
+        F-207: the PRIMARY KEY set is compared too -- a table recreated (or
+        hand-migrated) with a different key silently changed upsert/delete
+        semantics while type and nullability still matched."""
         rows = await self._pool.query(
-            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS "
+            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY "
+            "FROM information_schema.COLUMNS "
             "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
             (self._db_name, name),
         )
-        actual = {row[0]: (row[1], row[2]) for row in rows}
+        actual = {row[0]: (row[1], row[2], row[3]) for row in rows}
         problems: list[str] = []
         for col in spec.columns.values():
             if col.name not in actual:
                 continue  # missing columns are handled additively above
-            live_type, live_nullable = actual[col.name]
+            live_type, live_nullable, live_key = actual[col.name]
             if live_type.lower() != col.column_type():
                 problems.append(
                     f"{name}.{col.name}: type drift, declared {col.column_type()}, live {live_type}"
@@ -535,6 +565,21 @@ class SchemaManager:
                     f"{name}.{col.name}: nullability drift, declared "
                     f"{expected_nullable}, live {live_nullable}"
                 )
+            if col.primary and live_key != "PRI":
+                problems.append(
+                    f"{name}.{col.name}: declared PRIMARY KEY but the live column "
+                    f"has COLUMN_KEY={live_key!r} (upsert/delete semantics changed)"
+                )
+        live_primaries = {col_name for col_name, (_, _, key) in actual.items() if key == "PRI"}
+        declared_primaries = {col.name for col in spec.columns.values() if col.primary}
+        unexpected_primaries = (
+            live_primaries - declared_primaries - (set(actual) - set(spec.columns))
+        )
+        if unexpected_primaries:
+            problems.append(
+                f"{name}: live PRIMARY KEY columns {sorted(unexpected_primaries)} are not "
+                "declared primary in the config"
+            )
         if problems:
             raise SchemaError(
                 "schema drift detected (tables config vs live database):\n  "

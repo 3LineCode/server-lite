@@ -56,16 +56,21 @@ _FUNC_ATTRS = (
 
 _RELOADING: set[str] = set()
 
-# F-166: the module currently being reloaded (module name, or None).  The
-# update phase is synchronous (single event loop), so a module-level flag is
-# race-free the same way _RELOADING is.  _refresh_closure consults it to
-# decide which closure-held functions belong to THIS reload.
-_ACTIVE_MODULE: str | None = None
+# F-166/F-203: the reload stack -- module names currently being reloaded,
+# innermost last. A module's re-exec can trigger ANOTHER module's reload
+# (an import hook, a ``__reload__`` hook that reloads siblings); the old
+# single-valued flag was overwritten by the nested reload and reset to None
+# by its finally, so the OUTER reload's closure refresh silently did
+# nothing. The stack also scopes the per-reload seen-set: each reload gets
+# its own, pushed at entry and popped at exit. The update phase is
+# synchronous (single event loop), so list mutation stays race-free the way
+# the old set was.
+_ACTIVE_RELOADS: list[str] = []
 
-# F-166: functions whose cells were already refreshed in the current reload
-# (id-keyed): cycles out of self-referential closures and skips shared
-# inner functions a second wrapper also captures.
-_CELL_SEEN: set[int] = set()
+# F-166/F-203: functions whose cells were already refreshed by the CURRENT
+# (innermost) reload (id-keyed): cycles out of self-referential closures
+# and skips shared inner functions a second wrapper also captures.
+_CELL_SEEN_STACK: list[set[int]] = []
 
 # Changing these on a live class breaks instances already inside dicts/sets.
 _IDENTITY_DUNDERS = frozenset(
@@ -88,7 +93,6 @@ class ReloadRejected(ReloadError):
 
 def reload_module(module_name: str) -> types.ModuleType:
     """Reload ``module_name`` in place, preserving object identity."""
-    global _ACTIVE_MODULE
     module = sys.modules.get(module_name)
     if module is None:
         # F-96: the watcher used to auto-import unknown modules, so saving
@@ -109,10 +113,10 @@ def reload_module(module_name: str) -> types.ModuleType:
     assert module.__file__ is not None
     code = compile(source, module.__file__, "exec")  # the SAME validated bytes
     _RELOADING.add(module_name)
-    _CELL_SEEN.clear()  # F-166: per-reload cycle guard
+    _CELL_SEEN_STACK.append(set())  # F-166/F-203: per-reload cycle guard
     cache = ModCache(module)  # pre-reload deep snapshot: the OLD objects
     try:
-        _ACTIVE_MODULE = module_name
+        _ACTIVE_RELOADS.append(module_name)
         before_digest = hashlib.sha256(source).hexdigest()
         exec(code, module.__dict__)  # module dict now holds NEW objects
         updated_classes = _update_module(module, cache)
@@ -133,7 +137,8 @@ def reload_module(module_name: str) -> types.ModuleType:
         get_metrics().reload_total.labels(result="failed").inc()
         raise
     finally:
-        _ACTIVE_MODULE = None
+        _ACTIVE_RELOADS.pop()
+        _CELL_SEEN_STACK.pop()
         _RELOADING.discard(module_name)
     return module
 
@@ -536,12 +541,16 @@ def _check_class(name: str, old: type, info: _ClassInfo, problems: list[str]) ->
             f"{sorted(info.identity_dunders)} (instances may sit in dicts/sets)"
         )
     for attr_name, old_attr in old.__dict__.items():
-        # F-41: only name-mangled privates (``__foo``) skip -- they live under
-        # ``_Cls__foo`` in the class dict, so AST and runtime names cannot be
-        # matched. Real dunders DO get validated: ``__exit__``/``__call__``/
-        # ``__aiter__``/... are invoked by the language with fixed arity, and a
-        # signature change that slipped validation used to break every
-        # protocol caller the moment the swap landed.
+        # F-41: only name-mangled privates skip validation -- a ``__foo``
+        # written inside a class body lands in the class dict as
+        # ``_Cls__foo`` (F-203: the old ``startswith("__")`` guard could
+        # never match those, because the mangling already happened; the
+        # actual skip is the ``info.functions`` miss below, since the AST
+        # side only knows the unmangled name). Real dunders DO get
+        # validated: ``__exit__``/``__call__``/``__aiter__``/... are invoked
+        # by the language with fixed arity, and a signature change that
+        # slipped validation used to break every protocol caller the moment
+        # the swap landed.
         if attr_name.startswith("__") and not attr_name.endswith("__"):
             continue
         old_fn = _unwrap_method_function(old_attr)
@@ -549,7 +558,10 @@ def _check_class(name: str, old: type, info: _ClassInfo, problems: list[str]) ->
             continue
         new_spec = info.functions.get(attr_name)
         if new_spec is None:
-            continue  # method deleted: allowed (same as before)
+            # Mangled privates (``_Cls__foo``) land here: the AST knows the
+            # source name ``__foo``, not the mangled key, so the lookup
+            # misses and the method skips signature validation.
+            continue  # method deleted or name-mangled: allowed (same as before)
         # F-149: method-level twin of the module-level async<->sync check.
         if _is_coroutine_func(old_fn) != (attr_name in info.async_functions):
             problems.append(
@@ -777,9 +789,10 @@ def _refresh_closure(old_func: types.FunctionType, new_func: types.FunctionType)
     state-preservation semantics are unchanged.  Functions from OTHER
     modules are never touched: their reload is their own module's business.
     """
-    module_name = _ACTIVE_MODULE
+    module_name = _ACTIVE_RELOADS[-1] if _ACTIVE_RELOADS else None
     if module_name is None:
         return  # not inside a reload (defensive; every caller is one)
+    seen = _CELL_SEEN_STACK[-1]
     old_cells = old_func.__closure__ or ()
     new_cells = new_func.__closure__ or ()
     if not old_cells or len(old_cells) != len(new_cells):
@@ -799,11 +812,11 @@ def _refresh_closure(old_func: types.FunctionType, new_func: types.FunctionType)
             new_val, types.FunctionType
         ):
             continue  # state cell: preserved (documented semantics)
-        if old_val is new_val or id(old_val) in _CELL_SEEN:
+        if old_val is new_val or id(old_val) in seen:
             continue
         if old_val.__module__ != module_name:
             continue  # foreign module's function
-        _CELL_SEEN.add(id(old_val))
+        seen.add(id(old_val))
         logger.debug(
             "reload: refreshing closure-held function %s (via %s.%s)",
             old_val.__qualname__,

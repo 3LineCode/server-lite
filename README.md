@@ -47,28 +47,17 @@ uv run mypy src tests
 
 ## Status
 
-v1.0.0-rc.2: P0-P5 core plus the full migration-finish pass (F-01..F-30 in
-`docs/migration-plan.md` -- data safety, network robustness, kernel,
-hot-reload guards, business facade) and nine review passes on top
-(F-31..F-164 -- see `CHANGELOG.md`). The seventh pass closed every finding
-of the second external assessment; the eighth (F-142..F-154) closed the
-third; the ninth (F-155..F-164) closed every finding of a full-repo
-assessment: the ORM now works in the multi-process topology (pool-less
-TableCatalog backs savers in business processes), a decode failure during
-load resolves joiners instead of hanging them, the coalesced flush drops
-the journal hold, plain containers become tracked automatically on
-set_data/load, the inbound RPC task pool is bounded, a sub-process death
-escalates to a main-runtime shutdown even when the callback fails, the
-Windows fd ceiling and the production inter_token separation are enforced
-at boot, and the hot-reload validator compares default POSITIONS, not
-counts. The tenth pass (F-165..F-189) closed every remaining finding of
-the repo evaluation and added the transport-security layer the trust model
-was missing: TLS on the client listener and the proxy plane (mutual mode
-for server-to-server links) and CURVE+ZAP on the ZMQ bus, plus
-inserted-value tracking in the ORM containers, closure-aware hot reload
-for decorated functions, ROUTER-confirmed bus authentication, bounded
-dials, rate-limited hostile-traffic logging, and the data-layer
-race/performance fixes. See `docs/plan.md` (master plan),
-`docs/hot-reload.md` (reload contract and known limits) and
-`docs/deployment.md` (trust model and platform limits before going
-public).
+v1.0.0-rc.3: P0-P5 core, the full migration-finish pass (F-01..F-30), and
+ten review passes on top (F-31..F-189 -- see `CHANGELOG.md`). The eleventh
+pass (F-190..F-228) closed every finding of a full horizontal evaluation:
+the bus-auth identity-inheritance hole (F-190) and the silently-dropped
+forwarding leg (F-191) are fixed with regression tests, the client face
+grew a real session layer (connection registry, disconnect events,
+`api.session`, per-connection fairness), explicit flush/delete can no
+longer punch through an open transaction, flush rounds are deadline-bounded
+under DB outages, Redis got the mysql-style liveness alarm, the Windows fd
+budget is enforced per process, and the docs/CI debts (.pyi stub promise,
+api.redis facade row, partition coverage floors, nightly soak) are
+settled. See `docs/plan.md` (master plan), `docs/hot-reload.md` (reload
+contract and known limits) and `docs/deployment.md` (trust model and
+platform limits before going public).

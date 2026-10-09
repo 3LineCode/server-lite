@@ -1,5 +1,176 @@
 # Changelog
 
+## v1.0.0-rc.3: eleventh pass (F-190..F-228) -- every finding of the deep evaluation closed; client session layer added
+
+A full horizontal evaluation (kernel, network, data layer, tests, docs, CI)
+produced ~40 findings, from two high-severity security/correctness defects
+to documentation drift; all are closed here, each behavioural fix with a
+regression test in `tests/test_review_pass11.py` (42 new tests; suite now
+651). ruff format+check, mypy --strict (src) and mypy on tests clean.
+
+### Bus security (the two evaluation highs)
+- F-190: authenticated bus identity can no longer be INHERITED. ZMQ hands
+  an identity's routing to whichever connection claimed it most recently,
+  and the ROUTER cannot observe the replacement -- a local process cloning
+  a (crashed or live) sub-process's number used to send data frames through
+  the victim's stale authenticated entry with no token at all. Three
+  measures close it: (a) any AUTH0 for an authenticated identity REVOKES it
+  and restarts the challenge (honest peers re-prove every 30 s keepalive;
+  an impostor cannot answer); (b) authenticated entries carry a liveness
+  deadline refreshed only by AUTH2, and the ROUTER proactively challenges
+  every authenticated identity each 20 s -- liveness is proven by the
+  ROUTER's clock, not the peer's memory; (c) the supervisor revokes a dead
+  child's identity the moment its process exits. `revoke_identity()`,
+  `pyline_bus_auth_expired_total` metric.
+- F-191: a forwarding leg the ROUTER refused (queue full by count/bytes,
+  destination table full) now answers the ORIGINAL sender with a
+  `@busnack` receipt (small frames only), and the source RpcManager fails
+  the matching pending CALL immediately -- the exact failure mode
+  F-14/F-145 removed for the first leg used to survive on the second leg as
+  a full timeout burn. `dropped_forward_calls` counter.
+
+### Bus / RPC hygiene
+- F-192: a frame with undecodable flag bytes is dropped at the ROUTER gate
+  (rate-limited log) instead of escaping into the recv loop's per-frame
+  traceback catch-all -- the one log-flood vector F-171 missed.
+- F-193: the ZAP responder validates the request's domain, answers
+  malformed requests with an explicit 400 instead of silence, and a dead
+  ternary in the allowlist derivation is gone.
+- F-194: msgpack bools no longer pass int checks -- `isinstance(True, int)`
+  accepted `True` as RPC call id 1, as network sub-protocol 1, and as a
+  `@fwd` hop count.
+
+### Client session layer (the evaluation's architectural gap)
+- F-225: the client face is no longer connection-blind. A per-process
+  registry maps monotonic never-reused conn_ids to live connections;
+  `ClientDisconnectedEvent` mirrors `ClientConnectedEvent` (any close
+  reason); the dispatch contextvar lets plain-network handlers (and the
+  tasks they spawn) ask `api.session.current()` which client sent the
+  frame without signature changes; `api.session` provides
+  get/send/kick/all_ids/inflight; `pyline_client_sessions` gauge. Login
+  binding stays in business hands by design.
+- F-224: per-connection handler concurrency cap
+  (`socket.max_inflight_per_connection`, default 16) -- the process-global
+  pool let ONE authenticated client occupy every slot and starve all
+  others.
+
+### Kernel / lifecycle
+- F-195: a shutdown request racing an in-flight boot step action waits for
+  the step to settle (bounded) before building the teardown plan -- a
+  listener/pool assigned after the step's await used to miss the plan
+  entirely and leak into asyncio.run's backstop.
+- F-196: `ServerRuntime.boot()` is single-shot (the shutdown-hook list is
+  append-only; a second boot ran the whole teardown twice).
+- F-197: the DB process runs no business code (no import side effects, no
+  save scheduler, no devtools, no FrameInit/FuncDone fanout) -- matching
+  the DbLayer contract that previously held only in its docstring.
+- F-198: teardown drains background notification tasks (excluding the
+  teardown task itself), and the clock boundary chain stops arming before
+  the flush (a chain leg racing scheduler.close() raised "scheduler is
+  closed" out of a background task; a boundary firing mid-flush dirtying
+  post-snapshot data is the same silent-loss class as an ingress frame).
+- F-201: the metrics endpoint shuts down off-loop
+  (`ThreadingHTTPServer.shutdown()` blocks up to its poll interval).
+- F-199: `next_halfhour_after` raises explicitly instead of an `assert`
+  that `python -O` strips. F-202: the event bus MRO cache is capped.
+  F-200: a child that survives SIGKILL is CRITICAL-logged and counted
+  (`reason="kill_timeout"`), not passed silently.
+
+### Hot reload
+- F-203: the reload bookkeeping is a STACK -- a nested reload (import
+  hook, `__reload__` that reloads siblings) used to overwrite the
+  single-valued active-module flag and silently disable the outer reload's
+  closure refresh; the per-reload seen-set is scoped the same way. The
+  dead mangled-private guard condition is corrected to describe the actual
+  mechanism (the AST/runtime name mismatch below it).
+- F-204: docs/hot-reload.md now states that the swap blocks the event loop
+  for the duration of the module top-level re-exec (and what to do about
+  it).
+
+### Data layer
+- F-205: explicit `flush()`/`delete()` refuse (`SaverHeldByTransactionError`)
+  while an open transaction holds the saver, unless called from inside that
+  transaction or with `force=True` (the shutdown drain's documented
+  never-drop override) -- a cross-task flush used to autocommit straight
+  through the unit, surviving its rollback.
+- F-206: one flush round is bounded (`flush_round_timeout`, 30 s default).
+  During a DB outage each remote execute costs its full RPC timeout; the
+  coalesced fallback (one execute per row) used to stretch a single round
+  to minutes while every other dirty saver waited. Deadline-hit savers are
+  requeued with backoff (never dropped) -- and the deadline check now also
+  fires when the LAST group returns partial (a subtle drop window the
+  first cut of this fix introduced and the test caught).
+- F-207: the tables-config type grammar accepts `INT UNSIGNED`,
+  `DECIMAL(10,2)` and `ENUM('a','b')` (strictly validated -- no arbitrary
+  text can ride a "length" into DDL), and drift detection compares the
+  PRIMARY KEY set too (a recreated table with a different key silently
+  changed upsert/delete semantics while type/nullability matched).
+- F-208: the MySQL keepalive connection's read timeout is the PROBE
+  timeout (one interval), not the business one -- 3 misses used to cost
+  ~90 s+ against a silently dead server while every business query hung
+  independently for its own 30 s.
+- F-209: remote-transaction high-water warning at 75% of the global cap
+  (each session holds a dedicated connection; budget against
+  mysql.max_connections).
+- F-211: `mysql.odku_row_alias` aligns remote processes' TableCatalog with
+  the DB process's version-probed ODKU syntax (one write path per cluster
+  instead of two divergent ones).
+- F-212: a saver deleted while waiting for its flush lock counts as
+  SKIPPED (`save_skipped_total`), not saved -- nothing was written.
+- F-213: Redis gets the mysql-keepalive treatment: a dedicated PING probe
+  with miss counting, `redis_lost` alarm + `pyline_redis_lost_total`;
+  redis-py's silent auto-reconnect was exactly why the outage needed its
+  own signal.
+- F-214: the NETWORK decode face rejects non-str map keys
+  (`strict_map_key=True`, the msgpack project's hash-collision
+  recommendation); own-data blobs keep the permissive form (prototype-era
+  rows) -- documented at both call sites.
+- F-215: `dataclass_codec` logs unknown keys in stored blobs (shape drift
+  used to vanish silently; missing keys still fall back to defaults --
+  that direction is the forward-compat mechanism).
+- F-216: tracked containers warn (once per type) when a dict/list SUBCLASS
+  is rebuilt as a plain tracked container (defaultdict loses its factory).
+- F-217: mutating a container after its saver's delete raises the named
+  `SaverDeletedError` (OSError subclass) instead of a bare OSError.
+- F-218: `TrackableModel`'s write-only `_dirty` flag is removed (nothing
+  ever read it; the real dirty state lives on the saver).
+
+### Transport / platform
+- F-219: the Windows fd budget is PER PROCESS: the client listener and the
+  proxy server each commit under their own label and the SUM must fit the
+  selector-loop ceiling (each used to be checked against the full budget,
+  promising ~2x what win32 select() can watch). The proxy plane takes its
+  own machine-scale cap (min(max_connections, 64)); the platform default
+  client cap is 384 on win32 (a stock config boots again on the platform
+  this repo develops on), 4096 elsewhere.
+- F-220: TLS minimum version pinned to TLSv1.2 (was OpenSSL-build
+  dependent); `tls.verify_hostname` upgrades the proxy cert from "signed
+  by our CA" to "is the machine we named" when per-host certs carry SANs;
+  certificate paths resolve against the project root implied by
+  `$PYLINE_CONFIG_DIR` when built outside the loader; production boots
+  WARN when the bus or the client listener runs authenticated-but-plaintext.
+- F-223: a protocol error (bad magic/version/oversize) is claimed as the
+  close reason instead of being buried under the generic "read eof".
+- F-222: `requires-python >= 3.12.1` (3.12.0's early-returning
+  `StreamWriter.wait_closed()` could RST unread frames). F-221: the
+  reassembly copy is evaluated-and-kept, with the reasoning recorded at
+  the site.
+
+### Config / docs / CI
+- F-226: production refuses an inline `$plain:` `inter_token` (the doc
+  said "$env:-referenced"; now the code enforces exactly that). Doc drift
+  closed: the `.pyi` stub generator and `api.coverage` facade are
+  explicitly marked out-of-scope in migration-plan.md (they were promised,
+  never built, and absent from the deferred list); `api.redis`'s actual
+  home (`api.db`) is what the facade table names now.
+- F-227: per-partition coverage floors in CI (reload >=83, net >=83,
+  db >=88, core >=85) -- the total gate used to mask a weak partition
+  behind strong ones.
+- F-228: nightly workflow (`.github/workflows/nightly.yml`): full matrix
+  re-run plus the soak smoke (`tests/test_soak.py`, marker `soak`) --
+  boot, sustained churn, loop-latency and heap-growth budgets, clean
+  teardown. The 72h soak + production heap diff stays an rc->GA gate.
+
 ## v1.0.0-rc.2: tenth pass (F-165..F-189) -- every open finding of the repo assessment closed, transport security added
 
 Every risk and deficiency named by the full evaluation (two deep code

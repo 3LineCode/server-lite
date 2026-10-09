@@ -212,6 +212,12 @@ class MySQLPool:
         )
         # F-10: heartbeat traffic never competes with business queries for
         # pool slots -- the keepalive runs on its own connection.
+        # F-208: that connection's read timeout is the PROBE timeout, not the
+        # business one -- sharing read_timeout (30 s default) meant a silently
+        # dead server parked each SELECT 1 for the full 30 s, so the
+        # documented "3 misses" really cost ~90 s+ while every business query
+        # hung independently. One probe interval bounds a miss instead.
+        keepalive_read = max(min(s.read_timeout, s.keepalive_interval), 1.0)
         self._keepalive_conn = await asyncmy.connect(
             host=s.host,
             port=s.port,
@@ -221,7 +227,7 @@ class MySQLPool:
             charset=s.charset,
             autocommit=True,
             connect_timeout=5,
-            read_timeout=s.read_timeout,
+            read_timeout=keepalive_read,
         )
         logger.info("mysql connected: %s:%d/%s", s.host, s.port, s.db_name)
         self._keepalive_task = asyncio.get_running_loop().create_task(self._keepalive())

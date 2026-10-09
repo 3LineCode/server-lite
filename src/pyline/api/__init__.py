@@ -36,6 +36,7 @@ if TYPE_CHECKING:
         orm,
         registry,
         rpc,
+        session,
         task,
         timer,
     )
@@ -106,6 +107,7 @@ _SUBMODULES = (
     "orm",
     "registry",
     "rpc",
+    "session",
     "task",
     "timer",
 )

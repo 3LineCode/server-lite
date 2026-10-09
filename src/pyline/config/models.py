@@ -7,6 +7,7 @@ prototype's attribute-access config that silently returned ``None``.
 
 from __future__ import annotations
 
+import sys
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
@@ -59,8 +60,19 @@ class SocketSettings(_StrictModel):
     # Global and per-peer-IP connection caps: each pending handshake costs
     # tasks plus up to max_frame_size of decode buffer; unbounded accepts are
     # a cheap FD/task exhaustion attack.
-    max_connections: int = Field(default=4096, ge=1)
+    # F-219: the default must boot on the platform it ships on -- 4096 blew
+    # the Windows selector-loop fd budget at bind time (F-161), and even 448
+    # left nothing for a proxy listener in the same process. 384 + the
+    # proxy-plane cap (64) fits the ~448-fd Windows ceiling exactly.
+    max_connections: int = Field(
+        default_factory=lambda: 384 if sys.platform == "win32" else 4096, ge=1
+    )
     max_connections_per_ip: int = Field(default=256, ge=1)
+    # F-224: per-connection cap on concurrently RUNNING handler tasks. The
+    # Network-level cap is process-global: one authenticated connection could
+    # occupy every slot with a frame storm and starve all other clients.
+    # 0 disables the per-connection cap.
+    max_inflight_per_connection: int = Field(default=16, ge=0)
     # TLS on the CLIENT listener (F-187): server certificate for game
     # clients. None = plaintext (the pre-F-187 default; HMAC auth still
     # runs, but payloads are sniffable on the path).
@@ -92,6 +104,13 @@ class TlsSettings(_StrictModel):
     # theater).
     ca_file: str | None = None
     require_client_cert: bool = False
+    # F-220: verify the server certificate's hostname/IP against the dial
+    # target. Off by default because the proxy mesh dials ``advertise_ip``
+    # values that the classic one-cert-per-machine model does not bind into
+    # SANs; with per-host certificates (IP SANs or DNS names that match the
+    # dial target) turn it on -- it upgrades the cert from "signed by our
+    # CA" to "is the machine we named".
+    verify_hostname: bool = False
 
 
 class CurveSettings(_StrictModel):
@@ -211,6 +230,11 @@ class MySQLSettings(_StrictModel):
     # root at load time; ``None`` disables the versioned-migration engine
     # (table creation / additive columns / drift detection still run).
     migrations_dir: str | None = None
+    # F-211: use the row-alias ``ON DUPLICATE KEY UPDATE`` syntax (MySQL >=
+    # 8.0.19) in REMOTE processes' upserts too. The pool-owning process picks
+    # the form by version probe; business processes cannot probe (no pool),
+    # so this setting aligns their TableCatalog with the probed choice.
+    odku_row_alias: bool = False
 
     @model_validator(mode="after")
     def _check_pool_bounds(self) -> MySQLSettings:
@@ -239,6 +263,12 @@ class RedisSettings(_StrictModel):
     # server parks every awaiting caller forever.
     socket_timeout: float = Field(default=5.0, gt=0)
     health_check_interval: int = Field(default=30, ge=0)
+    # F-213: dedicated liveness probe cadence (mirror of mysql's keepalive).
+    # redis-py reconnects on next use by itself, but WITHOUT a probe the
+    # outage is invisible until a business call fails -- no alarm, no metric,
+    # no recovery signal.
+    keepalive_interval: float = Field(default=5.0, gt=0)
+    keepalive_miss_limit: int = Field(default=3, ge=1)
 
 
 class ClockSettings(_StrictModel):

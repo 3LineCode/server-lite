@@ -54,6 +54,23 @@ class SaveState(Enum):
     DELETED = "deleted"
 
 
+class SaverHeldByTransactionError(RuntimeError):
+    """F-205: an open transaction owns this saver's next write.
+
+    An explicit flush()/delete() from OUTSIDE the owning transaction would
+    autocommit past the unit's atomicity (the rollback could no longer undo
+    it). Call it from inside the transaction, after the unit ends, or with
+    ``force=True`` (the shutdown drain's never-drop override)."""
+
+
+class SaverDeletedError(OSError):
+    """F-217: the saver was deleted; its containers must not dirty it again.
+
+    Subclasses OSError (the historical raise) so existing handlers keep
+    working -- but the type and message now say WHAT happened instead of a
+    bare OSError surfacing from deep inside a dict assignment."""
+
+
 class QueryExecutor(Protocol):
     async def query(self, sql: str, args: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]: ...
 
@@ -138,13 +155,28 @@ def dataclass_codec(
     schema_version: int = 1,
     migrations: dict[int, Migration] | None = None,
 ) -> DataclassCodec:
-    """Build a codec for a dataclass model using asdict/kwargs reconstruction."""
+    """Build a codec for a dataclass model using asdict/kwargs reconstruction.
+
+    F-215: unknown keys in the stored dict (fields removed from the model
+    while old rows still carry them) log a warning naming them -- shape drift
+    used to vanish silently, discoverable only by data "disappearing" after
+    a reload. Missing keys still fall back to field defaults: that direction
+    is the forward-compatibility mechanism for ADDED fields and must not
+    raise."""
 
     def to_dict(instance: Any) -> dict[str, Any]:
         return asdict(instance)
 
     def from_dict(data: dict[str, Any]) -> Any:
         known = {f.name for f in fields(model_cls)}
+        unknown = [k for k in data if k not in known]
+        if unknown:
+            logger.warning(
+                "stored blob for %s carries unknown field(s) %s (removed from the "
+                "model while old rows still have them; values dropped)",
+                model_cls.__qualname__,
+                sorted(unknown),
+            )
         return model_cls(**{k: v for k, v in data.items() if k in known})
 
     return DataclassCodec(to_dict, from_dict, schema_version=schema_version, migrations=migrations)
@@ -313,7 +345,10 @@ class DataSaver:
 
     def mark_dirty(self) -> None:
         if self.state == SaveState.DELETED:
-            raise OSError(f"saver {self._column}[{self.key!r}] marked dirty after delete")
+            raise SaverDeletedError(
+                f"saver {self._column}[{self.key!r}] marked dirty after delete "
+                "(a container captured before delete() must not be mutated afterwards)"
+            )
         if self.state not in (SaveState.LOADED, SaveState.MISSING) and self._data is None:
             raise OSError(
                 f"saver {self._column}[{self.key!r}] marked dirty before load; "
@@ -377,7 +412,7 @@ class DataSaver:
             )
         return blob
 
-    async def flush(self) -> None:
+    async def flush(self, *, force: bool = False) -> None:
         """Encode and upsert immediately.
 
         Serialized against delete() by the flush lock (F-34): the state is
@@ -386,11 +421,31 @@ class DataSaver:
         On success the saver is dequeued from the auto-save scheduler
         (F-151) -- unless it was re-marked while the upsert was in flight,
         which the dirty-generation snapshot detects.
+
+        F-205: refuses (``SaverHeldByTransactionError``) while an open
+        transaction holds this saver's next write, UNLESS the caller runs
+        inside that same transaction (the flush then joins the unit and the
+        journal's rollback re-mark covers it) or passes ``force=True`` (the
+        shutdown drain: never-drop beats atomicity). The auto-save scheduler
+        always skips held savers, but an explicit flush() from another task
+        used to autocommit straight through the unit.
         """
         async with self._flush_lock:
             if self.state == SaveState.DELETED:
                 return
             self._require_loaded("flushed")
+            if (
+                not force
+                and self._pending_journal is not None
+                and current_flush_journal() is not self._pending_journal
+            ):
+                raise SaverHeldByTransactionError(
+                    f"saver {self._column}[{self.key!r}] is held by an open "
+                    "transaction; flushing it here would autocommit outside "
+                    "the unit (the rollback could not undo it). Flush from "
+                    "inside the transaction, after it ends, or force=True "
+                    "on the shutdown path."
+                )
             blob = self._encode_row()
             # F-151: generation of the data snapshot carried by this upsert.
             seq = self._dirty_seq
@@ -478,9 +533,22 @@ class DataSaver:
         saver usable and retryable; concurrent deletes join one DELETE.
         The whole operation holds the flush lock (F-34) so no upsert is in
         flight while the DELETE runs.
+
+        F-205: same transaction-hold guard as flush() -- a cross-task DELETE
+        autocommitted outside the owning unit could not be rolled back with
+        it; from inside the unit the DELETE joins it legitimately.
         """
         if self.state == SaveState.DELETED:
             return
+        if (
+            self._pending_journal is not None
+            and current_flush_journal() is not self._pending_journal
+        ):
+            raise SaverHeldByTransactionError(
+                f"saver {self._column}[{self.key!r}] is held by an open "
+                "transaction; deleting it here would autocommit outside the "
+                "unit. Delete from inside the transaction or after it ends."
+            )
         async with self._flush_lock:
             # A concurrent delete may have won the lock while we waited;
             # mypy cannot see that ``state`` mutates across the await.
@@ -526,13 +594,12 @@ class TrackableModel:
     call ``self.touch()`` after mutating lists/dicts.
     """
 
-    _INTERNAL_ATTRS = frozenset({"_saver", "_dirty", "_INTERNAL_ATTRS", "__dict__", "__weakref__"})
+    _INTERNAL_ATTRS = frozenset({"_saver", "_INTERNAL_ATTRS", "__dict__", "__weakref__"})
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
 
     _saver: DataSaver | None = None
-    _dirty: bool = False
 
     @property
     def saver(self) -> DataSaver | None:
@@ -548,8 +615,11 @@ class TrackableModel:
         self.touch()
 
     def touch(self) -> None:
-        """Mark dirty explicitly (required after in-place container mutation)."""
-        object.__setattr__(self, "_dirty", True)
+        """Mark dirty explicitly (required after in-place container mutation).
+
+        F-218: this used to also set a ``_dirty`` flag that nothing ever read
+        (the real dirty state lives on the DataSaver/scheduler) -- removed so
+        the mixin surface is only what works."""
         saver = getattr(self, "_saver", None)
         if saver is not None:
             saver.mark_dirty()

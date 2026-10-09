@@ -17,6 +17,7 @@ ServerRuntime orchestrates these.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from collections.abc import Awaitable, Callable, Coroutine
@@ -93,8 +94,14 @@ class ClockEventEmitter:
         self._log_rotation_mb = log_rotation_mb
         self._last_boundary = 0.0
         self._channel = logging.getLogger("pyline.channel.clock")
+        # F-198: set by stop(); once closing, no further boundary is armed
+        # (arming after the scheduler's close step raised "scheduler is
+        # closed" out of a background task).
+        self._closing = False
 
     def start(self) -> None:
+        if self._closing:
+            return
         self._last_boundary = self._clock.now()
         # Honour the configured log.rotation_mb: the clock channel used to
         # silently pin the 64 MB default while every other channel followed
@@ -104,7 +111,18 @@ class ClockEventEmitter:
         )
         self._schedule_next()
 
+    async def stop(self) -> None:
+        """F-198: stop arming the boundary chain (teardown step).
+
+        A chain leg in flight when the scheduler closes used to raise
+        ``RuntimeError("scheduler is closed")`` out of its background task --
+        pure teardown-time noise, but teardown noise is what buries real
+        data-loss lines."""
+        self._closing = True
+
     def _schedule_next(self) -> None:
+        if self._closing:
+            return
         deadline = self._clock.next_halfhour_after(self._clock.now())
         self._scheduler.call_after(
             max(deadline - self._clock.now(), 0.1), self._on_boundary, label="clock-boundary"
@@ -227,7 +245,12 @@ class DbLayer:
             # config the DB process runs DDL from, and every statement rides
             # DatabaseAccess -> RPC -> the DB process.
             if entry.use_mysql:
-                self._specs = TableCatalog(self._ctx.tables)
+                # F-211: mirror mysql.odku_row_alias so remote upserts use the
+                # same ODKU syntax the DB process picked by version probe.
+                self._specs = TableCatalog(
+                    self._ctx.tables,
+                    odku_alias=self._ctx.settings.mysql.odku_row_alias,
+                )
             return self._remote_access(rpc)
         await self._connect_local(rpc)
         assert self.db_service is not None
@@ -273,7 +296,14 @@ class DbLayer:
             self._ctx.services["schema"] = schema
             self._specs = schema
         if self._ctx.entry.use_redis:
-            self.redis = RedisClient(s.redis)
+            # F-213: the mysql_lost alarm's redis counterpart -- the probe
+            # detects the outage, redis-py's auto-reconnect handles recovery.
+            self.redis = RedisClient(
+                s.redis,
+                on_lost=lambda: self._alarms.emit(
+                    "redis_lost", {"host": s.redis.host, "port": s.redis.port}
+                ),
+            )
             await self.redis.connect()
         pool: PoolLike = self.mysql if self.mysql is not None else NullPool()
         redis: RedisLike = self.redis if self.redis is not None else NullRedis()
@@ -423,16 +453,24 @@ class DevtoolsLayer:
     async def stop_metrics(self) -> None:
         """Explicitly close the metrics endpoint (F-99): stop accepting,
         join the serve_forever loop and release the port instead of leaking
-        the socket until process exit."""
+        the socket until process exit.
+
+        F-201: ThreadingHTTPServer.shutdown() blocks until the
+        serve_forever poll interval (0.5 s by default) notices -- run it in
+        a worker thread under a wait_for, so a teardown step no longer
+        parks the event loop. Same discipline as F-21 (child.join) and the
+        zctx.term() off-loop drain."""
         server, self.metrics_server = self.metrics_server, None
         if server is None:
             return
         shutdown = getattr(server, "shutdown", None)
         close = getattr(server, "server_close", None)
         if shutdown is not None:
-            shutdown()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.to_thread(shutdown), timeout=5.0)
         if close is not None:
-            close()
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(close)
 
 
 def start_metrics_endpoint(bind: str, port: int, token: str | None) -> object:

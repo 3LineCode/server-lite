@@ -100,6 +100,13 @@ class LifecycleManager:
         # (hooks + quit-task drain), so the parking loop can join a
         # fire-and-forget teardown instead of racing it.
         self._shutdown_done: asyncio.Future[None] | None = None
+        # F-195: whether a boot step ACTION is currently between its start
+        # and its completion, and the future resolved when it lands. A
+        # shutdown request arriving mid-step used to run its hooks (which
+        # snapshot resources) while the step was still assigning them --
+        # see wait_boot_step_settled().
+        self._boot_step_active = False
+        self._boot_step_done: asyncio.Future[None] | None = None
         self.stuck_error: StartupStuckError | None = None
 
     # ------------------------------------------------------------------ #
@@ -216,6 +223,8 @@ class LifecycleManager:
             from pyline.obs.metrics import get_metrics
 
             started = time.monotonic()
+            self._boot_step_active = True
+            self._boot_step_done = asyncio.get_running_loop().create_future()
             try:
                 if self._step_timeout is None:
                     await action()
@@ -236,6 +245,30 @@ class LifecycleManager:
                 get_metrics().boot_phase_seconds.labels(phase=state.name).observe(
                     time.monotonic() - started
                 )
+                self._boot_step_active = False
+                done = self._boot_step_done
+                if done is not None and not done.done():
+                    done.set_result(None)
+
+    async def wait_boot_step_settled(self, timeout: float) -> None:
+        """F-195: wait for the boot step action currently in flight (if any).
+
+        ``request_shutdown`` may land while a step action is parked on an
+        await (``serve()``, ``db_layer.connect()``). The shutdown hooks then
+        snapshot the runtime's half-built state -- a listener or pool the
+        step assigns only AFTER its await returns used to miss the teardown
+        plan entirely and leak into ``asyncio.run``'s loop-close backstop.
+        Waiting here (bounded; the step has its own step_timeout anyway)
+        lets the action finish assigning before the plan is built. The
+        shield keeps a wait_for timeout from cancelling the shared future.
+        """
+        if not self._boot_step_active:
+            return
+        done = self._boot_step_done
+        if done is None:
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(done), timeout=timeout)
 
     # ------------------------------------------------------------------ #
     # Start gates

@@ -25,6 +25,7 @@ from typing import Any, Protocol
 
 import msgpack
 
+from pyline.net.ipc import BUS_NACK
 from pyline.net.network import Network
 from pyline.net.protocol import decode_payload
 from pyline.obs.metrics import get_metrics
@@ -85,6 +86,12 @@ class SenderProtocol(Protocol):
     ) -> None: ...
 
 
+def _wire_int(value: Any) -> bool:
+    """F-194: msgpack encodes bool as an int subtype, so a bare
+    ``isinstance(value, int)`` accepted ``True`` as call id 1."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 @dataclass(slots=True)
 class _PendingCall:
     call_id: int
@@ -93,6 +100,25 @@ class _PendingCall:
     future: asyncio.Future[Any]
     timer: asyncio.TimerHandle
     started: float = 0.0
+
+
+class _BusNackNetwork(Network):
+    """F-191: gateway endpoint for ``@busnack`` drop receipts from the ROUTER.
+
+    The bus validates the sender is the local main process before
+    dispatching; the body is ``[dropped_target, origin, flag, payload]`` for
+    a frame that was accepted from us but refused for its destination. Not a
+    ``[sub, *args]`` network, so ``handle_message`` is overridden instead of
+    subscribing."""
+
+    flag = BUS_NACK
+
+    def __init__(self, gateway: Any, rpc: RpcManager) -> None:
+        super().__init__(gateway)
+        self._rpc = rpc
+
+    def handle_message(self, flag: str, payload: bytes, from_service: int = 0) -> None:
+        self._rpc.on_forward_dropped(payload, from_service)
 
 
 class RpcManager(Network):
@@ -112,6 +138,9 @@ class RpcManager(Network):
         super().__init__(gateway)
         self._sender = sender
         self._own_service_no = own_service_no
+        # F-191: drop receipts from the bus ROUTER reach us as a second
+        # network on the gateway (the bus dispatches @busnack locally).
+        self._nack_net = _BusNackNetwork(gateway, self)
         self._functions: dict[str, Callable[..., Any]] = {}
         self._pending: dict[int, _PendingCall] = {}
         # (caller service no, call_id) -> (running task, caller) -- the caller
@@ -151,6 +180,8 @@ class RpcManager(Network):
         # F-77: notify-style calls (call_id 0) rejected while busy used to
         # vanish without a trace; counted now.
         self.busy_notify_drops = 0
+        # F-191: CALLs the ROUTER refused to forward (receipted via @busnack).
+        self.dropped_forward_calls = 0
 
     # ------------------------------------------------------------------ #
     # Registration
@@ -268,6 +299,61 @@ class RpcManager(Network):
         except Exception:
             logger.debug("post-timeout CANCEL undeliverable for call %d", call_id, exc_info=True)
 
+    def on_forward_dropped(self, payload: bytes, from_service: int) -> None:
+        """F-191: the bus ROUTER refused to forward one of our frames.
+
+        ``raise_on_drop`` (F-127/F-145) only spanned the first leg -- the
+        enqueue in THIS process. A CALL that left here fine but met a full
+        destination queue at the ROUTER used to die in the full rpc timeout:
+        exactly the "message never arrived, caller burns the deadline"
+        failure mode those fixes removed for the first leg. Fail the matching
+        pending call now; the caller sees a precise error instead."""
+        try:
+            body = decode_payload(payload)
+        except (ValueError, msgpack.exceptions.ExtraData, RecursionError):
+            self.malformed_messages += 1
+            logger.warning("malformed bus nack receipt (total=%d)", self.malformed_messages)
+            return
+        if not isinstance(body, list) or len(body) != 4:
+            self.malformed_messages += 1
+            logger.warning("malformed bus nack shape")
+            return
+        dropped_target, origin, original_flag, original_payload = body
+        if (
+            not _wire_int(dropped_target)
+            or not _wire_int(origin)
+            or not isinstance(original_flag, str)
+            or not isinstance(original_payload, bytes)
+        ):
+            self.malformed_messages += 1
+            logger.warning("malformed bus nack fields")
+            return
+        if original_flag != RPC_FLAG:
+            logger.debug("bus nack for non-rpc flag %r ignored", original_flag)
+            return
+        try:
+            message = decode_payload(original_payload)
+        except (ValueError, msgpack.exceptions.ExtraData, RecursionError):
+            return
+        if not isinstance(message, list) or len(message) != 5 or message[0] != MSG_CALL:
+            logger.debug("bus nack: embedded rpc frame is not a CALL; ignored")
+            return
+        call_id = message[1]
+        if not _wire_int(call_id) or call_id == 0 or origin != self._own_service_no:
+            return
+        pending = self._pending.get(call_id)
+        if pending is None or pending.future.done() or pending.target != dropped_target:
+            return
+        pending.timer.cancel()
+        self._pending.pop(call_id, None)
+        self.dropped_forward_calls += 1
+        pending.future.set_exception(
+            RpcError(
+                f"rpc call {pending.func!r} -> service {dropped_target} was dropped at the "
+                "bus router (destination queue full; the call never reached the target)"
+            )
+        )
+
     # ------------------------------------------------------------------ #
     # Inbound (Network entry point)
     # ------------------------------------------------------------------ #
@@ -322,8 +408,8 @@ class RpcManager(Network):
             return
         _, call_id, from_service_claim, func_path, args = message
         if (
-            not isinstance(call_id, int)
-            or not isinstance(from_service_claim, int)
+            not _wire_int(call_id)
+            or not _wire_int(from_service_claim)
             or not isinstance(func_path, str)
             or not isinstance(args, list)
         ):
@@ -505,6 +591,9 @@ class RpcManager(Network):
             logger.warning("malformed rpc RESULT arity %d (dropped)", len(message))
             return
         _, call_id, ok, value = message
+        if not _wire_int(call_id):
+            logger.warning("malformed rpc RESULT call id (dropped)")
+            return
         pending = self._pending.get(call_id)
         if pending is None:
             logger.debug("rpc result for unknown/expired call_id=%d", call_id)
@@ -535,6 +624,9 @@ class RpcManager(Network):
             logger.warning("malformed rpc CANCEL arity %d (dropped)", len(message))
             return
         _, call_id, from_claim = message
+        if not _wire_int(call_id) or not _wire_int(from_claim):
+            logger.warning("malformed rpc CANCEL field types (dropped)")
+            return
         # F-40: only the service that issued the CALL may cancel it -- a
         # spoofed CANCEL is a cheap remote DoS against arbitrary running calls.
         if from_service == 0 or from_claim != from_service:

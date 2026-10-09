@@ -28,6 +28,30 @@ local process could set its DEALER identity to a victim's service number and
 inject frames as that service. The token itself never crosses the bus, so a
 sniffed digest from one connection is useless on any other (fresh nonces).
 
+F-190 hardens that gate against identity inheritance. ZMQ routes by identity
+to whichever connection most recently claimed it, and the ROUTER cannot
+observe identity->connection replacement -- so a set that only ever grows
+authenticated identities handed a fresh connection the previous holder's
+authenticated status (a local process could clone a crashed sub-process's
+number, never send AUTH0, and inject data through the stale entry forever).
+Three measures close it: (a) any AUTH0 for an identity REVOKES its
+authenticated status and restarts the challenge (an honest peer re-proves
+with every 30 s keepalive; an impostor cannot answer at all); (b) an
+authenticated entry expires after ``_AUTHED_TTL`` unless an AUTH2 refreshes
+it, and the ROUTER proactively challenges every authenticated identity each
+``_AUTH_CHALLENGE_INTERVAL`` -- liveness is now proven by the ROUTER's own
+clock, not by the peer's memory of a handshake; (c) the supervisor revokes a
+child's identity the moment its process dies.
+
+Delivery of dropped forwarding legs (F-191): a message the ROUTER accepted
+but could not enqueue for its destination DEALER (queue full, destination
+table full) used to vanish silently -- the source burned a full RPC timeout
+on a frame that never left, exactly the failure mode F-14/F-145 removed for
+the first leg. The ROUTER now answers a refused forwarding leg with a
+``@busnack`` control frame back to the ORIGINAL sender (small payloads
+only), and the source's RpcManager fails the matching pending call
+immediately instead of timing out.
+
 Send architecture (F-15, per the ZeroMQ guide's queue-broker pattern): the
 recv loop never sends. Every outbound destination has its own bounded queue
 -- bounded by message count AND queued bytes (frames may be up to
@@ -55,6 +79,7 @@ import secrets
 import sys
 import time
 
+import msgpack
 import zmq
 import zmq.asyncio
 
@@ -80,6 +105,13 @@ BUS_AUTH1 = "@busauth1"  # ROUTER -> DEALER: server nonce + HMAC(client||server)
 BUS_AUTH2 = "@busauth2"  # DEALER -> ROUTER: HMAC(server)
 BUS_AUTH3 = "@busauth3"  # ROUTER -> DEALER: handshake confirmed (F-169)
 
+# F-191: ROUTER -> original sender: your forwarded frame was refused for its
+# destination (queue full by count/bytes, or the destination table is full).
+# Payload is msgpack [dropped_target, origin, original_flag, original_payload]
+# -- small frames only, so a message refused for SIZE cannot demand a
+# same-sized receipt (see _NACK_PAYLOAD_LIMIT).
+BUS_NACK = "@busnack"
+
 # F-189: ZAP domain for the CURVE server. libzmq routes every CURVE
 # handshake to an inproc://zeromq.zap.01 responder when a socket has a
 # zap_domain set; our responder allowlists client public keys, so a keypair
@@ -95,10 +127,29 @@ _ZAP_ENDPOINT = "inproc://zeromq.zap.01"
 _AUTH_PENDING_TTL = 10.0
 _MAX_PENDING_AUTH = 64
 
+# F-190: authenticated-liveness cadence. ``_authed`` maps identity -> expiry
+# deadline; a completed AUTH2 refreshes it, the ROUTER's challenge loop
+# re-probes every authenticated identity well inside the TTL, and an entry
+# past its deadline is treated exactly like a never-authenticated one. An
+# honest DEALER answers both the periodic challenge and its own keepalive
+# AUTH0 (which now RESTARTS the handshake instead of no-op'ing); a local
+# impostor that cloned the identity can neither answer nor refresh, so the
+# most it can buy is one TTL of routed liveness -- never an authenticated
+# send.
+_AUTHED_TTL = 65.0
+_AUTH_CHALLENGE_INTERVAL = 20.0
+
+# F-191: the @busnack receipt embeds the refused frame's payload so the
+# source can fail a pending RPC CALL by call id. Frames larger than this are
+# refused without a receipt (they were refused for size in the first place;
+# the caller's timeout is the documented signal for oversized lost frames).
+_NACK_PAYLOAD_LIMIT = 4096
+
 # F-143: DEALER-side re-authentication cadence. A periodic AUTH0 from an
-# identity the ROUTER already authenticated is an ignored no-op, but a ROUTER
-# that lost our entry (it restarted) answers it with a fresh challenge -- so
-# a missed monitor event still self-heals within one interval.
+# identity the ROUTER already authenticated restarts a full challenge (the
+# F-190 contract: AUTH0 revokes and re-proves -- the ROUTER's own liveness
+# challenges cover the case of a ROUTER that lost our entry while we were not
+# looking), so a missed monitor event still self-heals within one interval.
 _REAUTH_INTERVAL = 30.0
 # F-143: backoff cap between re-handshake attempts after a reconnect.
 _REAUTH_RETRY_CAP = 30.0
@@ -119,6 +170,11 @@ _BUS_AUTH_REJECTS = shared_counter(
 _BUS_UNAUTHENTICATED = shared_counter(
     "pyline_bus_unauthenticated_total",
     "ZMQ bus data frames dropped from identities that never completed the handshake",
+)
+# F-190: identities demoted because their authenticated liveness expired.
+_BUS_AUTH_EXPIRED = shared_counter(
+    "pyline_bus_auth_expired_total",
+    "ZMQ bus identities demoted: authenticated liveness expired without a refresh",
 )
 
 # F-75: permissions for a POSIX ipc:// endpoint. The bind file sits in a
@@ -236,10 +292,14 @@ class ZmqBus:
         # ``max_frame_size`` bytes each pile up before it fires.
         self._peer_queue_bytes: dict[int, int] = {}
         # Handshake state. ROUTER side: identities that completed the
-        # challenge-response (``_auth_pending`` holds the in-flight ones).
-        # DEALER side: the nonce we sent and the event set once OUR handshake
+        # challenge-response, mapped to the liveness expiry deadline their
+        # last AUTH2 earned them (F-190 -- a set that only grew authenticated
+        # identities forever also authenticated whoever inherited the number
+        # afterwards; ``_auth_pending`` holds the in-flight ones). DEALER
+        # side: the nonce we sent and the event set once OUR handshake
         # completed (start() blocks on it).
-        self._authed: set[bytes] = set()
+        self._authed: dict[bytes, float] = {}
+        self._authed_ever: set[bytes] = set()
         self._auth_pending: dict[bytes, tuple[bytes, bytes, float]] = {}
         self._client_nonce: bytes | None = None
         self._authed_event = asyncio.Event()
@@ -256,6 +316,9 @@ class ZmqBus:
         self._monitor_socket: zmq.asyncio.Socket | None = None
         self._monitor_task: asyncio.Task[None] | None = None
         self._reauth_task: asyncio.Task[None] | None = None
+        # F-190: ROUTER-side liveness loop -- challenges every authenticated
+        # identity each _AUTH_CHALLENGE_INTERVAL and demotes the expired ones.
+        self._auth_challenge_task: asyncio.Task[None] | None = None
         # F-74: peers whose writer is between queue.get() and the completion
         # of send_multipart. Cancelling a writer inside send_multipart can
         # tear a multipart message in half on the socket, after which the
@@ -274,6 +337,10 @@ class ZmqBus:
         self._malformed_log = WindowLogLimiter()
         self._auth_reject_log = WindowLogLimiter()
         self._unroutable_log = WindowLogLimiter()
+        self._expired_log = WindowLogLimiter()
+        # F-192: the recv loop's catch-all used to logger.exception() every
+        # failure -- one full traceback per hostile frame.
+        self._recv_err_log = WindowLogLimiter()
         # F-170: close() is idempotent -- a second call (teardown plan step
         # plus a signal-raced teardown, or a test) must not re-term the
         # already-terminated context.
@@ -302,6 +369,9 @@ class ZmqBus:
         self.spoofed_messages = 0
         self.auth_rejects = 0
         self.unauthenticated_drops = 0
+        # F-190/F-191 observability.
+        self.auth_expired = 0
+        self.nacks_sent = 0
         # F-76: writer crashes that were not ZMQ routing errors.
         self.writer_errors = 0
         self._metrics = get_metrics()
@@ -344,6 +414,10 @@ class ZmqBus:
                 "zmq ROUTER bound to %s (curve=%s)",
                 endpoint,
                 "on" if curve is not None else "off",
+            )
+            # F-190: ROUTER-owned liveness loop -- see _auth_challenge_loop.
+            self._auth_challenge_task = asyncio.get_running_loop().create_task(
+                self._auth_challenge_loop()
             )
         else:
             self._socket = self._zctx.socket(zmq.DEALER)
@@ -682,7 +756,17 @@ class ZmqBus:
             try:
                 await self._on_recv(parts)
             except Exception:
-                logger.exception("zmq message handling failed (parts=%d)", len(parts))
+                # F-192: a per-frame traceback is a log-flood vector for
+                # whatever the frames carry; one windowed line, the counter
+                # and metrics carry the rest.
+                if self._recv_err_log.allow():
+                    logger.exception(
+                        "zmq message handling failed (parts=%d, suppressed=%d)",
+                        len(parts),
+                        self._recv_err_log.take_suppressed(),
+                    )
+                else:
+                    self._recv_err_log.take_suppressed()
 
     async def _on_recv(self, parts: list[bytes]) -> None:
         self.recv_messages += 1
@@ -714,14 +798,33 @@ class ZmqBus:
                         self._spoof_log.take_suppressed(),
                     )
                 return
-            flag = flag_b.decode("utf-8")
+            # F-192: a malformed flag must die HERE, not in the recv loop's
+            # catch-all -- an unauthenticated peer must not be able to buy a
+            # traceback per frame. It cannot be an auth handshake frame either
+            # (those carry well-formed utf-8), so drop-and-count regardless of
+            # the sender's auth status.
+            try:
+                flag = flag_b.decode("utf-8")
+            except UnicodeDecodeError:
+                if self._malformed_log.allow():
+                    logger.warning(
+                        "router got message with undecodable flag bytes (%d bytes); dropped "
+                        "(suppressed=%d)",
+                        len(flag_b),
+                        self._malformed_log.take_suppressed(),
+                    )
+                return
             if flag in (BUS_AUTH0, BUS_AUTH2):
                 self._router_auth_step(identity_b, flag, payload)
                 return
-            if identity_b not in self._authed:
-                # No handshake, no data: without this gate the Windows
+            now = time.monotonic()
+            deadline = self._authed.get(identity_b)
+            if deadline is None or deadline < now:
+                # No (live) handshake, no data: without this gate the Windows
                 # loopback endpoint (no filesystem permission to protect it)
-                # let any local process speak as any service number.
+                # let any local process speak as any service number. F-190:
+                # an EXPIRED entry is exactly as dead as none -- identity
+                # inheritance buys nothing.
                 self.unauthenticated_drops += 1
                 _BUS_UNAUTHENTICATED.inc()
                 # F-171: unauthenticated spray is the cheapest log-flood
@@ -743,7 +846,10 @@ class ZmqBus:
                 # Forward: identity = target, then [from, flag, payload].
                 # Enqueue, never send inline -- a slow DEALER must not stall
                 # the ROUTER's recv loop for every other peer (F-15).
-                self._enqueue(target, [service_no_bytes(target), from_b, flag_b, payload])
+                if not self._enqueue(target, [service_no_bytes(target), from_b, flag_b, payload]):
+                    # F-191: the second leg refused the frame -- tell the
+                    # ORIGINAL sender instead of letting it burn a timeout.
+                    self._send_nack(from_b, target, flag, payload)
         else:
             # [from, flag, payload] -- ``from`` was validated against the
             # sender's identity by the ROUTER before forwarding (F-39).
@@ -756,12 +862,23 @@ class ZmqBus:
                     )
                 return
             from_b, flag_b, payload = parts
-            flag = flag_b.decode("utf-8")
+            try:
+                flag = flag_b.decode("utf-8")
+            except UnicodeDecodeError:
+                if self._malformed_log.allow():
+                    logger.warning(
+                        "dealer got message with undecodable flag bytes; dropped (suppressed=%d)",
+                        self._malformed_log.take_suppressed(),
+                    )
+                return
             if flag == BUS_AUTH1:
                 self._dealer_auth_reply(payload)
                 return
             if flag == BUS_AUTH3:
                 self._dealer_auth_ack()  # F-169: ROUTER-confirmed handshake
+                return
+            if flag == BUS_NACK:
+                self._on_bus_nack(from_b, payload)
                 return
             self._dispatch_local(flag, payload, int.from_bytes(from_b, "big"))
 
@@ -773,18 +890,31 @@ class ZmqBus:
                 del self._auth_pending[identity]
 
     def _router_auth_step(self, identity: bytes, flag: str, payload: bytes) -> None:
-        """ROUTER side of the handshake: challenge AUTH0, verify AUTH2."""
+        """ROUTER side of the handshake: challenge AUTH0, verify AUTH2.
+
+        F-190: an AUTH0 for an identity that is currently authenticated
+        REVOKES that status and restarts the challenge -- ZMQ silently hands
+        an identity's routing to whichever connection claimed it most
+        recently, and the ROUTER cannot observe the replacement, so the only
+        safe assumption is "a fresh AUTH0 may come from a different process
+        than the one that authenticated". Honest peers re-prove every
+        ``_REAUTH_INTERVAL`` anyway (their keepalive AUTH0 now runs the full
+        challenge); an impostor cannot answer it, so the identity it tried
+        to inherit stays demoted."""
         now = time.monotonic()
         self._purge_stale_auth(now)
         if flag == BUS_AUTH0:
-            if identity in self._authed:
-                return  # re-auth of a live peer: idempotent no-op
             if len(payload) != NONCE_LEN:
                 self._reject_auth(identity, "bad auth0 nonce length")
                 return
             if len(self._auth_pending) >= _MAX_PENDING_AUTH:
+                # Note: the identity keeps its current status here. Rejecting
+                # the challenge must not let an attacker's junk AUTH0 demote a
+                # healthy authenticated peer -- the checks run BEFORE the
+                # revocation below for exactly that reason.
                 self._reject_auth(identity, "pending handshake table full")
                 return
+            self._authed.pop(identity, None)  # F-190: AUTH0 revokes, then re-proves
             server_nonce = secrets.token_bytes(NONCE_LEN)
             self._auth_pending[identity] = (
                 payload,
@@ -809,7 +939,9 @@ class ZmqBus:
             )
             return
         # BUS_AUTH2: HMAC(token, server_nonce) -- proof the peer holds the
-        # token; only valid against the nonce this ROUTER generated.
+        # token; only valid against the nonce this ROUTER generated. The
+        # check is flow-agnostic: the nonce may come from an AUTH0 challenge
+        # or from the ROUTER's own liveness probe (_auth_challenge_loop).
         entry = self._auth_pending.get(identity)
         if entry is None:
             self._reject_auth(identity, "auth2 without a pending handshake")
@@ -819,7 +951,9 @@ class ZmqBus:
             self._reject_auth(identity, "bad auth2 digest")
             return
         del self._auth_pending[identity]
-        self._authed.add(identity)
+        # F-190: authentication carries an expiry; the challenge loop and the
+        # peer's keepalives refresh it, silence lets it die.
+        self._authed[identity] = now + _AUTHED_TTL
         # F-169: confirm to the DEALER that its authentication LANDED. The
         # DEALER used to flip its own ``_auth_ok`` when it queued AUTH2 --
         # if that frame never arrived (queue drop, pending entry expired
@@ -837,7 +971,14 @@ class ZmqBus:
             ],
             force=True,
         )
-        logger.info("zmq bus peer %d authenticated", int.from_bytes(identity, "big"))
+        first_time = identity not in self._authed_ever
+        self._authed_ever.add(identity)
+        log = logger.info if first_time else logger.debug
+        log(
+            "zmq bus peer %d authenticated%s",
+            int.from_bytes(identity, "big"),
+            "" if first_time else " (liveness refresh)",
+        )
 
     def _reject_auth(self, identity: bytes, reason: str) -> None:
         self._auth_pending.pop(identity, None)
@@ -854,28 +995,101 @@ class ZmqBus:
                 self._auth_reject_log.take_suppressed(),
             )
 
+    async def _auth_challenge_loop(self) -> None:
+        """F-190: ROUTER-owned liveness loop.
+
+        Every ``_AUTH_CHALLENGE_INTERVAL`` each authenticated identity gets a
+        fresh server-nonce challenge; a valid AUTH2 refreshes its expiry. The
+        loop's clock -- not the peer's -- decides when an entry dies: an
+        impostor that inherited an identity's ROUTING (ZMQ hands routing to
+        the newest claimant, which the ROUTER cannot observe) can neither
+        answer the probes nor refresh the deadline, so the inherited entry
+        expires and its data frames start hitting the unauthenticated gate.
+        Without this, the only re-proof was the peer-initiated keepalive
+        AUTH0 -- which an impostor simply never sends."""
+        while True:
+            await asyncio.sleep(_AUTH_CHALLENGE_INTERVAL)
+            now = time.monotonic()
+            self._purge_stale_auth(now)
+            for identity, deadline in list(self._authed.items()):
+                if deadline < now:
+                    del self._authed[identity]
+                    self.auth_expired += 1
+                    _BUS_AUTH_EXPIRED.inc()
+                    if self._expired_log.allow():
+                        logger.info(
+                            "zmq bus identity %d demoted: authenticated liveness expired "
+                            "without a refresh (expired=%d, suppressed=%d)",
+                            int.from_bytes(identity, "big"),
+                            self.auth_expired,
+                            self._expired_log.take_suppressed(),
+                        )
+                    continue
+                if identity in self._auth_pending:
+                    continue  # a challenge is already in flight (keepalive race)
+                server_nonce = secrets.token_bytes(NONCE_LEN)
+                self._auth_pending[identity] = (b"", server_nonce, now + _AUTH_PENDING_TTL)
+                self._enqueue(
+                    int.from_bytes(identity, "big"),
+                    [
+                        identity,
+                        service_no_bytes(self._ctx.service_no),
+                        BUS_AUTH1.encode("utf-8"),
+                        server_nonce + hmac_digest(self._token, b"", server_nonce),
+                    ],
+                    force=True,
+                )
+
+    def revoke_identity(self, service_no: int) -> None:
+        """F-190: drop a service number's authenticated status immediately.
+
+        Called when the supervisor observes the owning child process die (or
+        be killed): the OS process that earned the handshake is gone, so any
+        future frame from that identity comes from whoever claimed the number
+        next -- it must re-prove from scratch. Belt and braces on top of the
+        liveness TTL; harmless when the peer is already gone."""
+        identity = service_no_bytes(service_no)
+        self._authed.pop(identity, None)
+        self._auth_pending.pop(identity, None)
+
     def _dealer_auth_reply(self, payload: bytes) -> None:
         """DEALER side: verify the ROUTER's AUTH1 and answer with AUTH2.
 
         F-169: this method no longer marks the handshake complete -- only the
         ROUTER's AUTH3 confirmation does (see ``_dealer_auth_ack``). Between
         our AUTH2 and that confirmation the ROUTER is the only side that
-        knows whether the handshake landed."""
-        if self._client_nonce is None:
-            # A stray AUTH1 without our challenge (e.g. after a completed
-            # handshake) -- nothing to do.
-            return
+        knows whether the handshake landed.
+
+        F-190: an AUTH1 with no outstanding AUTH0 from us is one of the
+        ROUTER's liveness probes (every authenticated identity is
+        re-challenged each _AUTH_CHALLENGE_INTERVAL). The probe's digest
+        covers the empty client nonce; we answer it the same way -- refusing
+        to answer would let our entry expire and our data frames join the
+        unauthenticated drops. The reply only proves token possession for
+        THIS server nonce, so answering an unsolicited probe leaks nothing a
+        solicited one would not."""
+        unsolicited = self._client_nonce is None
         if len(payload) != NONCE_LEN + 32:  # server nonce + SHA-256 digest
             logger.warning("zmq bus auth reply has bad length %d; ignored", len(payload))
             return
         server_nonce, claimed = payload[:NONCE_LEN], payload[NONCE_LEN:]
-        expected = hmac_digest(self._token, self._client_nonce, server_nonce)
+        if unsolicited:
+            expected = hmac_digest(self._token, b"", server_nonce)
+        else:
+            assert self._client_nonce is not None
+            expected = hmac_digest(self._token, self._client_nonce, server_nonce)
+            if not digest_matches(expected, claimed):
+                # A probe racing our own keepalive AUTH0 arrives with the
+                # empty-nonce digest -- accept that variant too (both are
+                # token proofs from the ROUTER over this server nonce).
+                expected = hmac_digest(self._token, b"", server_nonce)
         if not digest_matches(expected, claimed):
             # Wrong token on the ROUTER (or an impostor endpoint): never
             # answer, never authenticate -- start() fails on its deadline.
             logger.error("zmq bus auth reply failed digest verification")
             return
-        self._client_nonce = None  # one-shot: a replayed AUTH1 is ignored
+        if not unsolicited:
+            self._client_nonce = None  # one-shot: a replayed AUTH1 is ignored
         self._enqueue(
             _ROUTER_PEER,
             [
@@ -893,6 +1107,62 @@ class ZmqBus:
         self._ever_authed = True
         self._authed_event.set()
 
+    # ------------------------ drop receipts (F-191) ----------------------- #
+
+    def _send_nack(self, from_b: bytes, dropped_target: int, flag: str, payload: bytes) -> None:
+        """ROUTER: tell the ORIGINAL sender their forwarded frame was refused.
+
+        ``raise_on_drop`` (F-127) only spans the first leg -- the enqueue in
+        the SENDER's process. The forwarding enqueue at the ROUTER used to
+        fail invisibly, so a sub-process RPC CALL routed through the ROUTER
+        to a busy sibling died in a full 10 s timeout while the caller held a
+        perfectly actionable error. The receipt is bounded to small frames
+        (_NACK_PAYLOAD_LIMIT): a message refused for SIZE must not generate a
+        same-sized reply, and the oversized case keeps the documented
+        timeout-is-the-signal semantics. Enqueued without ``force``: a peer
+        whose own queue is saturated learns through its timeout, like
+        before."""
+        if len(payload) > _NACK_PAYLOAD_LIMIT:
+            return
+        try:
+            body = msgpack.packb(
+                [dropped_target, int.from_bytes(from_b, "big"), flag, payload],
+                use_bin_type=True,
+            )
+        except (TypeError, ValueError):
+            return
+        self.nacks_sent += 1
+        self._enqueue(
+            int.from_bytes(from_b, "big"),
+            [
+                from_b,
+                service_no_bytes(self._ctx.service_no),
+                BUS_NACK.encode("utf-8"),
+                body,
+            ],
+        )
+
+    def _on_bus_nack(self, from_b: bytes, payload: bytes) -> None:
+        """DEALER: a receipt for one of our frames refused at the ROUTER.
+
+        Only the main-process ROUTER synthesises @busnack frames; anything
+        else claiming the flag never went through bus authentication and is
+        dropped unread. The body dispatches through the gateway so the RPC
+        face (rpc.py) can fail the matching pending CALL by call id."""
+        sender = int.from_bytes(from_b, "big")
+        if main_service_no(sender) != self._ctx.main_service_no:
+            self.spoofed_messages += 1
+            self._metrics.ipc_spoofed.inc()
+            if self._spoof_log.allow():
+                logger.warning(
+                    "bus nack claimed to be from %d (not the local main process); dropped "
+                    "(suppressed=%d)",
+                    sender,
+                    self._spoof_log.take_suppressed(),
+                )
+            return
+        self._dispatch_local(BUS_NACK, payload, sender)
+
     # ------------------------ CURVE / ZAP (F-189) ------------------------- #
 
     def _start_zap(self, curve: CurveSettings) -> None:
@@ -905,11 +1175,10 @@ class ZmqBus:
         if curve.client_public is not None:
             allow.add(curve.client_public)
         else:
-            allow.add(
-                curve.client_public
-                if curve.client_public is not None
-                else curve_public_of(curve.client_secret.get_secret_value())
-            )
+            # F-193: this used to re-test ``client_public is not None`` inside
+            # its own else-branch -- a dead ternary that always evaluated the
+            # derived public key anyway.
+            allow.add(curve_public_of(curve.client_secret.get_secret_value()))
         self._zap_allow = frozenset(allow)
         self._zap_socket = self._zctx.socket(zmq.REP)
         self._zap_socket.bind(_ZAP_ENDPOINT)
@@ -927,7 +1196,12 @@ class ZmqBus:
         client_key(32 raw bytes)]; reply: [version, sequence, status_code,
         status_text, user_id, metadata].  A 300 ms bound on the reply keeps
         a wedged responder visible instead of silently stalling every CURVE
-        handshake."""
+        handshake.
+
+        F-193: the request's domain frame must match the socket's zap_domain
+        (RFC 27 routes by domain), and a malformed request gets an explicit
+        400 instead of silence -- libzmq otherwise parks the client's
+        handshake until its own timeout."""
         zap = self._zap_socket
         assert zap is not None
         while True:
@@ -937,21 +1211,30 @@ class ZmqBus:
                 raise
             except zmq.ZMQError:
                 return  # context torn down by close()
-            if len(request) < 7:
-                continue
+            if len(request) < 2:
+                continue  # not even a reply address: nothing to answer
             version, sequence = request[0], request[1]
-            mechanism = request[5]
-            client_key = request[6]
-            if mechanism == b"CURVE" and z85_encode(client_key) in self._zap_allow:
-                status, text, user_id = b"200", b"OK", z85_encode(client_key).encode("ascii")
+            if len(request) < 7:
+                status, text, user_id = b"400", b"malformed zap request", b""
             else:
-                self._zap_rejects += 1
-                _BUS_AUTH_REJECTS.inc()
-                logger.warning(
-                    "zmq ZAP rejected a CURVE client (key not in the allowlist; rejects=%d)",
-                    self._zap_rejects,
-                )
-                status, text, user_id = b"400", b"key not allowed", b""
+                domain = request[2]
+                mechanism = request[5]
+                client_key = request[6]
+                if (
+                    mechanism == b"CURVE"
+                    and domain == _ZAP_DOMAIN.encode("ascii")
+                    and z85_encode(client_key) in self._zap_allow
+                ):
+                    status, text, user_id = b"200", b"OK", z85_encode(client_key).encode("ascii")
+                else:
+                    self._zap_rejects += 1
+                    _BUS_AUTH_REJECTS.inc()
+                    logger.warning(
+                        "zmq ZAP rejected a CURVE client (key not in the allowlist or wrong "
+                        "domain; rejects=%d)",
+                        self._zap_rejects,
+                    )
+                    status, text, user_id = b"400", b"key not allowed", b""
             with contextlib.suppress(zmq.ZMQError):
                 await asyncio.wait_for(
                     zap.send_multipart([version, sequence, status, text, user_id, b""]),
@@ -1019,13 +1302,13 @@ class ZmqBus:
                 return
 
     async def _reauth_keepalive(self) -> None:
-        """F-143 belt-and-suspenders: periodically re-offer the handshake.
+        """F-143/F-190 belt-and-suspenders: periodically re-offer the handshake.
 
-        A ROUTER that knows this identity ignores AUTH0 (idempotent no-op),
-        so the steady-state cost is one tiny frame per interval. A ROUTER
-        that lost our entry -- restarted without the disconnect event ever
-        reaching this DEALER -- answers it with a fresh challenge and the
-        mesh heals within one interval instead of black-holing forever.
+        The ROUTER answers every AUTH0 with a fresh challenge (F-190), so each
+        interval the DEALER re-proves it holds the token -- this both
+        refreshes its authenticated liveness and heals a ROUTER that lost our
+        entry (restarted without the disconnect event ever reaching us)
+        within one interval instead of black-holing forever.
         """
         while True:
             await asyncio.sleep(_REAUTH_INTERVAL)
@@ -1044,13 +1327,14 @@ class ZmqBus:
         self._closed = True
         # F-143: stop the reconnect machinery first -- a monitor-triggered
         # re-handshake racing the socket teardown would log spurious errors.
-        for task in (self._reauth_task, self._monitor_task):
+        for task in (self._reauth_task, self._monitor_task, self._auth_challenge_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
         self._reauth_task = None
         self._monitor_task = None
+        self._auth_challenge_task = None
         # F-189: ZAP responder down before the context (its inproc bind
         # lives in the same context we are about to terminate).
         if self._zap_task is not None:
@@ -1062,6 +1346,7 @@ class ZmqBus:
             self._zap_socket.close(0)
             self._zap_socket = None
         self._authed.clear()
+        self._authed_ever.clear()
         self._auth_pending.clear()
         self._auth_ok = False
         if self._monitor_socket is not None:

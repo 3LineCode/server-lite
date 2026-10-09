@@ -75,10 +75,13 @@ def parse_forward(data: bytes) -> tuple[int, int, str, bytes, int]:
         target, from_service, flag, payload, hops = fields
     if (
         not isinstance(target, int)
+        or isinstance(target, bool)  # F-194: msgpack bools are ints
         or not isinstance(from_service, int)
+        or isinstance(from_service, bool)
         or not isinstance(flag, str)
         or not isinstance(payload, bytes)
         or not isinstance(hops, int)
+        or isinstance(hops, bool)
     ):
         raise ValueError("@fwd envelope has wrong field types")
     return target, from_service, flag, payload, hops
@@ -156,11 +159,19 @@ class ProxyServer(_CloseSpawner):
             send_queue_bytes=s.send_queue_bytes,
             max_frame=s.max_frame_size,
             preauth_max_frame=s.preauth_max_frame,
-            max_connections=s.max_connections,
+            # F-219: the proxy plane carries machine-to-machine links (tens),
+            # not client-scale traffic -- bounding it independently keeps a
+            # proxy machine's combined fd budget inside the Windows ceiling.
+            max_connections=min(s.max_connections, 64),
             max_connections_per_ip=s.max_connections_per_ip,
             ssl_context=ssl_context,
             on_message=self._on_pre_ident_frame,
             on_connected=self._on_connected,
+            # F-219: commit this listener's accept cap to the process-wide
+            # Windows fd budget under its own label -- the client listener
+            # and the proxy server each used to be checked against the FULL
+            # budget, promising the selector loop ~2x what it can watch.
+            label="proxy",
         )
         logger.info(
             "proxy server listening on %s:%d (tls=%s)",

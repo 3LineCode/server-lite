@@ -149,6 +149,8 @@ class DatabaseService:
         self._tx: dict[str, _TxRecord] = {}
         self._tx_ttl = tx_ttl
         self._max_transactions = max_transactions
+        # F-209: high-water warning latch (see rpc_tx_begin).
+        self._tx_watermark_warned = False
         self._dispose_tasks: set[asyncio.Task[None]] = set()
         # F-61: how finished transactions ended, so a caller whose COMMIT rpc
         # timed out can reconcile the ambiguous outcome.  Entries expire on
@@ -219,6 +221,21 @@ class DatabaseService:
             raise TransactionLimitError(
                 f"remote transaction limit reached ({self._max_transactions})"
             )
+        # F-209: the limit is global to every business process combined, and
+        # each session is a dedicated out-of-pool connection -- a burst that
+        # trends toward the cap deserves a warning BEFORE callers start
+        # eating TransactionLimitError (75% high-water, once until it drops
+        # back under).
+        if len(self._tx) >= self._max_transactions * 3 // 4 and not self._tx_watermark_warned:
+            self._tx_watermark_warned = True
+            logger.warning(
+                "remote transactions at %d/%d (each holds a dedicated connection; "
+                "budget against mysql.max_connections)",
+                len(self._tx),
+                self._max_transactions,
+            )
+        elif len(self._tx) < self._max_transactions // 2:
+            self._tx_watermark_warned = False
         session = await self._pool.open_session()
         try:
             await session.begin()

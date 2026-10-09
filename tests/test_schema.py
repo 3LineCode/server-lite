@@ -54,12 +54,12 @@ class SchemaFakePool:
         self,
         *,
         tables: set[str] | None = None,
-        columns: dict[str, list[tuple[str, str, str]]] | None = None,
+        columns: dict[str, list[tuple[str, ...]]] | None = None,
         version: int = 0,
     ) -> None:
         self.statements: list[tuple[str, tuple]] = []
         self.tables = set(tables or ())
-        # columns: table -> list of (name, column_type, is_nullable)
+        # columns: table -> list of (name, column_type, is_nullable[, column_key])
         self.columns: dict[str, list[tuple[str, str, str]]] = dict(columns or {})
         self.version = version
         # F-51: migration -> statements applied by a (possibly failed) attempt
@@ -108,9 +108,15 @@ class SchemaFakePool:
             return [(statements,)] if statements is not None else []
         if "information_schema.COLUMNS" in sql:
             table = args[1]
+            # Fixtures may carry 3-field rows (name, type, nullable); the
+            # drift check also reads COLUMN_KEY (F-207) -- synthesize it for
+            # legacy rows: every fixture spells its primary "id".
+            rows: list[tuple[str, ...]] = []
+            for row in self.columns.get(table, []):
+                rows.append(row if len(row) >= 4 else (*row, "PRI" if row[0] == "id" else ""))
             if "IS_NULLABLE" in sql:
-                return list(self.columns.get(table, []))
-            return [(name,) for name, _, _ in self.columns.get(table, [])]
+                return rows
+            return [(name,) for name, *_ in rows]
         return []
 
 

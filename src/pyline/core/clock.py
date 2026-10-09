@@ -120,7 +120,15 @@ class GameClock:
                 instant = candidate.replace(fold=fold).timestamp()
                 if instant > ts and (best is None or instant < best):
                     best = instant
-        assert best is not None, "wall window must contain the next boundary"
+        # F-199: this is an invariant of the window above, not a caller
+        # recoverable condition -- but an ``assert`` disappears under
+        # ``python -O``, and a ``None`` return would crash callers in
+        # arithmetic far from the cause. Raise explicitly instead.
+        if best is None:  # pragma: no cover - window arithmetic guarantees it
+            raise RuntimeError(
+                "next_halfhour_after: the +/-4h wall window found no boundary after "
+                f"ts={ts!r} (clock tz={self._tz!r})"
+            )
         return best
 
     def next_halfhour_boundary(self) -> tuple[float, int]:

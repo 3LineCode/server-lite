@@ -48,6 +48,7 @@ from pyline.net.protocol import (
     ProtocolError,
     encode_message,
 )
+from pyline.net.session import set_current_connection
 from pyline.obs.metrics import get_metrics, shared_counter
 
 logger = logging.getLogger(__name__)
@@ -99,18 +100,33 @@ DEFAULT_MAX_CONNECTIONS_PER_IP = 256
 _WINDOWS_SELECT_FDS = 512
 _WINDOWS_RESERVED_FDS = 64
 
+# F-219: the ceiling is PER PROCESS, not per listener: the client listener
+# and the proxy server each used to be checked against the full budget, so
+# together they could promise the selector loop ~2x what it can watch. Each
+# listener label commits its cap to this ledger; the SUM must fit.
+_FD_BUDGET_LEDGER: dict[str, int] = {}
 
-def check_windows_fd_budget(max_connections: int) -> None:
-    """Refuse an accept cap the Windows selector loop cannot honour (F-161)."""
+
+def reset_fd_budget_ledger() -> None:
+    """Test helper: forget committed reservations from a previous server."""
+    _FD_BUDGET_LEDGER.clear()
+
+
+def check_windows_fd_budget(max_connections: int, *, label: str = "client") -> None:
+    """Refuse accept caps the Windows selector loop cannot honour (F-161),
+    summed across every listener in this process (F-219)."""
     if sys.platform != "win32":
         return
+    _FD_BUDGET_LEDGER[label] = max_connections
     ceiling = _WINDOWS_SELECT_FDS - _WINDOWS_RESERVED_FDS
-    if max_connections > ceiling:
+    committed = sum(_FD_BUDGET_LEDGER.values())
+    if committed > ceiling:
         raise ConfigError(
-            f"socket.max_connections={max_connections} exceeds the Windows "
+            f"socket.max_connections across this process's listeners "
+            f"({_FD_BUDGET_LEDGER!r}) totals {committed} and exceeds the Windows "
             f"selector-loop budget (~{_WINDOWS_SELECT_FDS} fds incl. a "
             f"{_WINDOWS_RESERVED_FDS}-fd reserve for the bus/proxy/stdio): "
-            f"lower it to <= {ceiling} or deploy on POSIX "
+            f"lower the caps to a total <= {ceiling} or deploy on POSIX "
             "(see docs/deployment.md, 'Windows fd ceiling')"
         )
 
@@ -137,12 +153,23 @@ class Connection:
         is_server_side: bool,
         on_message: MessageCallback,
         on_verified: Callable[[Connection], None] | None = None,
+        max_inflight: int = 0,
     ) -> None:
         self.peer = peer
         self.is_server_side = is_server_side
         self.verified = False
         self.closed = False
         self.close_reason = ""
+        # F-225: registry-assigned id (0 = not registered -- proxy links and
+        # client-side connections). Assigned by ClientSessionRegistry.register.
+        self.conn_id = 0
+        # F-224: per-connection handler-task budget (0 = uncapped). Admitted
+        # by Network.handle_message through the dispatch contextvar; released
+        # by the handler task's done callback -- a frame storm from ONE
+        # connection used to be able to occupy the process-global handler
+        # pool and starve every other client.
+        self.max_inflight = max_inflight
+        self._inflight = 0
         self._reader = reader
         self._writer = writer
         self._token = token
@@ -228,6 +255,27 @@ class Connection:
         task.add_done_callback(_done)
 
     # ------------------------------------------------------------------ #
+    # Per-connection handler budget (F-224)
+    # ------------------------------------------------------------------ #
+
+    def admit_inflight(self) -> bool:
+        """Reserve one handler slot; False when this connection is at its cap."""
+        if self.max_inflight <= 0:
+            return True
+        if self._inflight >= self.max_inflight:
+            return False
+        self._inflight += 1
+        return True
+
+    def release_inflight(self) -> None:
+        if self.max_inflight > 0 and self._inflight > 0:
+            self._inflight -= 1
+
+    @property
+    def inflight(self) -> int:
+        return self._inflight
+
+    # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
 
@@ -262,6 +310,12 @@ class Connection:
                 for frame in self._decoder.feed(data):
                     if self._handle_frame(frame) is False:
                         return
+        except ProtocolError as exc:
+            # F-223: a protocol violation (bad magic/version, oversize) used
+            # to land in the catch-all below and close with the generic
+            # "read eof" -- the diagnostic only ever lived in the log line.
+            self._claimed_reason = self._claimed_reason or f"protocol error: {exc}"
+            logger.warning("protocol error on %s: %s", self, exc)
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
         except Exception:
@@ -342,6 +396,11 @@ class Connection:
             return True
         # F-13: dispatch isolation -- an application exception drops this one
         # frame; only a sustained storm of them takes the connection down.
+        # F-225: the dispatch runs inside the connection context so handlers
+        # (and the handler tasks Network spawns from here -- asyncio copies
+        # the context at task creation) can ask session.current() which
+        # client connection this frame arrived on.
+        token = set_current_connection(self)
         try:
             self._on_message(frame.flag, frame.payload)
         except Exception:
@@ -360,6 +419,8 @@ class Connection:
             if len(self._error_times) >= DISPATCH_ERROR_LIMIT:
                 self._spawn_close("dispatch error storm")
                 return False
+        finally:
+            token.var.reset(token)
         return True
 
     def _verified(self) -> None:
@@ -643,8 +704,11 @@ async def serve(
     token: str,
     on_message: MessageCallback,
     on_connected: Callable[[Connection], None],
+    on_disconnected: Callable[[Connection], None] | None = None,
     max_connections: int = DEFAULT_MAX_CONNECTIONS,
     max_connections_per_ip: int = DEFAULT_MAX_CONNECTIONS_PER_IP,
+    max_inflight_per_connection: int = 0,
+    label: str = "client",
     ssl_context: ssl.SSLContext | None = None,
     **kwargs: object,
 ) -> asyncio.AbstractServer:
@@ -657,12 +721,18 @@ async def serve(
 
     F-187/F-188: ``ssl_context`` (from
     :func:`pyline.net.tls.build_server_context`) wraps the listener in TLS;
-    the challenge-response handshake runs inside the tunnel, unchanged."""
+    the challenge-response handshake runs inside the tunnel, unchanged.
+
+    F-225: ``on_disconnected`` (when given) runs from the connection's close
+    hook -- exactly once per connection, any close reason. F-219:
+    ``label`` names this listener in the process-wide Windows fd budget
+    ledger. F-224: ``max_inflight_per_connection`` bounds how many handler
+    tasks ONE connection may have running (0 = uncapped)."""
 
     # F-161: fail at bind time on Windows instead of crashing the selector
-    # loop under load (both listeners -- client and proxy -- go through
-    # here, and each accepts up to max_connections sockets).
-    check_windows_fd_budget(max_connections)
+    # loop under load; F-219: the budget is shared by every listener in the
+    # process (client + proxy), each committing under its own label.
+    check_windows_fd_budget(max_connections, label=label)
 
     limiter = _ConnectionLimiter(max_connections, max_connections_per_ip)
 
@@ -695,11 +765,17 @@ async def serve(
             is_server_side=True,
             on_message=on_message,
             on_verified=verified_hook,
+            max_inflight=max_inflight_per_connection,
             **kwargs,  # type: ignore[arg-type]
         )
 
         def release_slot(_conn: Connection, ip: str = peer[0]) -> None:
             limiter.release(ip)
+            if on_disconnected is not None:
+                try:
+                    on_disconnected(_conn)
+                except Exception:
+                    logger.exception("on_disconnected hook failed for %s", _conn)
 
         conn.add_close_hook(release_slot)
         await conn.start()

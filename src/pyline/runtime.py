@@ -30,10 +30,11 @@ from pyline.config.loader import (
     load_table_defs,
 )
 from pyline.core.clock import GameClock
-from pyline.core.context import PROCESS_MAIN, Context
+from pyline.core.context import PROCESS_MAIN, SERVICE_NO_STRIDE, Context
 from pyline.core.events import (
     BaseInitEvent,
     ClientConnectedEvent,
+    ClientDisconnectedEvent,
     EnvReadyEvent,
     EventBus,
     FrameInitEvent,
@@ -59,8 +60,9 @@ from pyline.net import (
     close_server,
     serve,
 )
+from pyline.net.session import ClientSessionRegistry
 from pyline.net.tls import build_server_context
-from pyline.obs.metrics import AlarmHub
+from pyline.obs.metrics import AlarmHub, get_metrics
 from pyline.reload.inplace import reload_module
 from pyline.runtime_wiring import (
     ENV_UNSAFE_CONSOLE,
@@ -134,6 +136,14 @@ class ServerRuntime:
         self._client_server: asyncio.AbstractServer | None = None
         self._client_control_rejected = 0
         self._bg_tasks: set[asyncio.Task[object]] = set()
+        # F-225: client session registry -- conn_id -> live Connection. The
+        # gauge rides register/unregister; the disconnect event fires from
+        # each connection's close hook (exactly once per connection).
+        self.sessions = ClientSessionRegistry()
+        ctx.services["client_sessions"] = self.sessions
+        # F-196: boot() registers the shutdown hook by APPENDING; a second
+        # boot() used to run the whole teardown plan twice.
+        self._boot_called = False
 
     # ------------------------------------------------------------------ #
     # Boot
@@ -155,6 +165,15 @@ class ServerRuntime:
             raise ConfigError(f"clock.tz {tz!r} is not a valid timezone: {exc}") from exc
 
     async def boot(self) -> None:
+        # F-196: the shutdown hook list is appended to in _register_boot_steps;
+        # a second boot() (programmer error, a re-hosting embedder) used to
+        # double every hook -- the whole teardown plan ran twice.
+        if self._boot_called:
+            raise RuntimeError(
+                "ServerRuntime.boot() called twice; build a new ServerRuntime "
+                "for a second boot (shutdown hooks are not idempotent)"
+            )
+        self._boot_called = True
         self._register_boot_steps()
         await self.bus.emit(EnvReadyEvent())  # F-24: pre-boot hook point
         await self.lifecycle.run_boot()
@@ -179,7 +198,13 @@ class ServerRuntime:
         self.clock_events.start()
 
     async def _step_frame_init(self) -> None:
-        self._load_business()
+        # F-197: the DB process runs no business code (DbLayer's documented
+        # contract) -- importing the business package there used to execute
+        # its module side effects and register event handlers in the one
+        # process that exists to serve RPC, and develop mode even gave it a
+        # file watcher for modules it never dispatches.
+        if not self.ctx.is_db_process:
+            self._load_business()
         self.bus_zmq = ZmqBus(self.ctx, self.gateway)
         await self.bus_zmq.start()
         self.router = MessageRouter(self.ctx, self.gateway, self.bus_zmq)
@@ -201,7 +226,16 @@ class ServerRuntime:
             inflight_wait=self.ctx.settings.socket.rpc_inflight_wait,
         )
         self.ctx.services["rpc"] = self.rpc
-        await self.bus.emit(FrameInitEvent())
+        # F-220: a plaintext bus in production is authenticated but readable
+        # by anything on the path; the trust model says configure CURVE -- a
+        # deployment that forgot used to come up quietly exposed.
+        if self.ctx.settings.srv_type == "production" and self.ctx.settings.zeromq.curve is None:
+            logger.warning(
+                "zeromq.curve is not configured: the ZMQ bus runs AUTHENTICATED "
+                "but PLAINTEXT in production (see docs/deployment.md, trust model)"
+            )
+        if not self.ctx.is_db_process:
+            await self.bus.emit(FrameInitEvent())
 
     async def _step_conn_db(self) -> None:
         assert self.rpc is not None  # FRAME_INIT runs before CONN_DB
@@ -241,6 +275,12 @@ class ServerRuntime:
             logger.info("business module %s registered", module_name)
 
     async def _step_func_done(self) -> None:
+        # F-197: no business code lives in the DB process, so there is
+        # nothing to save-schedule, watch or notify -- starting the console/
+        # watcher there used to race the operator surface with a process
+        # nobody operates.
+        if self.ctx.is_db_process:
+            return
         self.save_scheduler.start()
         self.devtools.start(
             reload_hook=self._reload_and_rebind,
@@ -266,6 +306,14 @@ class ServerRuntime:
         # clients are authenticated by the in-tunnel HMAC handshake).
         tls = self.ctx.settings.socket.tls
         ssl_context = build_server_context(tls) if tls is not None else None
+        if ssl_context is None and self.ctx.settings.srv_type == "production":
+            # F-220: same reasoning as the bus warning above -- the listener
+            # is authenticated but plaintext; say so instead of letting a
+            # deployment discover it from a packet capture.
+            logger.warning(
+                "socket.tls is not configured: the client listener runs AUTHENTICATED "
+                "but PLAINTEXT in production (see docs/deployment.md, trust model)"
+            )
         self._client_server = await serve(
             entry.bind_host(),
             entry.client_listen_port(self.ctx.process_index),
@@ -278,9 +326,11 @@ class ServerRuntime:
             send_queue_bytes=self.ctx.settings.socket.send_queue_bytes,
             max_connections=self.ctx.settings.socket.max_connections,
             max_connections_per_ip=self.ctx.settings.socket.max_connections_per_ip,
+            max_inflight_per_connection=self.ctx.settings.socket.max_inflight_per_connection,
             ssl_context=ssl_context,
             on_message=self._on_client_frame,
             on_connected=self._on_client_connected,
+            on_disconnected=self._on_client_disconnected,
         )
         logger.info(
             "client listener on %s:%d (tls=%s)",
@@ -327,7 +377,27 @@ class ServerRuntime:
         self.gateway.dispatch(flag, payload)
 
     def _on_client_connected(self, conn: Connection) -> None:
-        self._spawn(self.bus.emit(ClientConnectedEvent(peer=conn.peer)))
+        # F-225: registry + id assignment happen synchronously in the
+        # handshake's verified hook, so the very first frame from this
+        # connection can already be answered with session.send(conn_id).
+        conn_id = self.sessions.register(conn)
+        get_metrics().client_sessions.set(self.sessions.count())
+        self._spawn(self.bus.emit(ClientConnectedEvent(peer=conn.peer, conn_id=conn_id)))
+
+    def _on_client_disconnected(self, conn: Connection) -> None:
+        # F-225: runs from the connection's close hook (exactly once). The
+        # event is the framework half of connection<->player bookkeeping:
+        # business handlers drop their mapping here; the registry entry is
+        # gone before the event fires, so a racing send() fails cleanly.
+        self.sessions.unregister(conn)
+        get_metrics().client_sessions.set(self.sessions.count())
+        self._spawn(
+            self.bus.emit(
+                ClientDisconnectedEvent(
+                    peer=conn.peer, conn_id=conn.conn_id, reason=conn.close_reason
+                )
+            )
+        )
 
     async def _step_finished(self) -> None:
         logger.info(
@@ -399,6 +469,13 @@ class ServerRuntime:
         7. scheduler last -- mirrors boot (loop bound first, released last);
            business timers were the caller's responsibility to cancel at
            func-quit (step 1)."""
+        # F-195: a shutdown request that landed while a boot step action was
+        # still inside an await used to build this plan against half-built
+        # state -- a listener/pool the step assigns after its await returns
+        # never entered the plan and leaked into asyncio.run's backstop.
+        # Let the in-flight action finish assigning first (bounded; it has
+        # its own step_timeout).
+        await self.lifecycle.wait_boot_step_settled(self.shutdown_step_timeout)
         plan = TeardownPlan(
             total_timeout=self.shutdown_timeout, step_timeout=self.shutdown_step_timeout
         )
@@ -420,11 +497,27 @@ class ServerRuntime:
             plan.add("watcher", self.devtools.watcher.stop)
         if self.devtools.console is not None:
             plan.add("console", self.devtools.console.stop)
+        # F-198: stop arming the clock boundary chain BEFORE the flush -- a
+        # boundary firing mid-flush dirty data after its snapshot is the
+        # same silent-loss class as an ingress frame, and a chain leg racing
+        # the scheduler's close step used to raise "scheduler is closed"
+        # out of a background task.
+        plan.add("clock-events", self.clock_events.stop)
         plan.add("save-flush", flush_step, timeout=self.shutdown_timeout)
         if self.devtools.monitor is not None:
             plan.add("monitor", self.devtools.monitor.stop)
         if self.devtools.metrics_server is not None:
             plan.add("metrics-server", self.devtools.stop_metrics)
+        # F-225: close client connections (bounded) before the transports
+        # under them go away.
+        if self.sessions.count():
+            plan.add("client-sessions", self._drain_client_sessions)
+        # F-198: cancel remaining background notification tasks (clock
+        # chains, connect/disconnect event emits) instead of leaving them to
+        # asyncio.run's loop-close backstop. The CURRENT task (this
+        # teardown, possibly spawned through _spawn itself) is excluded.
+        if self._bg_tasks:
+            plan.add("bg-tasks", self._drain_bg_tasks)
         if self.bus_zmq is not None:
             plan.add("zmq-bus", self.bus_zmq.close)
         if self.db_layer.db_service is not None:
@@ -453,6 +546,41 @@ class ServerRuntime:
             # timeouts; previously only the total-deadline branch set this).
             self.save_flush_ok = False
             logger.critical("save-flush did not complete before the teardown ended")
+
+    async def _drain_client_sessions(self) -> None:
+        """F-225: bounded close of every registered client connection."""
+        await self.sessions.drain(timeout=self.shutdown_step_timeout)
+
+    async def _drain_bg_tasks(self) -> None:
+        """F-198: cancel outstanding background notification tasks.
+
+        Excludes the CURRENT task: the teardown itself usually arrived here
+        through ``_spawn(runtime.shutdown(...))`` (signal handler, console
+        command, watcher hook), and cancelling our own task mid-plan is
+        exactly the "teardown cut short" failure F-58 closed."""
+        current = asyncio.current_task()
+        pending = [t for t in self._bg_tasks if t is not current and not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def revoke_child_bus_identity(self, process_type: str) -> None:
+        """F-190: revoke a dead child's bus identity immediately.
+
+        The supervisor observes the process exit; the bus drops the identity
+        from its authenticated table so whoever claims that service number
+        next (a restarting child must, an impostor must not get to) starts
+        from an unauthenticated state. Belt and braces over the auth-liveness
+        TTL; harmless when the identity was already gone."""
+        bus = self.bus_zmq
+        if bus is None:
+            return
+        try:
+            index = self.ctx.process_index_of(process_type)
+        except ValueError:
+            return
+        bus.revoke_identity(index * SERVICE_NO_STRIDE + self.ctx.entry.server_no)
 
 
 def build_context(
@@ -603,6 +731,11 @@ def main(argv: list[str] | None = None) -> None:
                     exitcode,
                 )
                 return
+            # F-190: the dead child's bus identity is revoked before anything
+            # else -- the shutdown it triggers takes time, and in that window
+            # a local process could otherwise inherit the identity's
+            # authenticated status.
+            main_runtime.revoke_child_bus_identity(process_type)
             await main_runtime.shutdown(f"sub-process {process_type} died ({exitcode})")
 
         async def on_unhandled_death(process_type: str, exitcode: int | None) -> None:
@@ -618,6 +751,7 @@ def main(argv: list[str] | None = None) -> None:
                     exitcode,
                 )
                 return
+            target.revoke_child_bus_identity(process_type)  # F-190
             await target.shutdown(f"sub-process {process_type} died unhandled ({exitcode})")
 
         async def main_proc() -> None:

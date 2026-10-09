@@ -154,9 +154,22 @@ class TestDecodeTotalBudgetF146:
     def test_map_slots_counted_too(self) -> None:
         from pyline.net.protocol import decode_payload
 
-        payload = msgpack.packb([{i: i for i in range(200_000)} for _ in range(12)])
+        # str keys: the network face rejects non-str map keys outright
+        # (F-214), which would fail the decode for the wrong reason here.
+        payload = msgpack.packb([{str(i): i for i in range(200_000)} for _ in range(12)])
         with pytest.raises(ValueError, match="total element budget"):
             decode_payload(payload)
+
+    def test_non_str_map_key_rejected_f214(self) -> None:
+        """F-214: msgpack's own hash-collision recommendation -- map keys on
+        the network face must be strings; an int-keyed map is refused before
+        any budget accounting."""
+        import pytest as _pytest
+
+        from pyline.net.protocol import decode_payload
+
+        with _pytest.raises(ValueError, match="strict_map_key"):
+            decode_payload(msgpack.packb({1: "x"}))
 
     def test_legitimate_single_large_container_passes(self) -> None:
         from pyline.net.protocol import decode_payload

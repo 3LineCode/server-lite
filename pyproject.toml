@@ -4,10 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyline"
-version = "1.0.0rc2"
+version = "1.0.0rc3"
 description = "Production-grade asyncio game server framework (rebuilt from ServerLite prototype)"
 readme = "README.md"
-requires-python = ">=3.12"
+# F-222: 3.12.1 minimum -- 3.12.0's StreamWriter.wait_closed() returns early
+# before the transport flushes, so Connection.close() abort() could RST
+# frames the peer had not yet read.
+requires-python = ">=3.12.1"
 license = { text = "Proprietary" }
 authors = [{ name = "pyline" }]
 dependencies = [
@@ -47,6 +50,7 @@ markers = [
     "integration: tests that need real processes or network",
     "mysql: tests that need a live MySQL server",
     "redis: tests that need a live Redis server",
+    "soak: long-running stability smoke (nightly only, F-228)",
 ]
 
 [tool.coverage.run]

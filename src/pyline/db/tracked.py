@@ -14,8 +14,31 @@ callback as its parent, so nested mutations dirty the same saver.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, SupportsIndex, cast
+
+logger = logging.getLogger(__name__)
+
+# F-216: warn once per subclass type -- bind_tracking rebuilds dict/list
+# SUBCLASSES as plain TrackedDict/TrackedList (a defaultdict loses its
+# default_factory, an OrderedDict its ordering guarantees); the warning must
+# not fire per instance or the load path would spam.
+_SUBCLASS_WARNED: set[type] = set()
+
+
+def _warn_subclass(value: dict[Any, Any] | list[Any]) -> None:
+    vt = type(value)
+    if vt in _SUBCLASS_WARNED:
+        return
+    _SUBCLASS_WARNED.add(vt)
+    logger.warning(
+        "tracked container field holds %s; it will be rebuilt as a plain tracked "
+        "%s (subclass-specific behaviour is lost) -- container fields should be "
+        "plain dict/list",
+        vt.__qualname__,
+        "dict" if isinstance(value, dict) else "list",
+    )
 
 
 def bind_tracking(value: Any, touch: Callable[[], None] | None) -> Any:
@@ -32,9 +55,13 @@ def bind_tracking(value: Any, touch: Callable[[], None] | None) -> Any:
     if isinstance(value, TrackedList):
         return value
     if isinstance(value, dict):
+        if type(value) is not dict:
+            _warn_subclass(value)  # F-216
         wrapped = {k: bind_tracking(v, touch) for k, v in value.items()}
         return TrackedDict(wrapped, touch=touch)
     if isinstance(value, list):
+        if type(value) is not list:
+            _warn_subclass(value)  # F-216
         wrapped_items = [bind_tracking(v, touch) for v in value]
         return TrackedList(wrapped_items, touch=touch)
     return value

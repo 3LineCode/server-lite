@@ -59,6 +59,11 @@ class Metrics:
             buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
         )
         self.connections = Gauge(f"{namespace}_connections", "Active connections")
+        # F-225: registered client sessions (post-handshake, not yet closed)
+        # -- the connection<->player bookkeeping base business layers build on.
+        self.client_sessions = Gauge(
+            f"{namespace}_client_sessions", "Registered client connections (session registry)"
+        )
         self.rpc_latency = Histogram(
             f"{namespace}_rpc_seconds",
             "RPC round-trip latency",
@@ -99,6 +104,12 @@ class Metrics:
         self.save_queue = Gauge(f"{namespace}_save_queue", "Pending auto-save entries")
         self.save_flushed = Counter(f"{namespace}_save_flushed_total", "Flushed save entries")
         self.save_failures = Counter(f"{namespace}_save_failures_total", "Failed save flushes")
+        # F-212: rows skipped because the saver was deleted while waiting for
+        # its flush lock -- nothing was written, so counting them as flushed
+        # overstated durability.
+        self.save_skipped = Counter(
+            f"{namespace}_save_skipped_total", "Save entries skipped (deleted before flush)"
+        )
         self.reload_total = Counter(f"{namespace}_reload_total", "Hot reloads", ("result",))
         # --- kernel / lifecycle / db instrumentation ----------------------- #
         # These close the observability gap where a multi-process game server

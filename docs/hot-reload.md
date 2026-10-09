@@ -6,6 +6,13 @@ automatically. Validation is **static (AST)** -- the new source is never
 executed for checking purposes, so import-time side effects run exactly once
 (the old prototype sandbox executed them twice).
 
+**The swap itself blocks the event loop** (F-204): the module top level is
+re-executed synchronously, so a module whose import builds large tables or
+runs a heavy decorator matrix stalls EVERY connection for the duration of
+that re-exec (the watcher's 300 ms debounce coalesces file events, not the
+execution). Keep top-level work proportional to what a frame-dispatch stall
+can cost, or move it into `__reload__` hooks that yield.
+
 ## Guarantees
 
 | Property | Mechanism |

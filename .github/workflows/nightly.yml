@@ -1,0 +1,40 @@
+name: nightly
+
+# F-228: the nightly cadence the migration plan defers no longer. The full
+# unit+integration matrix runs again (catching date/time- and timing-
+# sensitive failures the per-push runs can miss), plus the soak smoke
+# (tests/test_soak.py: boot, sustained churn, loop-latency + heap-growth
+# budgets, clean teardown). The 72h soak + production-workload heap diff
+# remains an rc->GA gate.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"  # 03:00 UTC nightly
+  workflow_dispatch: {}
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra dev
+      - name: Soak smoke (loop latency, heap growth, clean teardown)
+        run: uv run pytest -m soak -v
+
+  full-matrix:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --extra dev --python ${{ matrix.python-version }}
+      - name: Full unit suite (soak included once, here per OS)
+        run: uv run pytest -m "not mysql and not redis"

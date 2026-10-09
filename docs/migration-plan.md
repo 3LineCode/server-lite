@@ -526,14 +526,14 @@ api.rpc.call(20001, "game.shop.buy", uid=1)
 | `api.timer` | `TimerFacade`：`call(flag, delay, func, *a)/ms_call/soon_call/left(flag)/delete(flag)`——语义逐条对齐旧仓（同 flag 重设覆盖、0.001s 下限、协程/普通双支持） | NewTimer |
 | `api.rpc` | `call(srv, path, *a, timeout)/notify(srv, path, *a)/current_caller()` | RpcCall/RCB/RpcFunc/RpcFromServer |
 | `api.db` | `execute(sql, *args)/query(sql, *args)`（本地/远程自动路由）+ 常量 `MYSQL_INT/STR/TEXT/DATA` | MysqlExecute/MysqlQuery |
-| `api.redis` | `get/set/delete/delete_many` | RedisSet/Get/Del/MultiDel |
+| `api.db`（redis 面） | `redis_set(key, v)/redis_get(key, default)/redis_delete(*keys)`（并入 `api.db`，string-only） | RedisSet/Get/Del/MultiDel |
 | `api.orm` | `DataSaver/TrackableModel/TrackedDict/TrackedList` + saver 便捷方法别名（`flush_now(force)/mark_dirty()/delete()/is_loaded()/is_deleted()/add_load_hook(fn)`） | ColumnSave/RowSave API 族 |
 | `api.clock` | `now()/now_int()/day_no()/week_no()/month_no()/set_debug_time(t)/push_debug_time(s)/format(...)` | com_time 的框架侧子集 |
 | `api.debug` | `trace(msg)/format_exception(exc)` | TraceMsg/RaiseError 的格式化能力（无全局劫持） |
-| `api.coverage` | `start()/stop()/save()`（4.5） | StartCoverage/StopCoverage |
+| ~~`api.coverage`~~ | **未迁移**（决策：用官方 `coverage run -m pytest` 与 CI 门禁替代自研运行时 coverage 开关，见 §5 延期清单） | StartCoverage/StopCoverage |
 | `api.log` | `file(name)/file_debug(name)`（写 `{log_dir}/{进程类型}/...`） | LogFile/LogDebug |
 
-`.pyi` 自动生成（问题#16 根治）：`scripts/gen_stubs.py` 用 `griffe`（mkdocstrings 的官方解析器）从真实 API 生成存根并入 CI 校验"存根与实现同步"。
+`.pyi` 自动生成（问题#16 根治）：**未实施，已显式移出范围**（F-226 记账）——全量 `mypy --strict`（src+tests）已提供比存根更强的漂移检测，运行时无存根消费者；当初的收益假设（手写存根失准）在 F-88 懒加载门面落地后不再成立。若未来对外发布类型包再评估 griffe 生成，见 §5 延期清单。
 
 ### 4.2 类型化协议注册（替代旧 SocketNet）
 
@@ -592,8 +592,13 @@ structlog 多行 banner（项目名/服务名+号/绑定地址/Python 版本/模
   （redis 98% 已达，reload 83%、runtime 69% 未达；分区下限需再一轮
   专项补测，暂以总量门禁 + CHANGELOG 已知缺口章节追踪）。
 - ❌ **延期（未排期）**：语义差分 oracle 套件（旧仓只读差分）、72h
-  soak + tracemalloc 堆对比 + nightly 性能基线、mkdocs 文档站。三者
-  均为发布前（rc→GA）门槛而非 rc 门槛，落地前不对外宣称 GA。
+  soak + tracemalloc 堆对比（nightly 已落地 soak 冒烟档，F-228）、
+  nightly 性能基线、mkdocs 文档站。均为发布前（rc→GA）门槛而非 rc
+  门槛，落地前不对外宣称 GA。
+- ❌ **显式移出范围（F-226 记账）**：`.pyi` 存根自动生成
+  （`scripts/gen_stubs.py`/griffe）与 `api.coverage` 运行时门面——
+  mypy --strict 全量门禁与 CI 覆盖率门禁分别覆盖了它们的原始动机，
+  保留本条目防止规划文档与实现继续漂移。
 
 ---
 

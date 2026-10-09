@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 LAYER_FRAMEWORK = 0
 LAYER_PUBLIC = 1
 LAYER_BUSINESS = 2
+
+# F-202: bound on the MRO->subscription-keys cache (see _subscription_keys).
+_MRO_CACHE_MAX = 4096
 _VALID_LAYERS = (LAYER_FRAMEWORK, LAYER_PUBLIC, LAYER_BUSINESS)
 
 EventHandler = Callable[[Any], Any]
@@ -121,6 +124,23 @@ class OnReloadEvent:
 @dataclass(slots=True)
 class ClientConnectedEvent:
     peer: tuple[str, int]
+    # F-225: registry-assigned connection id (monotonic, never reused). The
+    # default keeps handlers written against the pre-F-225 shape working.
+    conn_id: int = 0
+
+
+@dataclass(slots=True)
+class ClientDisconnectedEvent:
+    """F-225: a client connection's close hook fired (any reason).
+
+    The counterpart of ClientConnectedEvent: without it a
+    connection<->player map could only grow, and logout/kick cleanup had no
+    framework hook to ride. ``reason`` is the Connection's close reason
+    (idle timeout, send queue overflow, closed by peer, ...)."""
+
+    peer: tuple[str, int]
+    conn_id: int
+    reason: str = ""
 
 
 @dataclass(slots=True)
@@ -193,6 +213,12 @@ class EventBus:
             if (klass, layer) in self._handlers
         ]
         result = tuple(keys)
+        # F-202: every DISTINCT event type adds one permanent entry. A busy
+        # bus with short-lived dynamically created event classes (reload
+        # re-execution included) used to grow this map without bound; a
+        # simple size cap trades a rare recompute for bounded memory.
+        if len(self._mro_cache) >= _MRO_CACHE_MAX:
+            self._mro_cache.clear()
         self._mro_cache[mro] = result
         return result
 

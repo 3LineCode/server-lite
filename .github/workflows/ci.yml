@@ -47,8 +47,17 @@ jobs:
       - run: uv sync --extra dev --python ${{ matrix.python-version }}
       - name: Run unit tests with coverage
         run: |
-          uv run coverage run -m pytest -m "not mysql and not redis"
+          uv run coverage run -m pytest -m "not mysql and not redis and not soak"
           uv run coverage report --fail-under=85
+      # F-227: per-partition floors -- the total gate used to mask a weak
+      # partition behind strong ones. Floors sit at the CURRENT measured
+      # values (ratchet upward, never grandfather a regression below them).
+      - name: Per-partition coverage floors
+        run: |
+          uv run coverage report --include="src/pyline/reload/*" --fail-under=83
+          uv run coverage report --include="src/pyline/net/*" --fail-under=83
+          uv run coverage report --include="src/pyline/db/*" --fail-under=88
+          uv run coverage report --include="src/pyline/core/*" --fail-under=85
       - name: Hot-reload regression suite
         run: uv run pytest tests/test_reload.py -v
 

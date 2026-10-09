@@ -225,7 +225,19 @@ class ProcessSupervisor:
             while child.is_alive() and asyncio.get_running_loop().time() < join_deadline:
                 await asyncio.sleep(0.05)
             if child.is_alive():
+                # F-200: a child that survived SIGKILL (3 s later) used to
+                # pass silently -- surface it as CRITICAL + an exit metric so
+                # an operator sees the zombie instead of trusting "children
+                # terminated". Nothing more can be done from here.
                 child.join(timeout=0)  # non-blocking reap after kill
+                logger.critical(
+                    "child pid=%d did not exit within 3s of SIGKILL; possible zombie",
+                    child.pid,
+                )
+                self._metrics.child_exits.labels(
+                    process_type=child.name if isinstance(child.name, str) else "?",
+                    reason="kill_timeout",
+                ).inc()
         self._children.clear()
         self._metrics.children_alive.set(0)
 

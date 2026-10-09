@@ -54,7 +54,9 @@ def _write_config(
         "zeromq": {"bind_host": "tcp://127.0.0.1:29417"},
         "socket": {
             "token": "$plain:unit-test-token",
-            "inter_token": "$plain:unit-test-inter",
+            # F-226: production refuses an inline $plain: inter_token; the
+            # $file: key is written next to the config dir below.
+            "inter_token": "$file:inter_token",
             "client_port": 11520,
             "server_port": 12520,
             "max_connections": 32,
@@ -64,6 +66,9 @@ def _write_config(
         "clock": {"tz": clock_tz},
     }
     (config_dir / "project.json5").write_text(json.dumps(project), encoding="utf-8")
+    (config_dir.parent / "secrets.json").write_text(
+        json.dumps({"inter_token": "unit-test-inter"}), encoding="utf-8"
+    )
     servers = {
         "normal": {"sub_process": [], "use_mysql": True, "use_redis": True},
         "10001": {
@@ -682,7 +687,9 @@ class TestMainProcSpawnWindowF135:
             "metrics_port": None,
             "socket": {
                 "token": "$plain:t",
-                "inter_token": "$plain:unit-test-inter",
+                # F-226: production refuses an inline $plain: inter_token;
+                # these tests exercise spawn windows, not secrets policy.
+                "inter_token": "$file:inter_token",
                 "client_port": 11530,
                 "server_port": 12530,
                 "max_connections": 32,
@@ -701,6 +708,10 @@ class TestMainProcSpawnWindowF135:
             },
         }
         (config_dir / "servers.json5").write_text(json.dumps(servers), encoding="utf-8")
+        # $file: references read secrets.json NEXT TO the config dir.
+        (config_dir.parent / "secrets.json").write_text(
+            json.dumps({"inter_token": "unit-test-inter"}), encoding="utf-8"
+        )
 
     def test_bad_tables_fail_before_spawn(self, config_dir, monkeypatch) -> None:
         """Warm validation: a broken tables.json5 surfaces BEFORE children

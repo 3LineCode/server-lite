@@ -6,9 +6,20 @@ from pathlib import Path
 
 import pytest
 
+from pyline.net.connection import reset_fd_budget_ledger
 from pyline.net.loop_policy import install_loop_policy
 
 install_loop_policy()  # zmq needs a selector loop on Windows
+
+
+@pytest.fixture(autouse=True)
+def _fresh_fd_budget():
+    """F-219: the Windows fd budget ledger is PER PROCESS; tests share one
+    process, so each test starts with an empty ledger instead of inheriting
+    caps committed by whichever server bound earlier."""
+    reset_fd_budget_ledger()
+    yield
+    reset_fd_budget_ledger()
 
 
 @pytest.fixture()

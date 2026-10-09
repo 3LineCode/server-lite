@@ -70,6 +70,21 @@ def _resolve_secrets(data: dict[str, Any], config_dir: Path) -> None:
 
 def load_project_settings(config_dir: Path) -> ProjectSettings:
     raw = load_json5(config_dir / "project.json5")
+    # F-226: check BEFORE secret resolution replaces the reference string
+    # with the resolved value -- production must not carry inter_token as an
+    # inline $plain: literal. It is the server-impersonation key (bus, proxy,
+    # full-SQL RPC face); the deployment doc's "$env:-referenced" wording is
+    # now exactly what the code enforces ($file: counts as managed too).
+    if raw.get("srv_type") == "production":
+        socket_raw = raw.get("socket")
+        inter_raw = socket_raw.get("inter_token") if isinstance(socket_raw, dict) else None
+        if isinstance(inter_raw, str) and inter_raw.startswith("$plain:"):
+            raise ConfigError(
+                "socket.inter_token uses $plain: in srv_type=production; the "
+                "inter-server token authenticates the bus, the proxy mesh and "
+                "the full-SQL RPC face -- reference it via $env: or $file: "
+                "instead of committing it"
+            )
     _resolve_secrets(raw, config_dir)
     try:
         settings = ProjectSettings.model_validate(raw)

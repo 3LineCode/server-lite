@@ -42,19 +42,22 @@ tests/         unit + integration suites
 uv sync --extra dev
 uv run pytest
 uv run ruff check src tests
-uv run mypy src
+uv run mypy src tests
 ```
 
 ## Status
 
 v1.0.0-rc.1: P0-P5 core plus the full migration-finish pass (F-01..F-30 in
 `docs/migration-plan.md` -- data safety, network robustness, kernel,
-hot-reload guards, business facade) and five review passes on top
-(F-31..F-37, F-38..F-45, F-46..F-57, F-58..F-105, F-106..F-122 -- see
-`CHANGELOG.md`; the fourth closed every finding of the full project
-assessment, and the sixth closes every finding of an external repository
-assessment: gitignore secrets gap, unwired F-101 close, reload hook and
-posonly-guard holes, hop-count reset, shutdown-window requeue drop).
+hot-reload guards, business facade) and six review passes on top
+(F-31..F-122 -- see `CHANGELOG.md`). The seventh pass (F-123..F-141) closes
+every finding of the second external assessment: HMAC challenge-response
+handshakes on the TCP and ZMQ planes (the token never crosses a wire),
+pre-auth frame caps and bounded msgpack decoding, byte-bounded bus queues
+with fast-fail RPC, versioned migrations wired into production, isolation/
+recycle/timeout correctness in the MySQL layer, serialized remote-
+transaction statements, spawn-window teardown safety, and kernel/DB
+observability with per-process metrics export (coverage 85%).
 See `docs/plan.md` (master plan), `docs/hot-reload.md` (reload contract and
 known limits) and `docs/deployment.md` (trust model and platform limits
 before going public).

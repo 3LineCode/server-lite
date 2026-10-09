@@ -282,6 +282,9 @@ class Scheduler:
                     self._wheel.pop(entry.bucket, None)
 
     async def _tick_loop(self) -> None:
+        from pyline.obs.metrics import get_metrics
+
+        metrics = get_metrics()
         while not self._closed:
             now_bucket = math.floor(time.monotonic() / _TICK)
             for bucket in [b for b in self._wheel if b <= now_bucket]:
@@ -289,4 +292,8 @@ class Scheduler:
                 for entry in entries:
                     self._entries.pop(entry.seq, None)
                     self._fire(entry.func, entry.args, entry.label)
+            # Sampled here rather than on every schedule/cancel: the tick runs
+            # once a second regardless, and per-op gauge writes would tax the
+            # hot path the scheduler exists to keep cheap.
+            metrics.scheduler_pending.set(self.pending_count())
             await asyncio.sleep(_TICK)

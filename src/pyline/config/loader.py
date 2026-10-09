@@ -72,9 +72,22 @@ def load_project_settings(config_dir: Path) -> ProjectSettings:
     raw = load_json5(config_dir / "project.json5")
     _resolve_secrets(raw, config_dir)
     try:
-        return ProjectSettings.model_validate(raw)
+        settings = ProjectSettings.model_validate(raw)
     except ValidationError as exc:
         raise ConfigError(f"{config_dir / 'project.json5'}: invalid: {exc}") from exc
+    # mysql.migrations_dir is written relative to the PROJECT root (the
+    # config dir's parent); resolve once here so every process interprets it
+    # identically regardless of its working directory.
+    migrations = settings.mysql.migrations_dir
+    if migrations is not None and not Path(migrations).is_absolute():
+        settings = settings.model_copy(
+            update={
+                "mysql": settings.mysql.model_copy(
+                    update={"migrations_dir": str((config_dir.parent / migrations).resolve())}
+                )
+            }
+        )
+    return settings
 
 
 def load_server_registry(config_dir: Path) -> ServerRegistry:

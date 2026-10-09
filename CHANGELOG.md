@@ -1,5 +1,111 @@
 # Changelog
 
+## Unreleased: seventh review pass (F-123..F-141) -- external assessment round 2
+
+Every remaining finding of the second full external assessment, each with a
+regression test; ruff format+check, mypy --strict (src) and mypy on tests
+clean; coverage 85% (gate raised to 78).
+
+### Transport security
+- F-123: the TCP handshake is now an HMAC challenge-response -- the server
+  sends a random 16-byte nonce, the client answers HMAC-SHA256(token,
+  nonce). The token no longer crosses the wire in any form, and a sniffed
+  digest is bound to one connection's nonce (fresh every dial), so replay
+  buys nothing. `open_connection` blocks until the handshake completes
+  (restoring the "send immediately after it returns" contract the extra
+  round-trip would otherwise race); failed handshakes surface as
+  ConnectionClosedError instead of returning a dying connection.
+- F-124: the decoder runs at `socket.preauth_max_frame` (64 KiB default)
+  until verification widens it to the full frame budget -- an unauthenticated
+  connection can no longer park `max_frame` (16 MiB) in the decode buffer
+  while the accept caps only count connections.
+- F-125: every inbound msgpack decode of untrusted payloads goes through
+  `net.protocol.decode_payload`, which caps container elements (2^20) and
+  string/bin/ext sizes -- a 16 MiB frame of tiny values used to inflate into
+  hundreds of MB of Python objects.
+- F-126: the ZeroMQ bus requires an HMAC handshake (`@busauth0/1/2`) before
+  any data flows: the ROUTER drops all frames from identities that did not
+  prove possession of the inter-server token, and AUTH1 proves the ROUTER to
+  the DEALER in return. Without this, F-39's identity==from check only
+  constrained honest peers -- on the default Windows loopback-TCP endpoint
+  any local process could claim any service number. The shared resolution
+  (`inter_token` + once-per-process fallback warning) moved to
+  `net/auth.py` so the TCP proxy plane and the bus derive the same secret
+  without an import cycle.
+- F-127: per-destination bus queues are bounded by BYTES as well as message
+  count (`zeromq.queue_bytes`, 64 MiB default) -- frames on the bus may be
+  up to max_frame_size large, so a count-only bound allowed ~16 GiB per slow
+  peer (the exact hole F-21 closed for TCP). `zctx.term()` drains off the
+  event loop (it could block up to the linger per socket); SNDHWM/RCVHWM
+  replace the deprecated `set_hwm`.
+- F-128: `MessageRouter.route(..., raise_on_drop=True)` (threaded through
+  the bus and the @relay leg) turns a refused enqueue into
+  `BusOverflowError` at the RPC CALL site -- a congested peer used to
+  surface as a 10 s fake timeout because overflow dropped silently.
+  Fire-and-forget traffic keeps the drop-and-count contract.
+
+### Database
+- F-129: the versioned-migration engine is reachable from production:
+  `mysql.migrations_dir` (resolved against the project root at load time)
+  is wired into the runtime's SchemaManager. The parameter previously
+  existed only on the constructor with no config surface and no production
+  call site -- no `.sql` script could ever run.
+- F-130: dedicated MySQL sessions run the CONFIGURED isolation level (the
+  remote-transaction sessions -- the statements the level matters most for
+  -- silently ran at the server default); every connect path (bootstrap,
+  keepalive, sessions, pool) passes a bounded connect_timeout; the pool
+  forwards `mysql.pool_recycle` (asyncmy native) so wait_timeout-killed
+  connections recycle instead of failing on first use while the keepalive
+  reports healthy.
+- F-131: statements on a remote-transaction session are serialized per
+  session (the ambient contextvar is inherited by tasks spawned inside the
+  block; concurrent cursors on one asyncmy connection corrupt the wire
+  protocol), commit/rollback wait for in-flight statements, and a periodic
+  TTL sweep reaps abandoned sessions even on an otherwise idle DB process
+  (the lazy sweep only ran on begin/execute/query). The transaction module
+  docstring now states the rollback scope honestly: atomic for direct SQL,
+  flush-coalescing for saver blobs (never-drop beats restoring stale blobs).
+- F-132: ON DUPLICATE KEY UPDATE emits the row-alias syntax on servers >=
+  8.0.19 (probed once per boot) instead of the deprecated VALUES(col) form
+  on every save; older servers keep the legacy form.
+- F-133: the migration statement splitter is a state machine that honours
+  '...' string literals (doubled quotes, backslash escapes) and /* */
+  block comments -- a semicolon inside a DEFAULT or seeded value used to
+  cut the statement in two.
+- F-134: the pickle->msgpack tool pages its scan by primary key
+  (`--batch-size`, default 1000) instead of materializing whole tables, and
+  writes the codec's current blob version rather than a hardcoded 1.
+
+### Runtime & observability
+- F-135: the main process's pre-boot construction (build_context /
+  ServerRuntime) sits inside the terminate_children guard -- a config error
+  discovered there used to crash the main process with live children and no
+  graceful teardown; tables.json5 and clock.tz are warm-validated BEFORE
+  any child is spawned.
+- F-136: kernel/DB instrumentation closes the log-only gap: child exits
+  (by process type and reason) plus a live-children gauge, boot phase
+  durations, scheduler timer backlog (sampled on the 1 s wheel tick),
+  MySQL pool size/in-use (sampled on the keepalive) and acquire timeouts,
+  schema migration outcomes.
+- F-137: `metrics_all_processes: true` gives every sub-process its own
+  Prometheus exporter on `metrics_port + process_index` (the option
+  docs/deployment.md left open for the sub-process metrics gap).
+
+### Housekeeping
+- F-138: `__version__` comes from installed package metadata (was frozen at
+  0.1.0 while pyproject said 1.0.0rc1); dead `coverage_dir` config removed;
+  `EnvReadyEvent`/`StartupContextEvent` exported from `pyline.core`; the
+  clock log channel honours `log.rotation_mb`; stale `serve()` docstring
+  and dead `_decode_text` removed; ProxyServer/ProxyClient forward the full
+  accept-cap and byte-budget settings instead of relying on coinciding
+  defaults.
+- CI: `mypy src tests` (tests under a documented relaxed override that
+  still catches name/arity/await errors), coverage gate 75 -> 78 (measured
+  85); tests packaged (`tests/__init__.py`) so the override targets a
+  stable module namespace; a Windows monotonic-resolution flake in the
+  outcome-expiry test is fixed (10 ms could measure as 0.0 elapsed past a
+  15.6 ms clock tick).
+
 ## Unreleased: sixth review pass (F-106..F-122) -- external assessment fixes
 
 Every finding of the full external repository assessment, each with a

@@ -38,7 +38,14 @@ class LoopbackRouter:
         # most recent CALL this router delivered
         self.last_call_target: int = own_service_no
 
-    def route(self, flag: str, payload: bytes, target_service_no: int) -> None:
+    def route(
+        self,
+        flag: str,
+        payload: bytes,
+        target_service_no: int,
+        *,
+        raise_on_drop: bool = False,
+    ) -> None:
         import msgpack
 
         self.sent.append((target_service_no, flag, payload))
@@ -167,7 +174,14 @@ class TestHardeningF13F14F18:
         """F-14: a send exception fails the call now, not via a stray timer."""
 
         class BrokenRouter(LoopbackRouter):
-            def route(self, flag: str, payload: bytes, target_service_no: int) -> None:
+            def route(
+                self,
+                flag: str,
+                payload: bytes,
+                target_service_no: int,
+                *,
+                raise_on_drop: bool = False,
+            ) -> None:
                 raise ConnectionError("bus gone")
 
         router = BrokenRouter()
@@ -615,3 +629,36 @@ class TestOriginValidationF40:
             await task
         await asyncio.sleep(0.05)
         assert state["cancelled"] is True
+
+
+class TestBusOverflowFastFailF128:
+    async def test_call_raises_overflow_instead_of_timing_out(self) -> None:
+        """A CALL refused by a full bus queue fails at the send site (the
+        F-14 path) instead of surfacing as a 10 s fake timeout."""
+
+        from pyline.net.ipc import BusOverflowError
+
+        class OverflowRouter(LoopbackRouter):
+            def route(
+                self,
+                flag: str,
+                payload: bytes,
+                target_service_no: int,
+                *,
+                raise_on_drop: bool = False,
+            ) -> None:
+                if raise_on_drop:
+                    raise BusOverflowError("queue full")
+                super().route(flag, payload, target_service_no)
+
+        router = OverflowRouter()
+        rpc = RpcManager(ProtocolGateway(), router, own_service_no=1)
+        router.rpc = rpc
+
+        @rpc.expose
+        def hello() -> str:
+            return "hi"
+
+        with pytest.raises(BusOverflowError):
+            await rpc.call(1, hello)
+        assert rpc.pending_count() == 0

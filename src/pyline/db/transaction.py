@@ -14,9 +14,24 @@ context-local binding. Anything that leaves the block with an exception rolls
 the whole unit back; a logical save spanning two savers can no longer persist
 half (the pool itself is autocommit-per-statement otherwise).
 
+Scope of the rollback guarantee -- SQL vs ORM blobs:
+
+* Direct SQL inside the block is rolled back atomically, always.
+* Saver *blobs* are write-once rows: a rollback discards the unit's upserts
+  but memory keeps the new data, and the never-drop discipline then
+  re-persists that in-memory state through the auto-save queue OUTSIDE the
+  dead unit (see TransactionJournal). "Memory is authoritative" is the
+  deliberate trade (never-drop beats restoring stale blobs): treat the block
+  as atomic for the database writes you issue directly, and as
+  flush-coalescing for savers -- after a rollback their eventual on-disk
+  value is the post-mutation memory state, not the pre-transaction one.
+
 Two implementations share this contract: the local pool (dedicated pooled
 connection) and the DB process reached over RPC (session-scoped dedicated
-connection, reaped by TTL when a caller dies mid-transaction).
+connection, reaped by TTL when a caller dies mid-transaction). Statements on
+the remote session are serialized per session: the ambient binding is
+inherited by tasks spawned inside the block, and concurrent statements on one
+connection would corrupt the wire protocol.
 """
 
 from __future__ import annotations

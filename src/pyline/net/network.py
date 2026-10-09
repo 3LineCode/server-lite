@@ -24,6 +24,7 @@ from typing import Any, ClassVar, cast
 import msgpack
 
 from pyline.net.gateway import ProtocolGateway
+from pyline.net.protocol import decode_payload
 from pyline.obs.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ def pack_call(sub: int, *args: Any) -> bytes:
 
 def unpack_call(payload: bytes) -> tuple[int, list[Any]]:
     """Split an inbound payload into ``(sub, args)``."""
-    data = msgpack.unpackb(payload, raw=False, strict_map_key=False)
+    data = decode_payload(payload)
     if not isinstance(data, list) or not data or not isinstance(data[0], int):
         raise ValueError("malformed network payload: expected [sub, *args]")
     return data[0], list(data[1:])

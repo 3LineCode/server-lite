@@ -29,7 +29,9 @@ import msgpack
 
 import pyline.net.connection as conn_mod
 from pyline.core.context import Context
+from pyline.net.auth import inter_token as _inter_token_impl
 from pyline.net.ipc import main_service_no, service_no_bytes
+from pyline.net.protocol import decode_payload
 from pyline.net.router import MessageRouter, NoProxyAvailableError
 from pyline.obs.metrics import get_metrics
 
@@ -60,7 +62,7 @@ def parse_forward(data: bytes) -> tuple[int, int, str, bytes, int]:
     loop; malformed envelopes now raise ValueError, which every caller
     already treats as a drop-and-count condition.
     """
-    fields = msgpack.unpackb(data, raw=False, strict_map_key=False)
+    fields = decode_payload(data)
     if not isinstance(fields, list) or len(fields) not in (4, 5):
         raise ValueError(f"@fwd envelope must be a 4/5-field list, got {type(fields).__name__}")
     if len(fields) == 4:
@@ -80,30 +82,13 @@ def parse_forward(data: bytes) -> tuple[int, int, str, bytes, int]:
 
 
 def inter_token(ctx: Context) -> str:
-    """Server-to-server token; falls back to the client token (F-16).
+    """Server-to-server token; see :func:`pyline.net.auth.inter_token`.
 
-    The fallback keeps single-token deployments working but widens the blast
-    radius of a client-token leak to the inter-server plane -- warn so ops
-    can see it in the log instead of discovering it during an incident.
-
-    F-73: the warning is emitted once per process. ``inter_token`` is called
-    on every reconnect (and every server-side accept), so a flapping proxy
-    link used to re-log the same configuration fact on every attempt --
-    once is informative, every second is log spam that buries real events."""
-    s = ctx.settings.socket
-    if s.inter_token is None:
-        global _inter_token_warned
-        if not _inter_token_warned:
-            _inter_token_warned = True
-            logger.warning(
-                "socket.inter_token not set; server-to-server links reuse the CLIENT "
-                "token -- configure a separate $env: reference for production"
-            )
-        return s.token.get_secret_value()
-    return s.inter_token.get_secret_value()
-
-
-_inter_token_warned = False
+    Kept as a re-export: callers (tests included) import it from this module
+    historically. The implementation and its once-per-process fallback
+    warning live in :mod:`pyline.net.auth`, shared with the ZMQ bus so both
+    server-to-server planes derive the same secret."""
+    return _inter_token_impl(ctx)
 
 
 class _CloseSpawner:
@@ -147,14 +132,19 @@ class ProxyServer(_CloseSpawner):
 
     async def start(self) -> None:
         entry = self._ctx.entry
+        s = self._ctx.settings.socket
         self._server = await conn_mod.serve(
             entry.bind_host(),
             entry.process_port(process_index=0),
             token=self._inter_token(),
-            handshake_timeout=self._ctx.settings.socket.handshake_timeout,
-            idle_timeout=self._ctx.settings.socket.idle_timeout,
-            send_queue_limit=self._ctx.settings.socket.send_queue_limit,
-            max_frame=self._ctx.settings.socket.max_frame_size,
+            handshake_timeout=s.handshake_timeout,
+            idle_timeout=s.idle_timeout,
+            send_queue_limit=s.send_queue_limit,
+            send_queue_bytes=s.send_queue_bytes,
+            max_frame=s.max_frame_size,
+            preauth_max_frame=s.preauth_max_frame,
+            max_connections=s.max_connections,
+            max_connections_per_ip=s.max_connections_per_ip,
             on_message=lambda flag, payload: None,
             on_connected=self._on_connected,
         )
@@ -328,16 +318,19 @@ class ProxyClient(_CloseSpawner):
 
     async def _maintain(self, proxy_no: int, host: str, port: int) -> None:
         backoff = 1.0
+        s = self._ctx.settings.socket
         while True:
             try:
                 connection = await conn_mod.open_connection(
                     host,
                     port,
                     token=inter_token(self._ctx),
-                    handshake_timeout=self._ctx.settings.socket.handshake_timeout,
-                    idle_timeout=self._ctx.settings.socket.idle_timeout,
-                    send_queue_limit=self._ctx.settings.socket.send_queue_limit,
-                    max_frame=self._ctx.settings.socket.max_frame_size,
+                    handshake_timeout=s.handshake_timeout,
+                    idle_timeout=s.idle_timeout,
+                    send_queue_limit=s.send_queue_limit,
+                    send_queue_bytes=s.send_queue_bytes,
+                    max_frame=s.max_frame_size,
+                    preauth_max_frame=s.preauth_max_frame,
                     on_message=self._on_frame,
                 )
                 backoff = 1.0  # connected: reset the reconnect ladder

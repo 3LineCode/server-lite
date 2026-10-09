@@ -25,6 +25,7 @@ from typing import Any, Protocol
 import msgpack
 
 from pyline.net.network import Network
+from pyline.net.protocol import decode_payload
 from pyline.obs.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
@@ -73,7 +74,14 @@ class RpcUnknownFunctionError(RpcRemoteError):
 
 
 class SenderProtocol(Protocol):
-    def route(self, flag: str, payload: bytes, target_service_no: int) -> None: ...
+    def route(
+        self,
+        flag: str,
+        payload: bytes,
+        target_service_no: int,
+        *,
+        raise_on_drop: bool = False,
+    ) -> None: ...
 
 
 @dataclass(slots=True)
@@ -199,7 +207,10 @@ class RpcManager(Network):
             started=time.monotonic(),
         )
         try:
-            self._sender.route(RPC_FLAG, call_body, target_service_no)
+            # raise_on_drop: a CALL refused by a full bus queue must fail HERE
+            # (the F-14 send-failure path pops the pending entry) instead of
+            # surfacing as a fake timeout when the deadline fires.
+            self._sender.route(RPC_FLAG, call_body, target_service_no, raise_on_drop=True)
         except Exception:
             # F-14: a failed send must not strand the pending entry (and its
             # timer) until timeout -- the call failed right here.
@@ -252,7 +263,7 @@ class RpcManager(Network):
 
     def handle_message(self, flag: str, payload: bytes, from_service: int = 0) -> None:
         try:
-            message = msgpack.unpackb(payload, raw=False, strict_map_key=False)
+            message = decode_payload(payload)
         except (ValueError, msgpack.exceptions.ExtraData, RecursionError):
             # F-78: RecursionError covers adversarially deep msgpack nesting
             # (msgpack builds containers recursively while unpacking); only

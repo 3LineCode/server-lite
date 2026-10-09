@@ -427,3 +427,68 @@ class TestDoubleFailureDiscardsConnectionF68:
         assert conn.ensure_closed_calls == 1
         assert inner.events == ["RELEASE"]
         await pool.close()
+
+
+class TestSessionIsolationF130:
+    """The dedicated transaction session runs the CONFIGURED isolation level
+    (it used to silently run the server default), and every connect path
+    passes a bounded connect_timeout."""
+
+    async def test_open_session_sets_isolation_and_connect_timeout(self, monkeypatch: Any) -> None:
+        captured: dict[str, Any] = {}
+        executed: list[str] = []
+
+        class Cursor(FakeCursor):
+            async def execute(self, sql: str, args: tuple = ()) -> None:
+                executed.append(sql)
+
+        class Conn(FakeConn):
+            def cursor(self) -> FakeCursor:
+                return Cursor()
+
+        async def fake_connect(**kwargs: Any) -> FakeConn:
+            captured.update(kwargs)
+            return Conn()
+
+        monkeypatch.setattr(mysql_mod.asyncmy, "connect", fake_connect)
+        from pydantic import SecretStr as _SecretStr
+
+        settings = MySQLSettings(user="u", password=_SecretStr("x"), db_name="db")
+        assert settings.isolation_level == "READ COMMITTED"
+        session = mysql_mod.MySQLSession(settings)
+        await session.open()
+        assert captured.get("connect_timeout") == 5, "session connect must be bounded"
+        assert any("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED" in s for s in executed)
+
+    async def test_pool_passes_recycle_and_bootstrap_timeout(self, monkeypatch: Any) -> None:
+        connects: list[dict[str, Any]] = []
+        pool_kwargs: dict[str, Any] = {}
+
+        class Conn(FakeConn):
+            pass
+
+        async def fake_connect(**kwargs: Any) -> FakeConn:
+            connects.append(kwargs)
+            return Conn()
+
+        async def fake_create_pool(**kwargs: Any) -> FakeAsyncmyPool:
+            pool_kwargs.update(kwargs)
+            return FakeAsyncmyPool()
+
+        monkeypatch.setattr(mysql_mod.asyncmy, "connect", fake_connect)
+        monkeypatch.setattr(mysql_mod.asyncmy, "create_pool", fake_create_pool)
+        from pydantic import SecretStr as _SecretStr
+
+        settings = MySQLSettings(
+            user="u", password=_SecretStr("x"), db_name="db", pool_recycle=1800
+        )
+        pool = MySQLPool(settings)
+        await pool.connect()
+        try:
+            assert pool_kwargs.get("pool_recycle") == 1800
+            assert pool_kwargs.get("connect_timeout") == 5
+            assert connects and all(c.get("connect_timeout") == 5 for c in connects), (
+                "ensure_database/keepalive connects must be bounded too"
+            )
+        finally:
+            await pool.close()

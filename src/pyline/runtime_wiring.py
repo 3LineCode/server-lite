@@ -82,6 +82,7 @@ class ClockEventEmitter:
         log_dir: Path,
         spawn: SpawnFn,
         alarms: AlarmHub | None = None,
+        log_rotation_mb: int = 64,
     ) -> None:
         self._clock = clock
         self._scheduler = scheduler
@@ -89,12 +90,18 @@ class ClockEventEmitter:
         self._spawn = spawn
         self._log_dir = log_dir
         self._alarms = alarms
+        self._log_rotation_mb = log_rotation_mb
         self._last_boundary = 0.0
         self._channel = logging.getLogger("pyline.channel.clock")
 
     def start(self) -> None:
         self._last_boundary = self._clock.now()
-        self._channel = pyline_log.file_logger("clock", self._log_dir)
+        # Honour the configured log.rotation_mb: the clock channel used to
+        # silently pin the 64 MB default while every other channel followed
+        # the setting.
+        self._channel = pyline_log.file_logger(
+            "clock", self._log_dir, rotation_mb=self._log_rotation_mb
+        )
         self._schedule_next()
 
     def _schedule_next(self) -> None:
@@ -218,7 +225,19 @@ class DbLayer:
                 ),
             )
             await self.mysql.connect()
-            schema = SchemaManager(self.mysql, self._ctx.tables, s.mysql.db_name)
+            # The versioned-migration engine is reachable from production:
+            # ``migrations_dir`` used to be a constructor-only parameter with
+            # no config surface and no production call site, so no .sql script
+            # could ever run and only table creation / drift detection worked.
+            migrations_dir = Path(s.mysql.migrations_dir) if s.mysql.migrations_dir else None
+            if migrations_dir is None:
+                logger.info(
+                    "mysql.migrations_dir not set; versioned migrations disabled "
+                    "(table creation and drift detection still run)"
+                )
+            schema = SchemaManager(
+                self.mysql, self._ctx.tables, s.mysql.db_name, migrations_dir=migrations_dir
+            )
             await schema.ensure_all()
             self._ctx.services["schema"] = schema
         if self._ctx.entry.use_redis:
@@ -228,6 +247,10 @@ class DbLayer:
         redis: RedisLike = self.redis if self.redis is not None else NullRedis()
         self.db_service = DatabaseService(pool, redis)
         self.db_service.expose(rpc)
+        # The periodic TTL sweep frees abandoned remote-transaction sessions
+        # even when the DB process is otherwise idle (lazy-only reaping used
+        # to pin them -- and their locks -- until shutdown).
+        self.db_service.start()
 
     def saver_factory(
         self, access: DatabaseAccess, scheduler: SaveScheduler
@@ -337,18 +360,30 @@ class DevtoolsLayer:
         return [Path.cwd()]
 
     def _start_metrics_server(self) -> None:
-        """Export Prometheus metrics on the main process (F-28, F-54).
+        """Export Prometheus metrics (F-28, F-54).
 
-        Binds loopback by default; an optional bearer token makes the endpoint
-        safe to expose on a trusted network (``metrics_token``).
+        The main process binds ``metrics_port``. Sub-processes bind
+        ``metrics_port + process_index`` when ``metrics_all_processes`` is set
+        -- without it, sub-process autosave/RPC/loop metrics exist in-process
+        but have no exporter, i.e. they are invisible to Prometheus (the
+        documented "metrics gap" decision in docs/deployment.md; the per-
+        process ports are its recommended resolution). Binds loopback by
+        default; an optional bearer token (``metrics_token``) guards scrapes.
         """
-        port = self._ctx.settings.metrics_port
-        if port is None or not self._ctx.is_main_process:
+        settings = self._ctx.settings
+        port = settings.metrics_port
+        if port is None:
             return
-        token = self._ctx.settings.metrics_token
+        if self._ctx.is_main_process:
+            bind_port = port
+        elif settings.metrics_all_processes:
+            bind_port = port + self._ctx.process_index
+        else:
+            return
+        token = settings.metrics_token
         self.metrics_server = start_metrics_endpoint(
-            self._ctx.settings.metrics_bind,
-            port,
+            settings.metrics_bind,
+            bind_port,
             token.get_secret_value() if token is not None else None,
         )
 

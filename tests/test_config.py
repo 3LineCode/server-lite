@@ -273,3 +273,46 @@ class TestSecretMaskingF53:
         )
         with pytest.raises(ConfigError, match="reference"):
             load_project_settings(config_dir)
+
+
+class TestNewHardeningFieldsF123F129:
+    """The seventh-pass config surfaces: migrations_dir resolution and the
+    new socket/zeromq/mysql bounds exist with safe defaults."""
+
+    def test_defaults(self) -> None:
+        from pydantic import SecretStr
+
+        from pyline.config.models import (
+            MySQLSettings,
+            SocketSettings,
+            ZeroMQSettings,
+        )
+
+        assert (
+            SocketSettings(token=SecretStr("t"), client_port=1, server_port=2).preauth_max_frame
+            == 64 * 1024
+        )
+        zmq = ZeroMQSettings()
+        assert zmq.queue_bytes == 64 * 1024 * 1024
+        assert zmq.auth_timeout == 30.0
+        assert MySQLSettings(user="u", password=SecretStr("p"), db_name="d").pool_recycle == 3600
+        assert MySQLSettings(user="u", password=SecretStr("p"), db_name="d").migrations_dir is None
+
+    def test_migrations_dir_resolved_against_project_root(self, config_dir, tmp_path) -> None:
+        from pyline.config.loader import load_project_settings
+
+        settings = load_project_settings(config_dir)
+        assert settings.mysql.migrations_dir is None  # template does not set it
+        raw = (config_dir / "project.json5").read_text(encoding="utf-8")
+        import json5 as _json5
+
+        data = _json5.loads(raw)
+        data.setdefault("mysql", {})["migrations_dir"] = "migrations"
+        (config_dir / "project.json5").write_text(_json5.dumps(data), encoding="utf-8")
+        settings = load_project_settings(config_dir)
+        assert settings.mysql.migrations_dir is not None
+        from pathlib import Path as _Path
+
+        resolved = _Path(settings.mysql.migrations_dir)
+        assert resolved.is_absolute()
+        assert resolved == (config_dir.parent / "migrations").resolve()

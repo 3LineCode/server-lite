@@ -17,7 +17,13 @@ class FakeBus:
         self.sent: list[tuple[int, str, bytes, int | None]] = []
 
     def send(
-        self, target: int, flag: str, payload: bytes, *, from_service: int | None = None
+        self,
+        target: int,
+        flag: str,
+        payload: bytes,
+        *,
+        from_service: int | None = None,
+        raise_on_drop: bool = False,
     ) -> None:
         self.sent.append((target, flag, payload, from_service))
 

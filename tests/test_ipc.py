@@ -9,7 +9,7 @@ import pytest
 from pyline.config.loader import load_project_settings, load_server_registry, load_table_defs
 from pyline.core.context import PROCESS_DB, PROCESS_MAIN, Context
 from pyline.net.gateway import ProtocolGateway
-from pyline.net.ipc import ZmqBus
+from pyline.net.ipc import ZmqBus, service_no_bytes
 from pyline.net.network import Network, pack_call
 
 
@@ -170,13 +170,15 @@ async def test_ipc_send_order_preserved(config_dir, tmp_path) -> None:
 
 @pytest.mark.integration
 async def test_ipc_destination_cap(config_dir, tmp_path) -> None:
-    """F-24: the ROUTER caps tracked destinations -- a third unknown target is
-    dropped and counted, never allocated a queue or writer task."""
+    """F-24: the ROUTER caps tracked destinations -- an unknown target beyond
+    the cap is dropped and counted, never allocated a queue or writer task.
+    (The authenticated DEALER's handshake-reply slot counts against the cap
+    too -- the table is per outbound destination, not per data peer.)"""
     port = free_tcp_port()
     ctx_main = make_ctx(config_dir, tmp_path, main=True, index=0, port=port)
     ctx_sub = make_ctx(config_dir, tmp_path, main=False, index=1, port=port)
     gw_main, gw_sub = ProtocolGateway(), ProtocolGateway()
-    bus_main = ZmqBus(ctx_main, gw_main, max_destinations=2)
+    bus_main = ZmqBus(ctx_main, gw_main, max_destinations=3)
     bus_sub = ZmqBus(ctx_sub, gw_sub)
     await bus_main.start()
     await bus_sub.start()
@@ -191,8 +193,10 @@ async def test_ipc_destination_cap(config_dir, tmp_path) -> None:
                 break
             await asyncio.sleep(0.05)
         assert bus_main.dest_overflow == 1, "overflow message was not counted"
-        assert set(bus_main._peer_queues) == set(unknown[:2]), "third target allocated a queue"
-        assert len(bus_main._peer_tasks) == 2
+        assert set(bus_main._peer_queues) == {ctx_sub.service_no, *unknown[:2]}, (
+            "third target allocated a queue"
+        )
+        assert len(bus_main._peer_tasks) == 3
     finally:
         await bus_sub.close()
         await bus_main.close()
@@ -248,11 +252,19 @@ async def test_ipc_slow_dealer_does_not_block_bus(config_dir, tmp_path) -> None:
 @pytest.mark.integration
 async def test_router_drops_spoofed_from(config_dir, tmp_path) -> None:
     """F-39: a DEALER claiming to be a different service in the ``from`` field
-    is dropped at the ROUTER; a truthful sender still gets through."""
+    is dropped at the ROUTER; a truthful sender still gets through -- but only
+    after the bus handshake proves it holds the token."""
     import zmq
     import zmq.asyncio
 
-    from pyline.net.ipc import service_no_bytes
+    from pyline.net.auth import hmac_digest, inter_token
+    from pyline.net.ipc import (
+        _BUS_CONTROL_TARGET,
+        BUS_AUTH0,
+        BUS_AUTH1,
+        BUS_AUTH2,
+        service_no_bytes,
+    )
 
     port = free_tcp_port()
     ctx_main = make_ctx(config_dir, tmp_path, main=True, index=0, port=port)
@@ -283,7 +295,48 @@ async def test_router_drops_spoofed_from(config_dir, tmp_path) -> None:
         assert bus_main.spoofed_messages == 1
         assert box.get("got") is None
 
-        # the same socket telling the truth is delivered
+        # the same socket telling the truth -- but WITHOUT the handshake -- is
+        # dropped too: an unauthenticated identity must not place data on the
+        # bus merely by being honest about its number.
+        await rogue.send_multipart(
+            [
+                service_no_bytes(ctx_main.service_no),
+                service_no_bytes(424242),
+                b"test",
+                pack_call(1, "honest"),
+            ]
+        )
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(box["event"].wait(), 1.0)
+        assert bus_main.unauthenticated_drops == 1
+        assert box.get("got") is None
+
+        # complete the HMAC handshake as 424242; now the same frame is delivered
+        import secrets
+
+        token = inter_token(ctx_main)
+        client_nonce = secrets.token_bytes(16)
+        await rogue.send_multipart(
+            [
+                service_no_bytes(_BUS_CONTROL_TARGET),
+                service_no_bytes(424242),
+                BUS_AUTH0.encode(),
+                client_nonce,
+            ]
+        )
+        reply = await asyncio.wait_for(rogue.recv_multipart(), 5.0)
+        assert reply[1] == BUS_AUTH1.encode()
+        server_nonce, claimed = reply[2][:16], reply[2][16:]
+        assert hmac_digest(token, client_nonce, server_nonce) == claimed
+        await rogue.send_multipart(
+            [
+                service_no_bytes(_BUS_CONTROL_TARGET),
+                service_no_bytes(424242),
+                BUS_AUTH2.encode(),
+                hmac_digest(token, server_nonce),
+            ]
+        )
+        box["event"].clear()
         await rogue.send_multipart(
             [
                 service_no_bytes(ctx_main.service_no),
@@ -594,3 +647,140 @@ class TestEndpointNormalizationF105:
 
         assert normalize_endpoint("ipc:///tmp/x.sock") == "ipc:///tmp/x.sock"
         assert normalize_endpoint("tcp://127.0.0.1:2918") == "tcp://127.0.0.1:2918"
+
+
+class TestBusAuthF126:
+    """ROUTER-side handshake: bad digests rejected, good ones authenticate,
+    and data frames from unauthenticated identities never dispatch."""
+
+    def _router_bus(self, config_dir, tmp_path) -> tuple[ZmqBus, _DrainSocket]:
+        ctx = make_ctx(config_dir, tmp_path, main=True, index=0, port=0)
+        bus = ZmqBus(ctx, ProtocolGateway())
+        socket = _DrainSocket()
+        bus._socket = socket  # type: ignore[assignment]
+        return bus, socket
+
+    async def test_full_handshake_authenticates(self, config_dir, tmp_path) -> None:
+        import secrets
+
+        from pyline.net.auth import hmac_digest, inter_token
+        from pyline.net.ipc import BUS_AUTH0, BUS_AUTH1, BUS_AUTH2, NONCE_LEN
+
+        bus, socket = self._router_bus(config_dir, tmp_path)
+        try:
+            identity = service_no_bytes(424242)
+            client_nonce = secrets.token_bytes(NONCE_LEN)
+            bus._router_auth_step(identity, BUS_AUTH0, client_nonce)
+            await asyncio.sleep(0.05)  # the writer task delivers asynchronously
+            assert len(socket.sent) == 1  # @busauth1 reply
+            reply = socket.sent[0]
+            assert reply[2] == BUS_AUTH1.encode()
+            server_nonce = reply[3][:NONCE_LEN]
+            mac = reply[3][NONCE_LEN:]
+            assert mac == hmac_digest(inter_token(bus._ctx), client_nonce, server_nonce)
+            assert identity not in bus._authed
+            bus._router_auth_step(
+                identity, BUS_AUTH2, hmac_digest(inter_token(bus._ctx), server_nonce)
+            )
+            assert identity in bus._authed
+            assert bus.auth_rejects == 0
+        finally:
+            await bus.close()
+
+    async def test_bad_digest_rejected(self, config_dir, tmp_path) -> None:
+        import secrets
+
+        from pyline.net.ipc import BUS_AUTH0, BUS_AUTH2, NONCE_LEN
+
+        bus, socket = self._router_bus(config_dir, tmp_path)
+        try:
+            identity = service_no_bytes(424242)
+            bus._router_auth_step(identity, BUS_AUTH0, secrets.token_bytes(NONCE_LEN))
+            await asyncio.sleep(0.05)  # the writer task delivers asynchronously
+            server_nonce = socket.sent[0][3][:NONCE_LEN]
+            bus._router_auth_step(identity, BUS_AUTH2, b"X" * 32)
+            assert identity not in bus._authed
+            assert bus.auth_rejects == 1
+            assert identity not in bus._auth_pending  # rejected = purged
+            _ = server_nonce
+        finally:
+            await bus.close()
+
+    async def test_data_from_unauthenticated_identity_dropped(self, config_dir, tmp_path) -> None:
+        from pyline.net.ipc import _BUS_CONTROL_TARGET
+
+        ctx = make_ctx(config_dir, tmp_path, main=True, index=0, port=0)
+        got: dict = {"event": asyncio.Event()}
+        gw = ProtocolGateway()
+        _CaptureNet(gw, got)
+        bus = ZmqBus(ctx, gw)
+        bus._socket = _DrainSocket()  # type: ignore[assignment]
+        try:
+            sender = service_no_bytes(424242)
+            await bus._on_recv(
+                [
+                    sender,
+                    service_no_bytes(ctx.service_no),
+                    sender,
+                    b"test",
+                    pack_call(1, "unauth"),
+                ]
+            )
+            _ = _BUS_CONTROL_TARGET
+            assert bus.unauthenticated_drops == 1
+            assert got.get("got") is None
+        finally:
+            await bus.close()
+
+
+class TestBusByteBudgetF127:
+    """Per-destination queues bound BYTES, not just message count; refused
+    enqueues surface to RPC callers instead of becoming fake timeouts."""
+
+    def _bus(self, config_dir, tmp_path, *, queue_bytes: int) -> ZmqBus:
+        from dataclasses import replace as _replace
+
+        ctx = make_ctx(config_dir, tmp_path, main=True, index=0, port=0)
+        ctx = _replace(
+            ctx,
+            settings=ctx.settings.model_copy(
+                update={
+                    "zeromq": ctx.settings.zeromq.model_copy(update={"queue_bytes": queue_bytes})
+                }
+            ),
+        )
+        bus = ZmqBus(ctx, ProtocolGateway())
+        bus._socket = _BlockingSocket()  # type: ignore[assignment]
+        bus._socket.gate.clear()  # hold the writer mid-send: nothing drains
+        return bus
+
+    async def test_byte_refusal_and_raise_on_drop(self, config_dir, tmp_path) -> None:
+        import pytest as _pytest
+
+        from pyline.net.ipc import BusOverflowError
+
+        bus = self._bus(config_dir, tmp_path, queue_bytes=2048)
+        try:
+            blob = b"x" * 1500
+            assert bus.send(510001, "test", blob) is None  # within budget
+            with _pytest.raises(BusOverflowError):
+                bus.send(510001, "test", blob, raise_on_drop=True)  # second exceeds
+            assert bus.dropped_sends == 1
+            # fire-and-forget keep the historical drop-and-count contract
+            bus.send(510001, "test", blob)
+            assert bus.dropped_sends == 2
+        finally:
+            bus._socket.gate.set()
+            await bus.close()
+
+    async def test_bytes_released_after_send(self, config_dir, tmp_path) -> None:
+        bus = self._bus(config_dir, tmp_path, queue_bytes=2048)
+        try:
+            bus._socket.gate.set()  # writer drains immediately
+            for _ in range(5):
+                bus.send(510001, "test", b"x" * 1500)
+                await asyncio.sleep(0.02)
+            assert bus.queued_bytes() == 0, "budget must free once the socket took the frames"
+            assert bus.dropped_sends == 0
+        finally:
+            await bus.close()

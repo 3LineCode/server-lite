@@ -12,7 +12,7 @@ import pyline.net.connection as conn_mod
 import pyline.net.proxy as proxy_mod
 from pyline.net.proxy import FWD_FLAG, IDENT_FLAG, ProxyClient, ProxyServer, build_forward
 from pyline.obs.metrics import get_metrics
-from test_ipc import make_ctx  # reuse the config-based Context builder
+from tests.test_ipc import make_ctx  # reuse the config-based Context builder
 
 KW = {
     "handshake_timeout": 1.0,
@@ -150,7 +150,9 @@ class TestIdentValidation:
         import logging
 
         ctx = make_ctx(config_dir, tmp_path, main=True, index=0, port=0)
-        monkeypatch.setattr(proxy_mod, "_inter_token_warned", False)
+        import pyline.net.auth as auth_mod
+
+        monkeypatch.setattr(auth_mod, "_inter_token_warned", False)
         with caplog.at_level(logging.WARNING, logger="pyline.net.proxy"):
             for _ in range(5):  # five "reconnects"
                 proxy_mod.inter_token(ctx)

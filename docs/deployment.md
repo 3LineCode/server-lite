@@ -10,22 +10,32 @@ revisit when the answers change.
 The inter-process/inter-server mesh is *authenticated by identity binding,
 not by encryption*:
 
-- The TCP handshake authenticates the **client** via a shared token
-  (`hmac.compare_digest`); the server never proves itself to the client.
-  The token is static (no nonce/challenge), so it is replayable by anyone
-  who captures it on the wire -- another reason the plane must stay on a
-  trusted network. The client listener caps concurrent connections, globally
-  and per peer IP (F-72, `socket.max_connections` /
-  `socket.max_connections_per_ip`), so the handshake cost can no longer be
-  used for FD/task exhaustion.
-- The ZeroMQ bus (F-39) drops any message whose claimed `from` service
-  number does not match the sender's socket identity, and RPC (F-40) only
-  accepts results/cancels from the service the caller actually invoked --
-  but anyone who can *reach* the bus endpoint can still connect and speak
-  as themselves. On POSIX the `ipc://` endpoint file is chmod 0600 right
-  after bind (F-75), so other local users can neither snoop nor inject;
-  the residual same-host exposure is root / same-uid processes. A bare-path
-  `bind_file` (pre-F-105 configs) is normalized to `ipc://` automatically.
+- The TCP handshake is an HMAC **challenge-response** (F-123): the server
+  sends a random 16-byte nonce, the client answers
+  `HMAC-SHA256(token, nonce)`. The token itself never crosses the wire, and a
+  captured digest is useless on any other connection (fresh nonce each time).
+  Traffic is still unencrypted -- payload confidentiality needs TLS (below).
+  Pre-authentication the decoder accepts only `preauth_max_frame` (64 KiB
+  default, F-124) instead of the full 16 MiB frame budget, and every inbound
+  msgpack decode is element/size-capped (F-125), so an unauthenticated peer
+  can no longer park `max_frame` in the decode buffer or inflate a small
+  frame into gigabytes of Python objects. The client listener caps concurrent
+  connections, globally and per peer IP (F-72, `socket.max_connections` /
+  `socket.max_connections_per_ip`).
+- The ZeroMQ bus requires an HMAC handshake before any data flows (F-126):
+  a DEALER must prove it holds the inter-server token against a per-
+  connection nonce, and the ROUTER drops every frame from identities that
+  never completed it (mutually authenticated -- AUTH1 also proves the ROUTER
+  to the DEALER). On top of that, F-39 drops any message whose claimed `from`
+  service number does not match the sender's socket identity, and RPC (F-40)
+  only accepts results/cancels from the service the caller actually invoked.
+  Per-destination queues are bounded by bytes as well as message count
+  (F-127: `zeromq.queue_bytes`, 64 MiB default), so a slow peer cannot pile
+  ~16 GiB of 16 MiB frames into one queue; RPC CALLs refused by a full queue
+  fail fast at the caller instead of timing out 10 s later (F-128). On POSIX
+  the `ipc://` endpoint file is additionally chmod 0600 right after bind
+  (F-75). A bare-path `bind_file` (pre-F-105 configs) is normalized to
+  `ipc://` automatically.
 - The `@fwd` proxy plane validates peers by token + IP allowlist + IDENT
   machine claim (F-16), and binds each envelope's claimed origin to the
   sending connection's registered machine at the first hop (F-48) -- a
@@ -48,9 +58,13 @@ touching the public internet. Before crossing those lines the mesh needs
 transport security:
 
 - ZMQ plane: CURVE + ZAP (`zap_domain`, per-peer public keys) -- libzmq
-  ships both, pyzmq exposes them;
+  ships both, pyzmq exposes them (the F-126 HMAC handshake already removes
+  the plaintext-token and identity-forgery exposure; CURVE adds
+  confidentiality and per-peer keys instead of one shared secret);
 - TCP planes (client listener + proxy): TLS (server certs at minimum,
-  mutual for the proxy plane).
+  mutual for the proxy plane). The F-123 handshake already keeps the token
+  off the wire and blocks digest replay; TLS adds confidentiality and
+  server certificates.
 
 These are deliberate non-goals of the current milestone: they change the
 config surface (key distribution) and belong to a deployment-driven pass,
@@ -106,31 +120,36 @@ before `select()` raises. Options when a deployment outgrows it:
    selector loop and the client listener on proactor -- a kernel change,
    not a config change; needs its own review.
 
-## Windows: the ZMQ bus endpoint is unauthenticated TCP
+## Windows: the ZMQ bus endpoint is loopback TCP
 
 There is no `ipc://` transport on Windows, so the bus defaults to
 `tcp://127.0.0.1:<port>` (`zeromq.bind_host`, `config/models.py`). Unlike
 POSIX -- where the `ipc://` socket file is chmod 0600'd right after bind
-(F-75) -- a loopback TCP endpoint has **no OS-enforced access control and
-the bus protocol has no authentication of its own**: the F-39 identity
-binding only checks that a claimed `from` matches the sender's *self-chosen*
-socket identity. Any process running as the same user (or root) on a
-Windows host can connect, claim any service number, and inject RPC
-results/cancels into live calls. The generic mesh trust rule ("do not
-bridge the mesh onto a network you do not fully control") therefore
-includes *the loopback interface* on Windows: the assumption a deployment
-actually relies on is **single-user host**. Multi-user Windows hosts (or
-any host where unrelated services run as the same account) need the
-CURVE+ZAP transport-security pass from the trust-model section above
-before the bus endpoint is safe.
+(F-75) -- a loopback TCP endpoint has no OS-enforced access control. The bus
+now carries its own authentication (F-126): a local process without the
+inter-server token cannot place frames on the bus regardless of which
+identity it claims, so the previous "any same-uid process can impersonate
+any service" exposure is closed. What remains true: the token is a shared
+secret readable by every process of the deploying user, traffic on the
+loopback socket is unencrypted, and a same-uid process that reads the token
+out of config can speak as anyone. The assumption a deployment actually
+relies on is still **single-user host**; multi-user Windows hosts need the
+CURVE+ZAP transport-security pass from the trust-model section above before
+the bus endpoint is safe.
 
-## Sub-process metrics are not scrapeable
+## Sub-process metrics
 
-Only the main process exports Prometheus. The endpoint binds `127.0.0.1` by
-default (F-54); set `metrics_bind` and a `metrics_token` (bearer, secret
-reference) before exposing it on a network you trust -- the token gates
-scraping, it is not TLS. Sub-process metrics exist in-process but have no
-exporter. Options: per-process ports (port budget needed), or prometheus
-multiprocess mode (requires a shared dir + `PROMETHEUS_MULTIPROC_DIR`
-lifecycle handling). Decide before relying on sub-process metrics in
-alerting.
+The main process exports Prometheus on `metrics_port` (F-28/F-54). With
+`metrics_all_processes: true` (F-137) every sub-process ALSO exports its own
+registry on `metrics_port + process_index` -- the "per-process ports"
+option this document used to leave open. The endpoint binds `127.0.0.1` by
+default; set `metrics_bind` and a `metrics_token` (bearer, secret reference)
+before exposing it on a network you trust -- the token gates scraping, it is
+not TLS.
+
+Instrumented across processes (F-136): event-loop latency, connections,
+RPC latency/timeouts and origin rejections, dispatch errors, IPC
+safety counters, auto-save queue/flushes/failures, child liveness and exit
+reasons (main process), boot phase durations, scheduler timer backlog,
+MySQL pool saturation and acquire timeouts, schema migration outcomes, and
+hot-reload results.

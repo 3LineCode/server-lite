@@ -41,6 +41,13 @@
         "charset": "utf8mb4",
         "max_conn": 4,
         "min_conn": 1,
+        // Versioned .sql migrations (NNN_name.sql, applied in order at boot;
+        // resolved relative to the project root). Omit to run only table
+        // creation + additive columns + drift detection.
+        // "migrations_dir": "migrations",
+        // Recycle pooled connections younger than the server's wait_timeout
+        // so idle-killed conns do not fail on first use.
+        "pool_recycle": 3600,
     },
 
     "redis": {

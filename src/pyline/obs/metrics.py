@@ -70,6 +70,39 @@ class Metrics:
         self.save_flushed = Counter(f"{namespace}_save_flushed_total", "Flushed save entries")
         self.save_failures = Counter(f"{namespace}_save_failures_total", "Failed save flushes")
         self.reload_total = Counter(f"{namespace}_reload_total", "Hot reloads", ("result",))
+        # --- kernel / lifecycle / db instrumentation ----------------------- #
+        # These close the observability gap where a multi-process game server
+        # needs them most: child deaths and restarts, timer backlog, pool
+        # saturation, boot phase durations and migration outcomes were
+        # previously log-only (invisible to Prometheus).
+        self.children_alive = Gauge(f"{namespace}_children_alive", "Live supervised children")
+        self.child_exits = Counter(
+            f"{namespace}_child_exits_total",
+            "Supervised child process exits",
+            ("process_type", "reason"),
+        )
+        self.boot_phase_seconds = Histogram(
+            f"{namespace}_boot_phase_seconds",
+            "Duration of one boot-step action",
+            ("phase",),
+            buckets=(0.01, 0.05, 0.1, 0.5, 1, 5, 15, 60, 300),
+        )
+        self.scheduler_pending = Gauge(
+            f"{namespace}_scheduler_pending", "Timers pending in the scheduler"
+        )
+        self.mysql_pool_size = Gauge(f"{namespace}_mysql_pool_size", "MySQL pool size")
+        self.mysql_pool_in_use = Gauge(
+            f"{namespace}_mysql_pool_in_use", "MySQL pool connections in use"
+        )
+        self.mysql_acquire_timeouts = Counter(
+            f"{namespace}_mysql_acquire_timeouts_total",
+            "Pool acquisitions that exceeded acquire_timeout",
+        )
+        self.schema_migrations = Counter(
+            f"{namespace}_schema_migrations_total",
+            "Versioned schema migration files applied",
+            ("result",),
+        )
 
 
 _METRICS: Metrics | None = None

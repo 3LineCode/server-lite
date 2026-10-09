@@ -213,18 +213,29 @@ class LifecycleManager:
         self._last_advance = time.monotonic()
         action = self._step_actions.get(state)
         if action is not None:
-            if self._step_timeout is None:
-                await action()
-                return
+            from pyline.obs.metrics import get_metrics
+
+            started = time.monotonic()
             try:
-                await asyncio.wait_for(action(), timeout=self._step_timeout)
-            except TimeoutError as exc:
-                # The watchdog only records a stall and run_boot can only see
-                # it BETWEEN steps; a hung action (e.g. a connect without its
-                # own timeout) needs a hard bound or the process parks forever.
-                raise StartupStuckError(
-                    f"boot step {state.name} exceeded {self._step_timeout:.0f}s"
-                ) from exc
+                if self._step_timeout is None:
+                    await action()
+                    return
+                try:
+                    await asyncio.wait_for(action(), timeout=self._step_timeout)
+                except TimeoutError as exc:
+                    # The watchdog only records a stall and run_boot can only see
+                    # it BETWEEN steps; a hung action (e.g. a connect without its
+                    # own timeout) needs a hard bound or the process parks forever.
+                    raise StartupStuckError(
+                        f"boot step {state.name} exceeded {self._step_timeout:.0f}s"
+                    ) from exc
+            finally:
+                # Which boot phase ate the time used to be log-only; a slow
+                # step (schema migration, business init) is now a Prometheus
+                # histogram sample too.
+                get_metrics().boot_phase_seconds.labels(phase=state.name).observe(
+                    time.monotonic() - started
+                )
 
     # ------------------------------------------------------------------ #
     # Start gates

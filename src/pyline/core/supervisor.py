@@ -22,6 +22,8 @@ import sys
 from collections.abc import Awaitable, Callable
 from multiprocessing.synchronize import Event as MpEvent
 
+from pyline.obs.metrics import get_metrics
+
 logger = logging.getLogger(__name__)
 
 ChildMain = Callable[[str, int], Awaitable[None]]
@@ -42,6 +44,7 @@ class ProcessSupervisor:
         self._children: dict[str, mp.process.BaseProcess] = {}
         self._watch_task: asyncio.Task[None] | None = None
         self._shutdown_event: MpEvent | None = None
+        self._metrics = get_metrics()
 
     # ------------------------------------------------------------------ #
     # Main-process side
@@ -71,6 +74,7 @@ class ProcessSupervisor:
             )
             child.start()
             self._children[process_type] = child
+            self._metrics.children_alive.set(len(self._children))
             logger.info("spawned sub-process %s (index=%d, pid=%d)", process_type, index, child.pid)
 
     def start_child_watch(
@@ -95,6 +99,13 @@ class ProcessSupervisor:
                 if not child.is_alive():
                     code = child.exitcode
                     logger.fatal("sub-process %s died (exitcode=%s)", process_type, code)
+                    # Observable exit: 0 = clean (shutdown path), anything
+                    # else = crash; the gauge keeps the live count honest.
+                    self._metrics.child_exits.labels(
+                        process_type=process_type, reason="clean" if code == 0 else "crash"
+                    ).inc()
+                    self._children.pop(process_type, None)
+                    self._metrics.children_alive.set(len(self._children))
                     if on_child_died is not None:
                         try:
                             await on_child_died(process_type, code)
@@ -143,6 +154,8 @@ class ProcessSupervisor:
             self._shutdown_event.set()
         children = [c for c in self._children.values() if c.is_alive()]
         if not children:
+            self._children.clear()
+            self._metrics.children_alive.set(0)
             return
         deadline = asyncio.get_running_loop().time() + grace
         for child in children:
@@ -165,6 +178,7 @@ class ProcessSupervisor:
             if child.is_alive():
                 child.join(timeout=0)  # non-blocking reap after kill
         self._children.clear()
+        self._metrics.children_alive.set(0)
 
     # ------------------------------------------------------------------ #
     # Child-process side

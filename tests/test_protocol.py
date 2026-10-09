@@ -186,3 +186,48 @@ class TestDecoderCursorAndFlagsF78:
         assert frames[0].payload == b"\x00" * 8
         assert frames[-1].payload == bytes([499 % 256]) * 8
         assert decoder._offset == 0  # fully compacted after feed
+
+
+class TestDecodeCapsF125:
+    """decode_payload bounds msgpack expansion: a small frame must not be
+    able to inflate into gigabytes of Python objects."""
+
+    def test_oversized_array_rejected(self) -> None:
+        import msgpack
+        import pytest as _pytest
+
+        from pyline.net.protocol import decode_payload
+
+        bomb = msgpack.packb([0] * (1_048_576 + 1), use_bin_type=True)
+        with _pytest.raises(ValueError):
+            decode_payload(bomb)
+
+    def test_oversized_map_rejected(self) -> None:
+        import msgpack
+        import pytest as _pytest
+
+        from pyline.net.protocol import decode_payload
+
+        bomb = msgpack.packb({i: 0 for i in range(1_048_576 + 1)}, use_bin_type=True)
+        with _pytest.raises(ValueError):
+            decode_payload(bomb)
+
+    def test_normal_payloads_unaffected(self) -> None:
+        from pyline.net.protocol import decode_payload
+
+        assert decode_payload(msgpack_packb(["ok", {"k": 1}])) == ["ok", {"k": 1}]
+
+    def test_set_max_frame_only_widens(self) -> None:
+        decoder = FrameDecoder(max_frame=1024)
+        decoder.set_max_frame(4096)
+        assert decoder._max_frame == 4096
+        # narrowing is a no-op: authenticated peers must not have later legal
+        # frames rejected by accounting only
+        decoder.set_max_frame(512)
+        assert decoder._max_frame == 4096
+
+
+def msgpack_packb(value: object) -> bytes:
+    import msgpack
+
+    return msgpack.packb(value, use_bin_type=True)

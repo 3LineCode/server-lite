@@ -36,6 +36,11 @@ class SocketSettings(_StrictModel):
     client_port: int = Field(ge=1, le=65535)
     server_port: int = Field(ge=1, le=65535)
     max_frame_size: int = Field(default=16 * 1024 * 1024, ge=1024)
+    # Decode-buffer cap until the handshake verifies the peer: the handshake
+    # payloads are tiny, so an unauthenticated connection gets to buffer
+    # kilobytes, not ``max_frame_size`` (16 MiB), before it proves anything --
+    # the accept caps count connections, not bytes.
+    preauth_max_frame: int = Field(default=64 * 1024, ge=256)
     send_queue_limit: int = Field(default=1024, ge=1)
     # Byte-based companion to send_queue_limit: a count-only bound lets
     # ``send_queue_limit * max_frame_size`` bytes accumulate before the
@@ -66,6 +71,16 @@ class ZeroMQSettings(_StrictModel):
     # Per-destination outbound queue bound (F-15): bounds memory when a peer
     # is slow; overflow drops and counts, mirroring ZMQ's own HWM semantics.
     queue_bound: int = Field(default=1000, ge=1)
+    # Byte-based companion to queue_bound (the TCP side's F-21 analogue): a
+    # count-only bound lets ``queue_bound * max_frame_size`` bytes (~16 GiB)
+    # accumulate in one destination queue before the count guard fires --
+    # frames on the bus may be up to ``max_frame_size`` large. Default 64 MiB.
+    queue_bytes: int = Field(default=64 * 1024 * 1024, ge=1024)
+    # Deadline for the bus HMAC handshake (see net/ipc.py): a peer that never
+    # completes authentication fails its boot instead of silently dropping
+    # every message it sends. Generous because the DEALER queues its handshake
+    # until the ROUTER binds -- a child may boot before the parent's socket.
+    auth_timeout: float = Field(default=30.0, gt=0)
     # Upper bound on simultaneously tracked destinations: the ROUTER must not
     # grow an unbounded queue+writer per arbitrary target value.
     max_destinations: int = Field(default=256, ge=1)
@@ -97,6 +112,15 @@ class MySQLSettings(_StrictModel):
     # every connection up to read_timeout before that, but a leak holds it
     # forever).
     acquire_timeout: float = Field(default=10.0, gt=0)
+    # Seconds before a pooled connection is discarded and re-established on
+    # acquire, so a connection killed by the server's ``wait_timeout`` (which
+    # the dedicated keepalive socket cannot see) fails at most once. Set below
+    # the MySQL ``wait_timeout``. 0 disables age-based recycling.
+    pool_recycle: int = Field(default=3600, ge=0)
+    # Versioned ``.sql`` migration directory, resolved relative to the project
+    # root at load time; ``None`` disables the versioned-migration engine
+    # (table creation / additive columns / drift detection still run).
+    migrations_dir: str | None = None
 
     @model_validator(mode="after")
     def _check_pool_bounds(self) -> MySQLSettings:
@@ -156,6 +180,12 @@ class ProjectSettings(_StrictModel):
     metrics_bind: str = "127.0.0.1"
     # Optional bearer token (secret reference) required to scrape (F-54).
     metrics_token: SecretStr | None = None
+    # Per-process metrics export (see docs/deployment.md): when true, every
+    # sub-process ALSO exports its own registry on ``metrics_port + index``
+    # (the db child of a two-process split binds 9101, etc.). Without it only
+    # the main process exports, and sub-process autosave/RPC/loop metrics are
+    # invisible to Prometheus.
+    metrics_all_processes: bool = False
     # Hard bound per boot-step action: a hung connect aborts the boot
     # (the startup watchdog only observes stalls between steps).
     # None disables. Default is generous enough for schema migrations.
@@ -198,7 +228,6 @@ class ServerEntry(_StrictModel):
     client_port: int | None = Field(default=None, ge=1, le=65535)
     server_port: int | None = Field(default=None, ge=1, le=65535)
     sub_process: tuple[str, ...] = ()
-    coverage_dir: tuple[str, ...] = ()
     use_mysql: bool = True
     use_redis: bool = True
     is_proxy: bool = False

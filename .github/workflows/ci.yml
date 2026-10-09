@@ -25,7 +25,10 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --extra dev
-      - run: uv run mypy src
+      # tests are type-checked too, under the relaxed override declared in
+      # pyproject (fixture/test doubles keep pragmatic annotations; real
+      # type errors in test code are still caught)
+      - run: uv run mypy src tests
 
   test:
     strategy:
@@ -45,7 +48,7 @@ jobs:
       - name: Run unit tests with coverage
         run: |
           uv run coverage run -m pytest -m "not mysql and not redis"
-          uv run coverage report --fail-under=75
+          uv run coverage report --fail-under=78
       - name: Hot-reload regression suite
         run: uv run pytest tests/test_reload.py -v
 

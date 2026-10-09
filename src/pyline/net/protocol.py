@@ -17,6 +17,9 @@ the decoder reassembles them. ``pickle`` is never used on the wire.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
+
+import msgpack
 
 MAGIC = b"PL"
 VERSION = 1
@@ -31,9 +34,41 @@ MAX_FLAG_LEN = 255
 DEFAULT_CHUNK_SIZE = 1024 * 1024
 DEFAULT_MAX_FRAME = 16 * 1024 * 1024
 
+# Element/size caps for every inbound msgpack decode of untrusted payloads
+# (the TCP face, the RPC layer and the proxy envelopes all route through
+# ``decode_payload``). A 16 MiB msgpack blob of tiny values expands into
+# hundreds of MB of Python objects without these: an array of 16M small ints
+# is ~450 MB of interpreter objects from a 16 MB frame. The caps are far
+# above anything a game payload legitimately carries while bounding the
+# amplification factor of any single frame to a small multiple of its size.
+MAX_DECODE_STR = 16 * 1024 * 1024
+MAX_DECODE_BIN = 16 * 1024 * 1024
+MAX_DECODE_EXT = 16 * 1024 * 1024
+MAX_DECODE_ELEMS = 1_048_576
+
 
 class ProtocolError(Exception):
     """Malformed frame: bad magic/version/lengths or oversized message."""
+
+
+def decode_payload(payload: bytes) -> Any:
+    """Decode an inbound msgpack payload with bounded expansion.
+
+    Every decode of data that crossed a trust boundary must go through here:
+    the caps turn a pathological payload into a ``ValueError`` (which callers
+    already treat as drop-and-count) instead of a memory blow-up. Nested
+    depth stays covered by the existing ``RecursionError`` handling (F-78).
+    """
+    return msgpack.unpackb(
+        payload,
+        raw=False,
+        strict_map_key=False,
+        max_str_len=MAX_DECODE_STR,
+        max_bin_len=MAX_DECODE_BIN,
+        max_ext_len=MAX_DECODE_EXT,
+        max_array_len=MAX_DECODE_ELEMS,
+        max_map_len=MAX_DECODE_ELEMS,
+    )
 
 
 @dataclass(slots=True)
@@ -95,6 +130,18 @@ class FrameDecoder:
         self._pending_flag: str | None = None
         self._pending_data = bytearray()
         self._pending_size = 0
+
+    def set_max_frame(self, max_frame: int) -> None:
+        """Raise the frame cap (never lower it below pending state).
+
+        Used by the pre-auth window: the decoder starts at
+        ``preauth_max_frame`` (kilobytes) and is widened to the full
+        ``max_frame`` once the handshake verifies the peer. Lowering after
+        authentication is unsupported -- a peer that already sent legal full
+        frames must not have later frames rejected by accounting only.
+        """
+        if max_frame >= self._max_frame:
+            self._max_frame = max_frame
 
     def feed(self, data: bytes | bytearray | memoryview) -> list[Frame]:
         self._buffer += data

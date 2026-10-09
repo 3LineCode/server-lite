@@ -121,7 +121,15 @@ async def migrate_blobs(
     tables: dict[str, Any],
     *,
     execute: bool = False,
+    batch_size: int = 1000,
 ) -> MigrationReport:
+    """Walk every blob column and convert legacy pickle rows.
+
+    Rows stream in ``batch_size`` keyset pages (``WHERE pk > last ORDER BY pk``)
+    -- the original unbounded ``SELECT`` materialized the whole table in
+    memory at once, fine for prototype-scale tables but not for millions of
+    rows.
+    """
     report = MigrationReport(execute=execute)
     for table, column in _blob_columns(tables):
         # F-103: these names travel into f-string SQL below -- validate them
@@ -131,38 +139,58 @@ async def migrate_blobs(
         col_report = ColumnReport(table=table, column=column)
         report.columns.append(col_report)
         spec_pk = _primary_key(tables, table)
-        rows = await pool.query(
-            f"SELECT `{spec_pk}`, `{column}` FROM `{table}` WHERE `{column}` IS NOT NULL"
-        )
-        for key, blob in rows:
-            col_report.scanned += 1
-            if not isinstance(blob, (bytes, bytearray)):
-                col_report.failed += 1
-                col_report.failures.append(f"{key!r} (not binary: {type(blob).__name__})")
-                continue
-            if bytes(blob).startswith(BLOB_MAGIC):
-                col_report.skipped_modern += 1
-                continue
-            try:
-                data = restricted_loads(bytes(blob))
-                converted = dumps(data, schema_version=1)
-                # F-65: normalize BOTH sides.  msgpack preserves int/bytes
-                # dict keys exactly like pickle does; comparing the raw loads
-                # result against the str()-keyed normalization reported every
-                # non-string-keyed row as a round-trip mismatch, so it was
-                # left as pickle and unreadable (bad magic) at runtime.
-                if _normalize(loads(converted)) != _normalize(data):
-                    raise ValueError("round-trip mismatch")
-            except Exception as exc:
-                col_report.failed += 1
-                col_report.failures.append(f"{key!r} ({exc})")
-                continue
-            col_report.converted += 1
-            if execute:
-                await pool.execute(
-                    f"UPDATE `{table}` SET `{column}` = %s WHERE `{spec_pk}` = %s",
-                    (converted, key),
+        last_key: Any = None
+        while True:
+            if last_key is None:
+                rows = await pool.query(
+                    f"SELECT `{spec_pk}`, `{column}` FROM `{table}` "
+                    f"WHERE `{column}` IS NOT NULL ORDER BY `{spec_pk}` LIMIT %s",
+                    (batch_size,),
                 )
+            else:
+                rows = await pool.query(
+                    f"SELECT `{spec_pk}`, `{column}` FROM `{table}` "
+                    f"WHERE `{column}` IS NOT NULL AND `{spec_pk}` > %s "
+                    f"ORDER BY `{spec_pk}` LIMIT %s",
+                    (last_key, batch_size),
+                )
+            if not rows:
+                break
+            for key, blob in rows:
+                col_report.scanned += 1
+                if not isinstance(blob, (bytes, bytearray)):
+                    col_report.failed += 1
+                    col_report.failures.append(f"{key!r} (not binary: {type(blob).__name__})")
+                    continue
+                if bytes(blob).startswith(BLOB_MAGIC):
+                    col_report.skipped_modern += 1
+                    continue
+                try:
+                    data = restricted_loads(bytes(blob))
+                    # No explicit schema_version: the tool writes whatever the
+                    # CURRENT codec default is, so a future v2 codec migrates
+                    # old rows straight to the version the game reads.
+                    converted = dumps(data)
+                    # F-65: normalize BOTH sides.  msgpack preserves int/bytes
+                    # dict keys exactly like pickle does; comparing the raw loads
+                    # result against the str()-keyed normalization reported every
+                    # non-string-keyed row as a round-trip mismatch, so it was
+                    # left as pickle and unreadable (bad magic) at runtime.
+                    if _normalize(loads(converted)) != _normalize(data):
+                        raise ValueError("round-trip mismatch")
+                except Exception as exc:
+                    col_report.failed += 1
+                    col_report.failures.append(f"{key!r} ({exc})")
+                    continue
+                col_report.converted += 1
+                if execute:
+                    await pool.execute(
+                        f"UPDATE `{table}` SET `{column}` = %s WHERE `{spec_pk}` = %s",
+                        (converted, key),
+                    )
+            last_key = rows[-1][0]
+            if len(rows) < batch_size:
+                break
     return report
 
 
@@ -186,6 +214,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="write conversions (default is a dry run that changes nothing)",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="rows fetched per page (keyset pagination; the scan never "
+        "materializes the whole table)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -197,7 +232,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         pool = MySQLPool(settings.mysql)
         try:
             await pool.connect()
-            report = await migrate_blobs(pool, tables, execute=args.execute)
+            report = await migrate_blobs(
+                pool, tables, execute=args.execute, batch_size=args.batch_size
+            )
         finally:
             await pool.close()
         print(report.summary())

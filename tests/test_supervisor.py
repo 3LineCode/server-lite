@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 import pytest
@@ -154,3 +155,36 @@ class TestProcessSupervisor:
 
         assert _pid_alive(os.getpid()) is True
         assert _pid_alive(0x7FFFFFFF) is False
+
+
+class TestSupervisorMetricsF136:
+    async def test_child_exit_counted_and_gauge_dropped(self) -> None:
+        """A child death lands in pyline_child_exits_total{reason} and the
+        live-children gauge follows the table."""
+        from prometheus_client import REGISTRY
+
+        sup = ProcessSupervisor(_quiet_child)
+        sup._children["game"] = _FakeChild(exitcode=None)  # type: ignore[assignment]
+        notified: list[tuple[str, int | None]] = []
+
+        async def on_died(process_type: str, exitcode: int | None) -> None:
+            notified.append((process_type, exitcode))
+
+        watch = asyncio.get_running_loop().create_task(sup._watch_children(on_died))
+        try:
+            sup._children["game"].exitcode = 1  # type: ignore[index, union-attr]
+            sup._children["game"].terminated = True  # type: ignore[index, union-attr]
+            for _ in range(100):
+                if notified:
+                    break
+                await asyncio.sleep(0.02)
+            assert notified == [("game", 1)]
+            crash = REGISTRY.get_sample_value(
+                "pyline_child_exits_total", {"process_type": "game", "reason": "crash"}
+            )
+            assert (crash or 0) >= 1
+            assert float(REGISTRY.get_sample_value("pyline_children_alive") or 0) == 0.0
+        finally:
+            watch.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watch

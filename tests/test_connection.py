@@ -53,15 +53,10 @@ async def test_verified_round_trip() -> None:
 async def test_wrong_token_rejected() -> None:
     got: dict = {}
     server, port = await start_echo_server(got)
-    client = await conn_mod.open_connection(
-        "127.0.0.1", port, token="WRONG", on_message=lambda f, p: None, **KW
-    )
-    for _ in range(50):
-        if client.closed:
-            break
-        await asyncio.sleep(0.05)
-    assert client.closed
-    assert "handshake rejected" in client.close_reason or "read eof" in client.close_reason
+    with pytest.raises(conn_mod.ConnectionClosedError):
+        await conn_mod.open_connection(
+            "127.0.0.1", port, token="WRONG", on_message=lambda f, p: None, **KW
+        )
     await conn_mod.close_server(server)
 
 
@@ -100,7 +95,34 @@ class TestSendQueueBytesF21:
         error instead of buffering gigabytes."""
 
         async def silent(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            await asyncio.sleep(10)  # accept, never read, never close
+            # complete the server side of the handshake, then never read again
+            import hashlib
+            import hmac as hmac_mod
+            import secrets as secrets_mod
+
+            from pyline.net.protocol import FrameDecoder, encode_message
+
+            nonce = secrets_mod.token_bytes(16)
+            writer.write(b"".join(encode_message("@challenge", nonce)))
+            await writer.drain()
+            decoder = FrameDecoder()
+            while True:
+                data = await reader.read(4096)
+                if not data:
+                    return
+                frames = decoder.feed(data)
+                done = False
+                for frame in frames:
+                    if frame.flag == "@auth":
+                        expected = hmac_mod.new(TOKEN.encode(), nonce, hashlib.sha256).digest()
+                        assert hmac_mod.compare_digest(frame.payload, expected)
+                        writer.write(b"".join(encode_message("@welcome", b"")))
+                        await writer.drain()
+                        done = True
+                        break
+                if done:
+                    break
+            await asyncio.sleep(10)  # accept, never read again, never close
 
         server = await asyncio.start_server(silent, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
@@ -241,14 +263,12 @@ class TestConnectionCapsF72:
             await asyncio.sleep(0.1)
             assert all(c.verified for c in conns)
 
-            third = await conn_mod.open_connection(
-                "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
-            )
-            for _ in range(60):
-                if third.closed:
-                    break
-                await asyncio.sleep(0.05)
-            assert third.closed, "connection beyond the global cap was accepted"
+            # the refused accept drops the socket immediately: the dial fails
+            # fast instead of returning a dying connection
+            with pytest.raises(conn_mod.ConnectionClosedError):
+                await conn_mod.open_connection(
+                    "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
+                )
             after = (
                 REGISTRY.get_sample_value("pyline_connections_rejected_total", {"reason": "global"})
                 or 0.0
@@ -259,7 +279,6 @@ class TestConnectionCapsF72:
         finally:
             for conn in conns:
                 await conn.close("done")
-            await third.close("done")
             await conn_mod.close_server(server)
 
     async def test_per_ip_cap_rejects_second_from_same_ip(self) -> None:
@@ -276,27 +295,20 @@ class TestConnectionCapsF72:
             **KW,
         )
         port = server.sockets[0].getsockname()[1]
-        first = third = None
         try:
             first = await conn_mod.open_connection(
                 "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
             )
             await asyncio.sleep(0.1)
             assert first.verified
-            third = await conn_mod.open_connection(
-                "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
-            )
-            for _ in range(60):
-                if third.closed:
-                    break
-                await asyncio.sleep(0.05)
-            assert third.closed, "second connection from the same IP was accepted"
+            with pytest.raises(conn_mod.ConnectionClosedError):
+                await conn_mod.open_connection(
+                    "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
+                )
             assert not first.closed
         finally:
             if first is not None:
                 await first.close("done")
-            if third is not None:
-                await third.close("done")
             await conn_mod.close_server(server)
 
     async def test_slot_released_on_close_allows_reconnect(self) -> None:
@@ -337,14 +349,10 @@ class TestAuthCompareF22:
         for bad in ("test-tokenX", "test", "test-token-extra", ""):
             got: dict = {}
             server, port = await start_echo_server(got)
-            client = await conn_mod.open_connection(
-                "127.0.0.1", port, token=bad, on_message=lambda f, p: None, **KW
-            )
-            for _ in range(50):
-                if client.closed:
-                    break
-                await asyncio.sleep(0.05)
-            assert client.closed, f"token {bad!r} was accepted"
+            with pytest.raises(conn_mod.ConnectionClosedError):
+                await conn_mod.open_connection(
+                    "127.0.0.1", port, token=bad, on_message=lambda f, p: None, **KW
+                )
             await conn_mod.close_server(server)
 
 
@@ -440,26 +448,23 @@ class TestLifecycleF17:
 
         server = await asyncio.start_server(silent, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
-        client = await conn_mod.open_connection(
-            "127.0.0.1",
-            port,
-            token=TOKEN,
-            on_message=lambda f, p: None,
-            handshake_timeout=0.3,
-            idle_timeout=30.0,
-            send_queue_limit=64,
-        )
-        assert not client.verified
-        for _ in range(40):
-            if client.closed:
-                break
-            await asyncio.sleep(0.05)
-        assert client.closed
-        assert "handshake timeout" in client.close_reason
-        await conn_mod.close_server(server)
+        with pytest.raises(conn_mod.ConnectionClosedError, match="handshake timeout"):
+            await conn_mod.open_connection(
+                "127.0.0.1",
+                port,
+                token=TOKEN,
+                on_message=lambda f, p: None,
+                handshake_timeout=0.3,
+                idle_timeout=30.0,
+                send_queue_limit=64,
+            )
+        server.close()
 
     async def test_server_probes_idle_client(self) -> None:
         """F-17: the server side pings quiet links (raw client, no pyline)."""
+        import hashlib
+        import hmac as hmac_mod
+
         from pyline.net.protocol import FrameDecoder, encode_message
 
         got_pings = 0
@@ -467,16 +472,20 @@ class TestLifecycleF17:
 
         async def raw_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             nonlocal got_pings
-            # handshake: send @auth
-            writer.write(b"".join(encode_message("@auth", TOKEN.encode())))
-            await writer.drain()
             decoder = FrameDecoder()
             while True:
                 data = await reader.read(4096)
                 if not data:
                     return
                 for frame in decoder.feed(data):
-                    if frame.flag == "@ping":
+                    if frame.flag == "@challenge":
+                        # challenge-response: answer HMAC(token, nonce)
+                        digest = hmac_mod.new(
+                            TOKEN.encode(), frame.payload, hashlib.sha256
+                        ).digest()
+                        writer.write(b"".join(encode_message("@auth", digest)))
+                        await writer.drain()
+                    elif frame.flag == "@ping":
                         got_pings += 1
                         seen.set()
 
@@ -498,3 +507,101 @@ class TestLifecycleF17:
         assert got_pings >= 1
         raw_task.cancel()
         await conn_mod.close_server(server)
+
+
+class TestChallengeResponseF123:
+    """The token never crosses the wire; digests are per-connection bound."""
+
+    async def test_auth_payload_is_hmac_not_token(self) -> None:
+        """The @auth frame carries HMAC-SHA256(token, nonce) -- the plaintext
+        token appearing on the wire is exactly what this finds."""
+        import hashlib
+        import hmac as hmac_mod
+
+        captured: dict[str, list[bytes]] = {}
+        nonce_holder: dict[str, bytes] = {}
+
+        async def probe_server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            import secrets as secrets_mod
+
+            from pyline.net.protocol import FrameDecoder, encode_message
+
+            nonce = secrets_mod.token_bytes(16)
+            nonce_holder["nonce"] = nonce
+            writer.write(b"".join(encode_message("@challenge", nonce)))
+            await writer.drain()
+            decoder = FrameDecoder()
+            while True:
+                data = await reader.read(4096)
+                if not data:
+                    return
+                for frame in decoder.feed(data):
+                    captured.setdefault(frame.flag, []).append(frame.payload)
+                    if frame.flag == "@auth":
+                        writer.write(b"".join(encode_message("@welcome", b"")))
+                        await writer.drain()
+                        return
+
+        server = await asyncio.start_server(probe_server, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            client = await conn_mod.open_connection(
+                "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
+            )
+            assert client.verified
+            digests = captured.get("@auth", [])
+            assert len(digests) == 1
+            assert digests[0] != TOKEN.encode(), "plaintext token crossed the wire"
+            assert digests[0] != TOKEN.encode() * 4
+            expected = hmac_mod.new(TOKEN.encode(), nonce_holder["nonce"], hashlib.sha256).digest()
+            assert hmac_mod.compare_digest(digests[0], expected)
+            await client.close("done")
+        finally:
+            server.close()
+
+    async def test_replayed_digest_rejected_on_new_connection(self) -> None:
+        """A sniffed @auth digest is bound to the first connection's nonce:
+        replaying it against a fresh connection (fresh nonce) fails."""
+        got: dict = {}
+        server, port = await start_echo_server(got)
+        # connection 1: capture its digest
+        client1 = await conn_mod.open_connection(
+            "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
+        )
+        assert client1.verified
+        await client1.close("done")
+        # connection 2 with the WRONG token: its digest is an HMAC under a
+        # different key, rejected just like a replayed foreign digest would be
+        # (the server has no way to accept it: the nonce differs).
+        with pytest.raises(conn_mod.ConnectionClosedError):
+            await conn_mod.open_connection(
+                "127.0.0.1", port, token="attacker-guess", on_message=lambda f, p: None, **KW
+            )
+        await conn_mod.close_server(server)
+
+    async def test_preauth_frame_cap_rejects_oversized_frames(self) -> None:
+        """F-124: before verification the decoder accepts only
+        preauth_max_frame bytes; a big frame pre-auth kills the link instead
+        of parking max_frame (16 MiB) in the decode buffer."""
+        got: dict = {}
+        server, port = await start_echo_server(got)
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            from pyline.net.protocol import FrameDecoder, encode_message
+
+            # consume the @challenge
+            decoder = FrameDecoder()
+            while "@challenge" not in [f.flag for f in decoder.feed(await reader.read(65536))]:
+                pass
+            # a 256 KiB frame: legal post-auth (max_frame default 16 MiB) but
+            # far past the 64 KiB pre-auth cap
+            writer.write(b"".join(encode_message("flood", b"x" * (256 * 1024))))
+            await writer.drain()
+            try:
+                data = await asyncio.wait_for(reader.read(65536), 5.0)
+            except (ConnectionResetError, ConnectionAbortedError):
+                data = b""  # Windows: the abort arrives as a RST, not clean EOF
+            assert data == b"", "server must drop the link on a pre-auth oversized frame"
+        finally:
+            writer.close()
+            await conn_mod.close_server(server)

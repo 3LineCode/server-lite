@@ -1,25 +1,34 @@
-"""TCP connection with token handshake, heartbeat, idle timeout and send
-backpressure.
+"""TCP connection with challenge-response handshake, heartbeat, idle timeout
+and send backpressure.
 
 Protocol names starting with ``@`` are reserved for connection control:
 
-* ``@auth``        -- first frame from the client, payload = token string.
+* ``@challenge``   -- first frame from the server: 16 random bytes (nonce).
+* ``@auth``        -- client's reply: HMAC-SHA256(token, nonce) digest.
+* ``@welcome``     -- server's confirmation once the digest verified.
 * ``@ping``/``@pong`` -- heartbeat probes (client probes, server answers).
 
-Everything else is dispatched to the application ``on_message`` callback, but
-only after the server side has verified the handshake. One reader task owns
-the stream (handshake is enforced inside the read loop plus a deadline timer),
-one writer task drains a bounded send queue; when the peer stops reading and
-the queue fills up -- by message count OR queued bytes -- the connection is
-closed -- slow-consumer protection the prototype lacked.
+The token never crosses the wire: only keyed hashes of per-connection random
+nonces do, so a sniffed handshake is useless for replay (a new connection
+gets a fresh nonce) and leaks nothing about the token. The decode buffer is
+capped at ``preauth_max_frame`` (kilobytes) until the handshake verifies --
+an unauthenticated connection cannot park ``max_frame`` (16 MiB) of frames in
+the decoder. Everything else is dispatched to the application ``on_message``
+callback after verification. One reader task owns the stream (handshake is
+enforced inside the read loop plus a deadline timer), one writer task drains
+a bounded send queue; when the peer stops reading and the queue fills up --
+by message count OR queued bytes -- the connection is closed -- slow-consumer
+protection the prototype lacked.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import logging
+import secrets
 import time
 from collections import deque
 from collections.abc import Callable
@@ -40,8 +49,14 @@ logger = logging.getLogger(__name__)
 
 AUTH_FLAG = "@auth"
 WELCOME_FLAG = "@welcome"
+CHALLENGE_FLAG = "@challenge"
 PING_FLAG = "@ping"
 PONG_FLAG = "@pong"
+
+#: Length of the per-connection challenge nonce (bytes).
+CHALLENGE_NONCE_LEN = 16
+
+DEFAULT_PREAUTH_MAX_FRAME = 64 * 1024
 
 MessageCallback = Callable[[str, bytes], None]
 
@@ -84,6 +99,7 @@ class Connection:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         max_frame: int = DEFAULT_MAX_FRAME,
         send_queue_bytes: int = 64 * 1024 * 1024,
+        preauth_max_frame: int = DEFAULT_PREAUTH_MAX_FRAME,
         is_server_side: bool,
         on_message: MessageCallback,
         on_verified: Callable[[Connection], None] | None = None,
@@ -104,7 +120,12 @@ class Connection:
         self._max_frame = max_frame
         self._on_message = on_message
         self._on_verified = on_verified
-        self._decoder = FrameDecoder(max_frame=max_frame)
+        # Decode-buffer cap starts at the (tiny) pre-auth limit and widens to
+        # the full frame budget once the handshake verifies the peer: the
+        # accept caps count connections, not bytes, so without this each
+        # unauthenticated connection could park ``max_frame`` in the decoder.
+        self._decoder = FrameDecoder(max_frame=min(preauth_max_frame, max_frame))
+        self._challenge_nonce: bytes | None = None
         self._send_queue: asyncio.Queue[list[bytes]] = asyncio.Queue(send_queue_limit)
         self._send_queue_bytes = send_queue_bytes
         # F-21: bytes queued for the write loop. ``send_queue_limit`` counts
@@ -125,6 +146,13 @@ class Connection:
         # own F-20 discipline); a lost close task used to leave the socket
         # open until the idle timeout.
         self._bg_close_tasks: set[asyncio.Task[None]] = set()
+        # Handshake/lifecycle events: wait_verified() blocks until the
+        # handshake completes or the connection dies, restoring the
+        # open_connection contract that callers may send immediately after
+        # it returns (with the challenge-response flow the first outbound
+        # frame must not race the @challenge -> @auth exchange).
+        self._verified_event: asyncio.Event = asyncio.Event()
+        self._closed_event: asyncio.Event = asyncio.Event()
         self._metrics = get_metrics()
         self._metrics.connections.inc()
 
@@ -149,10 +177,13 @@ class Connection:
         # Both sides enforce the deadline (F-17): a client that never hears
         # @welcome must not hang forever either.
         self._tasks.append(loop.create_task(self._handshake_deadline()))
-        if not self.is_server_side:
-            # verified stays False until the server's @welcome confirms the
-            # token was accepted (F-17; it used to be set unconditionally).
-            self.send_message(AUTH_FLAG, self._token.encode("utf-8"))
+        if self.is_server_side:
+            # Challenge first: the peer must prove it holds the token by
+            # keyed-hashing THIS connection's random nonce, so the secret
+            # never crosses the wire and a captured digest cannot be replayed
+            # against any other connection.
+            self._challenge_nonce = secrets.token_bytes(CHALLENGE_NONCE_LEN)
+            self.send_message(CHALLENGE_FLAG, self._challenge_nonce)
         self._tasks.append(loop.create_task(self._read_loop()))
         self._tasks.append(loop.create_task(self._write_loop()))
         self._tasks.append(loop.create_task(self._idle_watch()))
@@ -183,30 +214,32 @@ class Connection:
         """Route one decoded frame; returns False to stop the read loop."""
         if not self.verified:
             if self.is_server_side:
-                # F-22: constant-time token comparison. A plain ``==`` on the
-                # secret leaks a length/prefix timing channel; compare_digest
-                # on utf-8 bytes matches what the client sends byte for byte.
-                if frame.flag == AUTH_FLAG and hmac.compare_digest(
-                    frame.payload, self._token_bytes
-                ):
-                    self.verified = True
-                    self.send_message(WELCOME_FLAG, b"")
-                    if self._on_verified is not None:
-                        try:
-                            self._on_verified(self)
-                        except Exception:
-                            logger.exception("on_verified hook failed for %s", self)
-                    return True
+                if frame.flag == AUTH_FLAG and self._challenge_nonce is not None:
+                    # F-22 lineage: constant-time comparison of the digest.
+                    # The expected value is HMAC(token, this connection's
+                    # nonce); a sniffed digest from another connection fails
+                    # because nonces never repeat in practice (2^-128).
+                    expected = hmac.new(
+                        self._token_bytes, self._challenge_nonce, hashlib.sha256
+                    ).digest()
+                    if hmac.compare_digest(frame.payload, expected):
+                        self._verified()
+                        return True
                 logger.warning("rejecting unauthenticated frame %r from %s", frame.flag, self)
                 self._spawn_close("handshake rejected")
                 return False
+            if frame.flag == CHALLENGE_FLAG:
+                if len(frame.payload) != CHALLENGE_NONCE_LEN:
+                    logger.warning("bad challenge length %d from %s", len(frame.payload), self)
+                    self._spawn_close("handshake rejected")
+                    return False
+                digest = hmac.new(self._token_bytes, frame.payload, hashlib.sha256).digest()
+                # verified stays False until the server's @welcome confirms the
+                # digest was accepted (F-17; it used to be set unconditionally).
+                self.send_message(AUTH_FLAG, digest)
+                return True
             if frame.flag == WELCOME_FLAG:
-                self.verified = True
-                if self._on_verified is not None:
-                    try:
-                        self._on_verified(self)
-                    except Exception:
-                        logger.exception("on_verified hook failed for %s", self)
+                self._verified()
                 return True
             logger.warning("client ignoring pre-welcome frame %r from %s", frame.flag, self)
             return True
@@ -239,12 +272,38 @@ class Connection:
                 return False
         return True
 
-    @staticmethod
-    def _decode_text(payload: bytes) -> str:
+    def _verified(self) -> None:
+        """Mark the handshake complete: full frame budget, @welcome, hook."""
+        self.verified = True
+        self._decoder.set_max_frame(self._max_frame)
+        if self.is_server_side:
+            self.send_message(WELCOME_FLAG, b"")
+        self._verified_event.set()
+        if self._on_verified is not None:
+            try:
+                self._on_verified(self)
+            except Exception:
+                logger.exception("on_verified hook failed for %s", self)
+
+    async def wait_verified(self) -> None:
+        """Block until the handshake completes; raise if the link dies first.
+
+        The handshake deadline task bounds the wait on both sides, so this
+        never parks forever."""
+        if self.verified:
+            return
+        verified = asyncio.ensure_future(self._verified_event.wait())
+        closed = asyncio.ensure_future(self._closed_event.wait())
         try:
-            return payload.decode("utf-8")
-        except UnicodeDecodeError:
-            return payload.decode("utf-8", "replace")
+            await asyncio.wait({verified, closed}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            verified.cancel()
+            closed.cancel()
+        if self.verified:
+            return
+        raise ConnectionClosedError(
+            f"connection {self} closed before the handshake completed ({self.close_reason})"
+        )
 
     async def _write_loop(self) -> None:
         try:
@@ -362,6 +421,7 @@ class Connection:
             while self._send_queue.qsize() and time.monotonic() < deadline:
                 await asyncio.sleep(0.01)
         self.closed = True
+        self._closed_event.set()
         try:
             self._writer.close()
             # wait_closed can block forever while the peer refuses to read
@@ -392,7 +452,12 @@ async def open_connection(
     on_message: MessageCallback,
     **kwargs: object,
 ) -> Connection:
-    """Dial a server and return a started client-side Connection."""
+    """Dial a server and return a started, VERIFIED client-side Connection.
+
+    Blocks until the challenge-response handshake completes (or fails: a
+    wrong token closes the link and surfaces as ConnectionClosedError), so
+    callers may send immediately -- with the challenge-response flow the
+    first caller frame must not race the @challenge -> @auth exchange."""
     reader, writer = await asyncio.open_connection(host, port)
     conn = Connection(
         reader,
@@ -404,6 +469,7 @@ async def open_connection(
         **kwargs,  # type: ignore[arg-type]
     )
     await conn.start()
+    await conn.wait_verified()
     return conn
 
 
@@ -460,8 +526,7 @@ async def serve(
     F-72: connections beyond ``max_connections`` (global) or
     ``max_connections_per_ip`` (same peer IP) are refused at accept time and
     counted in ``pyline_connections_rejected_total{reason}``. The defaults
-    mirror SocketSettings; pass explicit values to tighten them (the runtime
-    does not forward the settings yet -- its defaults coincide with these)."""
+    mirror SocketSettings; the runtime forwards the configured values."""
 
     limiter = _ConnectionLimiter(max_connections, max_connections_per_ip)
 

@@ -32,7 +32,7 @@ from pyline.db.service import (
 )
 from pyline.db.transaction import TransactionError, current_transaction
 from pyline.net.rpc import RpcTimeoutError
-from test_orm_autosave import make_schema
+from tests.test_orm_autosave import make_schema
 
 
 class RecordingExecutor:
@@ -466,7 +466,10 @@ class TestTxStatusF61:
         service = DatabaseService(pool, NullRedis(), outcome_ttl=0.0)
         tx_id = await service.rpc_tx_begin()
         await service.rpc_tx_commit(tx_id)
-        await asyncio.sleep(0.01)
+        # 50 ms: past the 15.6 ms GetTickCount64 resolution of Windows
+        # monotonic clocks -- a 10 ms sleep measured 0.0 elapsed sometimes,
+        # keeping the outcome entry alive and flaking this test.
+        await asyncio.sleep(0.05)
         assert await service.rpc_tx_status(tx_id) == "unknown"
 
 
@@ -589,3 +592,75 @@ class TestGatewayAccessF72:
     def test_constructor_still_requires_some_backend(self) -> None:
         with pytest.raises(ValueError, match="local service or remote rpc"):
             DatabaseAccess()
+
+
+class TestTxStatementSerializationF131:
+    """Concurrent statements on one remote session serialize; an abandoned
+    session is reaped by the periodic sweep even with no further RPC."""
+
+    async def test_concurrent_statements_serialize(self) -> None:
+        import time as _time
+
+        class SlowSession(FakeSession):
+            def __init__(self, log: list[Any]) -> None:
+                super().__init__(log)
+                self.overlaps = 0
+                self._active = 0
+
+            async def _slow(self, kind: str, sql: str) -> None:
+                if self._active:
+                    self.overlaps += 1  # two statements ran concurrently
+                self._active += 1
+                await asyncio.sleep(0.05)
+                self._log.append((kind, sql))
+                self._active -= 1
+
+            async def execute(self, sql: str, args: tuple[Any, ...] = ()) -> int:
+                await self._slow("EXEC", sql)
+                return 1
+
+            async def query(self, sql: str, args: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+                await self._slow("QUERY", sql)
+                return [(1,)]
+
+        class SlowPool(FakeSessionPool):
+            def __init__(self) -> None:
+                super().__init__()
+                self.session: SlowSession | None = None
+
+            async def open_session(self) -> SlowSession:
+                self.session = SlowSession(self.log)
+                return self.session
+
+        pool = SlowPool()
+        service = DatabaseService(pool, NullRedis())
+        tx_id = await service.rpc_tx_begin()
+        assert pool.session is not None
+        started = _time.monotonic()
+        await asyncio.gather(
+            service.rpc_tx_execute(tx_id, "UPDATE a", []),
+            service.rpc_tx_query(tx_id, "SELECT b", []),
+            service.rpc_tx_execute(tx_id, "UPDATE c", []),
+        )
+        elapsed = _time.monotonic() - started
+        assert pool.session.overlaps == 0, "statements on one session must not overlap"
+        assert elapsed >= 0.15  # three serialized 50 ms statements
+        await service.rpc_tx_commit(tx_id)
+
+    async def test_periodic_sweep_reaps_idle_session(self) -> None:
+        """The lazy reap only fires on begin/execute/query; an idle DB process
+        used to pin abandoned sessions (and their locks) until shutdown."""
+        pool = FakeSessionPool()
+        service = DatabaseService(pool, NullRedis(), tx_ttl=0.05)
+        tx_id = await service.rpc_tx_begin()
+        service.start()  # the periodic sweep
+        try:
+            for _ in range(100):
+                if service.active_transactions() == 0:
+                    break
+                await asyncio.sleep(0.05)
+            assert service.active_transactions() == 0, "sweep never reaped the idle session"
+            assert "ROLLBACK" in pool.log and "CLOSE" in pool.log
+            assert await service.rpc_tx_status(tx_id) == "rolled_back"
+        finally:
+            await service.close()

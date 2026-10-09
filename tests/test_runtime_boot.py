@@ -10,6 +10,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -660,3 +661,275 @@ class TestReloadHookSurfaces:
         console = Console(bus=EventBus())
         with pytest.raises(KeyboardInterrupt):
             console._reload_task_done(_FakeTask())  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- #
+# Seventh pass: spawn-window safety, warm validation, metrics wiring
+# --------------------------------------------------------------------------- #
+
+
+class TestMainProcSpawnWindowF135:
+    def _config_with_children(self, config_dir: Path) -> None:
+        project = {
+            "project": "spawn-test",
+            "srv_type": "production",
+            "metrics_port": None,
+            "socket": {"token": "$plain:t", "client_port": 11530, "server_port": 12530},
+            "mysql": {"user": "root", "password": "$plain:test", "db_name": "db"},
+            "redis": {"password": "$plain:test"},
+        }
+        (config_dir / "project.json5").write_text(json.dumps(project), encoding="utf-8")
+        servers = {
+            "10001": {
+                "name": "split",
+                "advertise_ip": "127.0.0.1",
+                "client_port": 1540,
+                "server_port": 2540,
+                "sub_process": ["game"],
+            },
+        }
+        (config_dir / "servers.json5").write_text(json.dumps(servers), encoding="utf-8")
+
+    def test_bad_tables_fail_before_spawn(self, config_dir, monkeypatch) -> None:
+        """Warm validation: a broken tables.json5 surfaces BEFORE children
+        exist (it used to crash the main process post-spawn, leaving crash-
+        mode teardown as the only backstop)."""
+        import pyline.runtime as runtime_mod
+
+        self._config_with_children(config_dir)
+        (config_dir / "tables.json5").write_text("{ not json5", encoding="utf-8")
+        spawned = {"n": 0}
+
+        class _Supervisor:
+            def __init__(self, child_main): ...
+            def spawn_subprocesses(self, sub_process, main_pid):
+                spawned["n"] += 1
+
+        monkeypatch.setattr(runtime_mod, "ProcessSupervisor", _Supervisor)
+        with pytest.raises(ConfigError, match=re.escape("tables.json5")):
+            runtime_mod.main(["--config", str(config_dir), "--server", "10001"])
+        assert spawned["n"] == 0
+
+    def test_bad_clock_tz_fails_before_spawn(self, config_dir, monkeypatch) -> None:
+        import pyline.runtime as runtime_mod
+
+        self._config_with_children(config_dir)
+        project = json.loads((config_dir / "project.json5").read_text(encoding="utf-8"))
+        project["clock"] = {"tz": "Not/AZone"}
+        (config_dir / "project.json5").write_text(json.dumps(project), encoding="utf-8")
+        spawned = {"n": 0}
+
+        class _Supervisor:
+            def __init__(self, child_main): ...
+            def spawn_subprocesses(self, sub_process, main_pid):
+                spawned["n"] += 1
+
+        monkeypatch.setattr(runtime_mod, "ProcessSupervisor", _Supervisor)
+        with pytest.raises(ConfigError, match="Not/AZone"):
+            runtime_mod.main(["--config", str(config_dir), "--server", "10001"])
+        assert spawned["n"] == 0
+
+    def test_construction_failure_still_terminates_children(self, config_dir, monkeypatch) -> None:
+        """The pre-boot construction (build_context/ServerRuntime) sits inside
+        the terminate_children guard: a failure there used to crash the main
+        process with live children and no graceful teardown."""
+        import pyline.runtime as runtime_mod
+
+        self._config_with_children(config_dir)
+        calls: list[str] = []
+
+        class _Supervisor:
+            def __init__(self, child_main): ...
+            def spawn_subprocesses(self, sub_process, main_pid):
+                calls.append("spawn")
+
+            def start_child_watch(self, cb): ...
+            async def terminate_children(self, **kw):
+                calls.append("terminate")
+
+        monkeypatch.setattr(runtime_mod, "ProcessSupervisor", _Supervisor)
+
+        def _boom(*a, **kw):
+            raise RuntimeError("config discovered only at build_context time")
+
+        monkeypatch.setattr(runtime_mod, "build_context", _boom)
+        with pytest.raises(RuntimeError, match="build_context"):
+            runtime_mod.main(["--config", str(config_dir), "--server", "10001"])
+        assert calls == ["spawn", "terminate"], (
+            "children spawned before the failure must be torn down on the way out"
+        )
+
+
+class TestMetricsWiringF136F137:
+    def test_boot_phase_histogram_observed(self, config_dir) -> None:
+        from prometheus_client import REGISTRY
+
+        from pyline.core.lifecycle import LifecycleManager, LifecycleState
+
+        async def run_boot() -> None:
+            manager = LifecycleManager(step_timeout=5.0)
+            manager.on_step(LifecycleState.LOOP_INIT, _noop_step)
+            await manager.run_boot()
+
+        async def _noop_step() -> None:
+            return None
+
+        before = REGISTRY.get_sample_value(
+            "pyline_boot_phase_seconds_count", {"phase": "LOOP_INIT"}
+        )
+        asyncio.run(run_boot())
+        after = REGISTRY.get_sample_value("pyline_boot_phase_seconds_count", {"phase": "LOOP_INIT"})
+        assert (after or 0) > (before or 0)
+
+    def test_sub_process_metrics_port_offset(self, config_dir, monkeypatch) -> None:
+        """metrics_all_processes: sub-processes export on port+index (the
+        documented resolution of the sub-process metrics gap)."""
+
+        import json5 as _json5
+
+        import pyline.runtime_wiring as wiring
+        from pyline.config.loader import (
+            load_project_settings,
+            load_server_registry,
+            load_table_defs,
+        )
+        from pyline.core.context import PROCESS_DB, Context
+        from pyline.runtime_wiring import DevtoolsLayer
+
+        project = _json5.loads((config_dir / "project.json5").read_text(encoding="utf-8"))
+        (config_dir / "project.json5").write_text(json.dumps(project), encoding="utf-8")
+
+        import socket as _socket
+
+        with _socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            free_port = s.getsockname()[1]
+        settings = load_project_settings(config_dir).model_copy(
+            update={
+                "metrics_port": free_port,
+                "metrics_all_processes": True,
+            }
+        )
+        registry = load_server_registry(config_dir)
+        ctx = Context(
+            settings=settings,
+            registry=registry,
+            tables=load_table_defs(config_dir),
+            entry=registry.entry(10001),
+            process_type=PROCESS_DB,
+            process_index=2,
+            main_pid=0,
+        )
+        captured: list[tuple[str, int, str | None]] = []
+
+        def fake_endpoint(bind: str, port: int, token: str | None) -> object:
+            captured.append((bind, port, token))
+            return object()
+
+        monkeypatch.setattr(wiring, "start_metrics_endpoint", fake_endpoint)
+        layer = DevtoolsLayer(ctx, None, None)  # type: ignore[arg-type]
+        layer._start_metrics_server()
+        assert captured == [("127.0.0.1", free_port + 2, None)]
+
+    def test_main_process_ignores_offset(self, config_dir, monkeypatch) -> None:
+        from types import SimpleNamespace
+
+        import pyline.runtime_wiring as wiring
+        from pyline.config.loader import load_project_settings
+        from pyline.runtime_wiring import DevtoolsLayer
+
+        settings = load_project_settings(config_dir).model_copy(
+            update={"metrics_port": 9123, "metrics_all_processes": True}
+        )
+        ctx = SimpleNamespace(
+            settings=settings, is_main_process=True, process_index=0, is_develop=False
+        )
+        captured: list[int] = []
+
+        def fake_endpoint(bind: str, port: int, token: str | None) -> object:
+            captured.append(port)
+            return object()
+
+        monkeypatch.setattr(wiring, "start_metrics_endpoint", fake_endpoint)
+        layer = DevtoolsLayer(ctx, None, None)  # type: ignore[arg-type]
+        layer._start_metrics_server()
+        assert captured == [9123]
+
+
+class TestMigrationsDirWiringF129:
+    async def test_db_layer_passes_configured_dir(self, config_dir, monkeypatch) -> None:
+        """The versioned-migration engine is reachable: DbLayer hands the
+        configured (loader-resolved) migrations_dir to SchemaManager."""
+        import json5 as _json5
+
+        import pyline.runtime_wiring as wiring
+        from pyline.config.loader import (
+            load_project_settings,
+            load_server_registry,
+            load_table_defs,
+        )
+        from pyline.core.context import PROCESS_MAIN, Context
+        from pyline.net.gateway import ProtocolGateway
+        from pyline.net.rpc import RpcManager
+
+        project = _json5.loads((config_dir / "project.json5").read_text(encoding="utf-8"))
+        project.setdefault("mysql", {})["migrations_dir"] = "dbmigrations"
+        (config_dir / "project.json5").write_text(json.dumps(project), encoding="utf-8")
+        servers = {
+            "10001": {
+                "name": "db",
+                "advertise_ip": "127.0.0.1",
+                "server_port": 2541,
+                "use_mysql": True,
+                "use_redis": False,
+            }
+        }
+        (config_dir / "servers.json5").write_text(json.dumps(servers), encoding="utf-8")
+
+        settings = load_project_settings(config_dir)
+        registry = load_server_registry(config_dir)
+        ctx = Context(
+            settings=settings,
+            registry=registry,
+            tables=load_table_defs(config_dir),
+            entry=registry.entry(10001),
+            process_type=PROCESS_MAIN,
+            process_index=0,
+            main_pid=0,
+        )
+        ctx.loop = asyncio.get_running_loop()
+        captured = {}
+
+        class _FakePool:
+            async def connect(self):
+                captured["pool_connected"] = True
+
+        class _FakeSchema:
+            def __init__(self, pool, tables, db_name, *, migrations_dir=None):
+                captured["migrations_dir"] = migrations_dir
+
+            async def ensure_all(self):
+                captured["ensured"] = True
+
+        monkeypatch.setattr(wiring, "MySQLPool", lambda *a, **kw: _FakePool())
+        monkeypatch.setattr(wiring, "SchemaManager", _FakeSchema)
+        layer = wiring.DbLayer(ctx, None)  # type: ignore[arg-type]
+        rpc = RpcManager(ProtocolGateway(), _NullRouter(), own_service_no=1)
+        await layer.connect(rpc)
+        from pathlib import Path as _P
+
+        assert captured["migrations_dir"] is not None
+        assert _P(str(captured["migrations_dir"])).name == "dbmigrations"
+        assert captured.get("ensured") is True
+
+
+class _NullRouter:
+    def route(
+        self,
+        flag: str,
+        payload: bytes,
+        target_service_no: int,
+        *,
+        raise_on_drop: bool = False,
+    ) -> None:
+        return None

@@ -95,6 +95,14 @@ class _TxRecord:
     def __init__(self, session: MySQLSession) -> None:
         self.session = session
         self.last_active = time.monotonic()
+        # One connection, potentially many coroutines: the ambient-transaction
+        # ContextVar is inherited by tasks spawned inside the block, so two of
+        # them can issue statements on the SAME session concurrently. Without
+        # serialization the statements interleave on one socket -- asyncmy
+        # connections are not safe for concurrent cursors -- corrupting the
+        # protocol stream. The lock also covers commit/rollback, so an
+        # in-flight statement finishes before the unit ends.
+        self.lock = asyncio.Lock()
 
     def touch(self) -> None:
         """F-47: the TTL bounds *idle* time -- an active transaction must not
@@ -137,6 +145,22 @@ class DatabaseService:
         self._outcomes: dict[str, tuple[str, float]] = {}
         self._outcome_ttl = outcome_ttl
         self._closed = False
+        # Periodic sweep: the lazy reap in begin/execute/query never runs when
+        # the DB process is fully idle, so an abandoned session (and its
+        # locks) used to survive until close() on an otherwise idle process.
+        self._sweep_task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        """Start the periodic TTL sweep (idempotent; stopped by close())."""
+        if self._sweep_task is not None and not self._sweep_task.done():
+            return
+        self._sweep_task = asyncio.get_running_loop().create_task(self._sweep_loop())
+
+    async def _sweep_loop(self) -> None:
+        interval = max(1.0, self._tx_ttl / 4)
+        while True:
+            await asyncio.sleep(interval)
+            self._reap_expired()
 
     def expose(self, rpc: RpcManager) -> None:
         rpc.register(RPC_QUERY, self.rpc_query)
@@ -205,13 +229,15 @@ class DatabaseService:
         self._reap_expired()
         record = self._live_tx(tx_id)
         record.touch()
-        return await record.session.execute(sql, tuple(args))
+        async with record.lock:
+            return await record.session.execute(sql, tuple(args))
 
     async def rpc_tx_query(self, tx_id: str, sql: str, args: list[Any]) -> list[list[Any]]:
         self._reap_expired()
         record = self._live_tx(tx_id)
         record.touch()
-        rows = await record.session.query(sql, tuple(args))
+        async with record.lock:
+            rows = await record.session.query(sql, tuple(args))
         return [list(row) for row in rows]
 
     async def rpc_tx_commit(self, tx_id: str) -> None:
@@ -222,7 +248,8 @@ class DatabaseService:
         # record is already popped, so the caller's rollback remedy would
         # only see TransactionGoneError and the session would stay open.
         try:
-            await record.session.commit()
+            async with record.lock:  # let any in-flight statement finish first
+                await record.session.commit()
         except BaseException:
             # F-61: a failed COMMIT leaves the server-side outcome genuinely
             # unknown (the connection may have died mid-commit), never
@@ -240,7 +267,8 @@ class DatabaseService:
         # F-61: recorded before the dispose so the outcome is visible even if
         # the rollback itself then hangs or fails.
         self._record_outcome(tx_id, "rolled_back")
-        await record.dispose(rollback=True)
+        async with record.lock:  # let any in-flight statement finish first
+            await record.dispose(rollback=True)
 
     async def rpc_tx_status(self, tx_id: str) -> str:
         """F-61: ``'committed' | 'rolled_back' | 'unknown'`` for a transaction.
@@ -303,6 +331,11 @@ class DatabaseService:
         """
         self._closed = True
         loop = asyncio.get_running_loop()
+        if self._sweep_task is not None:
+            self._sweep_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._sweep_task
+            self._sweep_task = None
         disposes: list[asyncio.Task[None]] = []
         for tx_id, record in list(self._tx.items()):
             self._tx.pop(tx_id, None)

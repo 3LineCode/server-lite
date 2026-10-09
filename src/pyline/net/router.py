@@ -107,6 +107,7 @@ class MessageRouter:
         target_service_no: int,
         from_service: int | None = None,
         hops: int = 0,
+        raise_on_drop: bool = False,
     ) -> None:
         """Route one message toward ``target_service_no``.
 
@@ -118,7 +119,12 @@ class MessageRouter:
         an ``@fwd``; every onward proxy send stamps ``hops + 1`` so MAX_HOPS
         bounds loops that re-enter the router (a registry disagreement used
         to reset the counter to 0 at every ProxyClient hop).
-        """
+
+        ``raise_on_drop`` propagates through the bus legs (raise_on_drop on
+        ``ZmqBus.send``): a refused enqueue surfaces as ``BusOverflowError``
+        here instead of a silent drop -- callers awaiting a result fail fast
+        instead of timing out. The proxy legs already raise on send failure
+        (ConnectionClosedError / NoProxyAvailableError)."""
         if target_service_no == self._ctx.service_no:
             origin = self._ctx.service_no if from_service is None else from_service
             self._gateway.dispatch(flag, payload, origin)
@@ -129,12 +135,20 @@ class MessageRouter:
             # cross-machine caller of a local sub-process left with the wrong
             # origin and the caller's F-40 target check rejected it (then the
             # 10s timeout fired).
-            self._bus.send(target_service_no, flag, payload, from_service=from_service)
+            self._bus.send(
+                target_service_no,
+                flag,
+                payload,
+                from_service=from_service,
+                raise_on_drop=raise_on_drop,
+            )
             return
         if self._ctx.is_sub_process:
             # F-70: sub-processes have no proxy links; hand the message to the
             # local main process inside an @relay envelope (see below).
-            self._relay_via_main(target_service_no, from_service, flag, payload, hops)
+            self._relay_via_main(
+                target_service_no, from_service, flag, payload, hops, raise_on_drop
+            )
             return
         # On a proxy machine, deliver directly from the local node table first.
         origin = self._ctx.service_no if from_service is None else from_service
@@ -159,6 +173,7 @@ class MessageRouter:
         flag: str,
         payload: bytes,
         hops: int = 0,
+        raise_on_drop: bool = False,
     ) -> None:
         """F-70: send a cross-server message through the local main process.
 
@@ -173,7 +188,7 @@ class MessageRouter:
         envelope = msgpack.packb(
             [target_service_no, origin, flag, payload, hops], use_bin_type=True
         )
-        self._bus.send(self._ctx.main_service_no, RELAY_FLAG, envelope)
+        self._bus.send(self._ctx.main_service_no, RELAY_FLAG, envelope, raise_on_drop=raise_on_drop)
 
     def _on_relay(self, payload: bytes, from_service: int) -> None:
         """Handle an ``@relay`` envelope from a local sub-process (F-70).

@@ -30,6 +30,7 @@ from typing import Any
 
 from pyline.config.models import TableDef
 from pyline.db.mysql import MySQLPool
+from pyline.obs.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,12 @@ class TableSpec:
     name: str
     comment: str = ""
     columns: dict[str, ColumnSpec] = field(default_factory=dict)
+    # ODKU syntax selector, set by SchemaManager after probing the server
+    # version: MySQL >= 8.0.19 deprecates ``VALUES(col)`` in ON DUPLICATE KEY
+    # UPDATE (noisy deprecation warnings on every save); the row-alias form
+    # ``AS _new ... _new.col`` is the replacement. False (legacy VALUES) keeps
+    # 5.7 / <8.0.19 servers working.
+    odku_alias: bool = False
 
     @classmethod
     def from_def(cls, name: str, table_def: TableDef) -> TableSpec:
@@ -200,13 +207,22 @@ class TableSpec:
         pk = self.primary_column().name
         return f"SELECT `{column}` FROM `{self.name}` WHERE `{pk}` = %s"
 
+    def _odku_update(self, column: str) -> str:
+        if self.odku_alias:
+            return f"ON DUPLICATE KEY UPDATE `{column}` = `_new`.`{column}`"
+        return f"ON DUPLICATE KEY UPDATE `{column}` = VALUES(`{column}`)"
+
+    def _row_alias(self) -> str:
+        # MySQL 8.0.19+: the row alias must ride the VALUES clause for the
+        # ODKU assignment to reference it.
+        return "AS `_new` " if self.odku_alias else ""
+
     def upsert_sql(self, column: str) -> str:
         check_identifier(self.name)
         check_identifier(column)
-        pk = self.primary_column().name
         return (
-            f"INSERT INTO `{self.name}` (`{pk}`, `{column}`) VALUES (%s, %s) "
-            f"ON DUPLICATE KEY UPDATE `{column}` = VALUES(`{column}`)"
+            f"INSERT INTO `{self.name}` (`{self.primary_column().name}`, `{column}`) "
+            f"VALUES (%s, %s) {self._row_alias()}{self._odku_update(column)}"
         )
 
     def upsert_many_sql(self, column: str, rows: int) -> str:
@@ -216,11 +232,10 @@ class TableSpec:
         check_identifier(column)
         if rows < 1:
             raise ValueError("rows must be >= 1")
-        pk = self.primary_column().name
         values = ", ".join(["(%s, %s)"] * rows)
         return (
-            f"INSERT INTO `{self.name}` (`{pk}`, `{column}`) VALUES {values} "
-            f"ON DUPLICATE KEY UPDATE `{column}` = VALUES(`{column}`)"
+            f"INSERT INTO `{self.name}` (`{self.primary_column().name}`, `{column}`) "
+            f"VALUES {values} {self._row_alias()}{self._odku_update(column)}"
         )
 
     def insert_row_sql(self) -> str:
@@ -243,30 +258,80 @@ def _parse_type(type_str: str) -> tuple[str, int | None]:
     return name, length
 
 
-# MySQL only opens a ``--`` comment when whitespace (or end-of-line) follows
-# the dashes; that exact shape is cut, so ``--`` glued to an identifier is
-# left alone.
-_LINE_COMMENT_RE = re.compile(r"--(?:\s|$)")
-
-
 def _split_statements(sql_text: str) -> list[str]:
     """Split a migration file into statements on ``;``.
 
-    ``--`` comments (whole lines and trailing after a statement) are stripped
-    BEFORE splitting (F-66): splitting first used to cut a comment containing
-    a semicolon in half and glue its tail onto the next statement.  String
-    literals containing semicolons are still not supported -- migrations are
-    DDL, keep values out of them.
+    F-66 kept ``--`` comment halves from leaking into the next statement; this
+    state-machine pass additionally honours ``'...'`` string literals (with the
+    ``''`` doubling and backslash escape of MySQL's default sql_mode) and
+    ``/* ... */`` block comments, so a semicolon inside a DEFAULT or a seeded
+    value no longer cuts the statement in two. Values in migrations remain
+    discouraged -- this just stops them from silently corrupting the file.
     """
-    no_comments = "\n".join(
-        _LINE_COMMENT_RE.split(line, maxsplit=1)[0] for line in sql_text.splitlines()
-    )
     statements: list[str] = []
-    for chunk in no_comments.split(";"):
-        statement = "\n".join(line for line in chunk.splitlines() if line.strip()).strip()
-        if statement:
-            statements.append(statement)
+    current: list[str] = []
+    in_string = False
+    i = 0
+    n = len(sql_text)
+    while i < n:
+        ch = sql_text[i]
+        if in_string:
+            current.append(ch)
+            if ch == "\\" and i + 1 < n:  # default sql_mode: escaped char
+                current.append(sql_text[i + 1])
+                i += 2
+                continue
+            if ch == "'":
+                if sql_text.startswith("''", i):  # doubled quote stays literal
+                    current.append("'")
+                    i += 2
+                    continue
+                in_string = False
+            i += 1
+            continue
+        if ch == "'":
+            in_string = True
+            current.append(ch)
+            i += 1
+            continue
+        # MySQL only opens a ``--`` comment when whitespace (or end-of-line)
+        # follows the dashes; that exact shape is skipped (F-66).
+        if (
+            ch == "-"
+            and sql_text.startswith("--", i)
+            and (i + 2 >= n or sql_text[i + 2] in " \t\r\n")
+        ):
+            newline = sql_text.find("\n", i)
+            i = n if newline == -1 else newline
+            continue
+        if ch == "/" and sql_text.startswith("/*", i):
+            end = sql_text.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        if ch == ";":
+            statement = _tidy_statement("".join(current))
+            if statement:
+                statements.append(statement)
+            current = []
+            i += 1
+            continue
+        current.append(ch)
+        i += 1
+    tail = _tidy_statement("".join(current))
+    if tail:
+        statements.append(tail)
     return statements
+
+
+def _tidy_statement(statement: str) -> str:
+    return "\n".join(line for line in statement.splitlines() if line.strip()).strip()
+
+
+def _parse_server_version(version: str) -> tuple[int, int, int]:
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version)
+    if match is None:
+        return (0, 0, 0)
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 
 class SchemaManager:
@@ -298,9 +363,36 @@ class SchemaManager:
         """
         async with self._cross_process_lock():
             await self._ensure_database()
+            await self._select_odku_syntax()
             await self._ensure_version_table()
             await self._ensure_tables()
             await self._apply_migrations()
+
+    async def _select_odku_syntax(self) -> None:
+        """Pick the ODKU syntax per server version (see TableSpec.odku_alias).
+
+        A probe failure keeps the legacy ``VALUES()`` form: it still executes
+        on every supported server (deprecated, not removed), so an
+        information-gathering hiccup must not block boot.
+        """
+        try:
+            rows = await self._pool.query("SELECT VERSION()")
+            version = str(rows[0][0]) if rows else ""
+        except Exception:
+            logger.warning(
+                "could not probe mysql version; upserts keep the legacy VALUES() ODKU syntax",
+                exc_info=True,
+            )
+            return
+        use_alias = _parse_server_version(version) >= (8, 0, 19)
+        if use_alias:
+            for spec in self._tables.values():
+                spec.odku_alias = True
+        logger.info(
+            "upsert ODKU syntax: %s (server version %s)",
+            "row alias" if use_alias else "legacy VALUES()",
+            version,
+        )
 
     @contextlib.asynccontextmanager
     async def _cross_process_lock(self) -> AsyncIterator[None]:
@@ -462,15 +554,19 @@ class SchemaManager:
                     done + 1,
                     len(statements),
                 )
-            for index in range(done, len(statements)):
-                statement = statements[index]
-                logger.info("applying migration %s: %s", path.name, statement.splitlines()[0])
-                await self._pool.execute(statement)
-                await self._pool.execute(
-                    f"INSERT INTO `{PROGRESS_TABLE}` (`migration`, `statements`) "
-                    f"VALUES (%s, %s) ON DUPLICATE KEY UPDATE `statements` = %s",
-                    (number, index + 1, index + 1),
-                )
+            try:
+                for index in range(done, len(statements)):
+                    statement = statements[index]
+                    logger.info("applying migration %s: %s", path.name, statement.splitlines()[0])
+                    await self._pool.execute(statement)
+                    await self._pool.execute(
+                        f"INSERT INTO `{PROGRESS_TABLE}` (`migration`, `statements`) "
+                        f"VALUES (%s, %s) ON DUPLICATE KEY UPDATE `statements` = %s",
+                        (number, index + 1, index + 1),
+                    )
+            except Exception:
+                get_metrics().schema_migrations.labels(result="failed").inc()
+                raise
             await self._pool.execute(
                 f"UPDATE `{VERSION_TABLE}` SET `version` = %s WHERE `version` < %s",
                 (number, number),
@@ -478,6 +574,7 @@ class SchemaManager:
             await self._pool.execute(
                 f"DELETE FROM `{PROGRESS_TABLE}` WHERE `migration` = %s", (number,)
             )
+            get_metrics().schema_migrations.labels(result="applied").inc()
             logger.info("applied migration %s (version %d)", path.name, number)
 
     async def _migration_progress(self, number: int) -> int:

@@ -68,6 +68,8 @@ class SchemaFakePool:
         self.get_lock_result = 1
         self.lock_statements: list[tuple[str, tuple]] = []
         self.sessions: list[FakeSchemaLockSession] = []
+        # server version reported to SELECT VERSION() (ODKU syntax probe)
+        self.server_version = "5.7.44"
 
     async def open_session(self) -> FakeSchemaLockSession:
         session = FakeSchemaLockSession(self)
@@ -99,6 +101,8 @@ class SchemaFakePool:
             return [(t,) for t in self.tables]
         if sql.startswith("SELECT `version` FROM `pyline_schema`"):
             return [(self.version,)]
+        if sql == "SELECT VERSION()":
+            return [(self.server_version,)]
         if sql.startswith("SELECT `statements` FROM `pyline_schema_progress`"):
             statements = self.migration_progress.get(args[0])
             return [(statements,)] if statements is not None else []
@@ -482,3 +486,60 @@ class TestMigrationLockF67:
         with pytest.raises(ConnectionError, match="mid-migration"):
             await manager.ensure_all()
         assert pool.sessions[0].released and pool.sessions[0].closed
+
+
+class TestOdkuSyntaxF132:
+    """ON DUPLICATE KEY UPDATE: the deprecated VALUES(col) form switches to
+    the 8.0.19+ row-alias form when the server supports it."""
+
+    def test_alias_form_when_enabled(self) -> None:
+        spec = TableSpec.from_def("tbl_player", make_def())
+        assert "VALUES(`data`)" in spec.upsert_sql("data")
+        spec.odku_alias = True
+        single = spec.upsert_sql("data")
+        many = spec.upsert_many_sql("data", 3)
+        assert "AS `_new`" in single and "`_new`.`data`" in single
+        assert "VALUES(" not in single.replace("VALUES %s", "")
+        assert "AS `_new`" in many and many.count("(%s, %s)") == 3
+
+    async def test_version_probe_selects_syntax(self) -> None:
+        pool = SchemaFakePool(tables={"tbl_player"}, columns={"tbl_player": []}, version=0)
+        pool.server_version = "8.0.34"
+        manager = SchemaManager(pool, {"tbl_player": make_def()}, "test_db")
+        await manager.ensure_all()
+        assert manager.table("tbl_player").odku_alias is True
+
+    async def test_old_server_keeps_legacy_values(self) -> None:
+        pool = SchemaFakePool(tables={"tbl_player"}, columns={"tbl_player": []}, version=0)
+        pool.server_version = "8.0.18"  # alias form lands in 8.0.19
+        manager = SchemaManager(pool, {"tbl_player": make_def()}, "test_db")
+        await manager.ensure_all()
+        assert manager.table("tbl_player").odku_alias is False
+
+
+class TestSplitStatementsStringsF133:
+    """The migration splitter honours string literals and block comments, not
+    just ``--`` lines."""
+
+    def test_semicolon_inside_string_literal(self) -> None:
+        from pyline.db.schema import _split_statements
+
+        stmts = _split_statements(
+            "INSERT INTO t VALUES ('a;b');\n-- comment; with semicolon\n"
+            "UPDATE t SET c = 'it''s;fine';"
+        )
+        assert len(stmts) == 2
+        assert "'a;b'" in stmts[0]
+        assert "it''s;fine" in stmts[1]
+
+    def test_block_comments_stripped(self) -> None:
+        from pyline.db.schema import _split_statements
+
+        stmts = _split_statements("/* header; v2 */ ALTER TABLE t ADD c INT;\n-- tail; note\n")
+        assert stmts == ["ALTER TABLE t ADD c INT"]
+
+    def test_dashes_glued_to_identifier_are_not_a_comment(self) -> None:
+        from pyline.db.schema import _split_statements
+
+        stmts = _split_statements("SELECT a--b FROM t;")
+        assert stmts == ["SELECT a--b FROM t"]

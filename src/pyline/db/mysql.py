@@ -22,6 +22,7 @@ from typing import Any, cast
 import asyncmy
 
 from pyline.config.models import MySQLSettings
+from pyline.obs.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ async def ensure_database(settings: MySQLSettings) -> None:
         password=settings.password.get_secret_value(),
         charset=settings.charset,
         autocommit=True,
+        connect_timeout=5,
     )
     try:
         async with conn.cursor() as cursor:
@@ -107,8 +109,17 @@ class MySQLSession:
             db=s.db_name,
             charset=s.charset,
             autocommit=True,
+            connect_timeout=5,
             read_timeout=s.read_timeout,
         )
+        # The configured isolation level applies here too: this session runs
+        # the remote-transaction unit, i.e. the statements for which the level
+        # matters most -- it used to silently run at the server default
+        # (REPEATABLE READ) while every pooled statement ran at the configured
+        # one. ``isolation_level`` is a Literal whitelist (F-09), so the
+        # interpolation is injection-safe.
+        async with self._conn.cursor() as cursor:
+            await cursor.execute(f"SET SESSION TRANSACTION ISOLATION LEVEL {s.isolation_level}")
 
     async def begin(self) -> None:
         async with self._conn.cursor() as cursor:
@@ -192,6 +203,12 @@ class MySQLPool:
             # it honors -- without it a half-dead server parks every pooled
             # query forever.  Symmetric with the redis socket_timeout fix (F-11).
             read_timeout=s.read_timeout,
+            # Age-based recycling: a pooled connection killed server-side by
+            # ``wait_timeout`` looks alive to the dedicated keepalive socket
+            # (which proves the SERVER, not each pooled conn); recycling keeps
+            # such a connection from failing on first use after every idle
+            # stretch. Keep this below the MySQL wait_timeout.
+            pool_recycle=s.pool_recycle or -1,
         )
         # F-10: heartbeat traffic never competes with business queries for
         # pool slots -- the keepalive runs on its own connection.
@@ -203,6 +220,7 @@ class MySQLPool:
             db=s.db_name,
             charset=s.charset,
             autocommit=True,
+            connect_timeout=5,
             read_timeout=s.read_timeout,
         )
         logger.info("mysql connected: %s:%d/%s", s.host, s.port, s.db_name)
@@ -231,6 +249,7 @@ class MySQLPool:
         try:
             return await asyncio.wait_for(pool.acquire(), timeout=timeout)
         except TimeoutError:
+            get_metrics().mysql_acquire_timeouts.inc()
             raise PoolAcquireTimeoutError(
                 f"no mysql connection free within {timeout:.1f}s "
                 f"(pool for {self._settings.db_name} at "
@@ -410,9 +429,11 @@ class MySQLPool:
         """Dedicated connection; misses are tolerated up to the configured limit."""
         conn = self._keepalive_conn
         s = self._settings
+        metrics = get_metrics()
         misses = 0
         while not self._closed:
             await asyncio.sleep(s.keepalive_interval)
+            self._sample_pool_gauges(metrics)
             healthy = False
             try:
                 async with conn.cursor() as cursor:
@@ -430,6 +451,22 @@ class MySQLPool:
             logger.warning("mysql keepalive missed %d/%d", misses, s.keepalive_miss_limit)
             if misses >= s.keepalive_miss_limit:
                 raise MySQLLostError("mysql connection lost (keepalive)")
+
+    def _sample_pool_gauges(self, metrics: Any) -> None:
+        """Publish pool saturation on the keepalive cadence.
+
+        A pool pinned at max in-use with acquire timeouts rising is THE early
+        signal of a leak or a slow query; without gauges it was log-only."""
+        pool = self._pool
+        if pool is None:
+            return
+        try:
+            size = int(getattr(pool, "size", 0) or 0)
+            free = int(getattr(pool, "freesize", 0) or 0)
+        except Exception:  # pragma: no cover - defensive against driver changes
+            return
+        metrics.mysql_pool_size.set(size)
+        metrics.mysql_pool_in_use.set(max(size - free, 0))
 
     async def close(self) -> None:
         self._closed = True

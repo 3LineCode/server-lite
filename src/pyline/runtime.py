@@ -115,6 +115,7 @@ class ServerRuntime:
             log_dir=Path(ctx.settings.log.log_dir),
             spawn=self._spawn,
             alarms=self.alarms,
+            log_rotation_mb=ctx.settings.log.rotation_mb,
         )
         self.save_scheduler = SaveScheduler(
             on_alarm=lambda kind, payload: self.alarms.emit(kind, payload)
@@ -266,6 +267,7 @@ class ServerRuntime:
             token=self.ctx.settings.socket.token.get_secret_value(),
             handshake_timeout=self.ctx.settings.socket.handshake_timeout,
             max_frame=self.ctx.settings.socket.max_frame_size,
+            preauth_max_frame=self.ctx.settings.socket.preauth_max_frame,
             idle_timeout=self.ctx.settings.socket.idle_timeout,
             send_queue_limit=self.ctx.settings.socket.send_queue_limit,
             send_queue_bytes=self.ctx.settings.socket.send_queue_bytes,
@@ -568,8 +570,16 @@ def main(argv: list[str] | None = None) -> None:
     entry = registry.entry(server_no)
     main_pid = os.getpid()
 
-    # Warm config validation before spawning children (fail fast).
-    load_project_settings(config_dir)
+    # Warm config validation before spawning children (fail fast). Everything
+    # the MAIN process will parse at build_context time is validated here so a
+    # config error surfaces BEFORE children exist -- previously a bad
+    # tables.json5 or clock.tz crashed the main process after the spawn, and
+    # teardown degraded to the children's parent-watch (no flush, exit-code
+    # guarantees lost).
+    warm_settings = load_project_settings(config_dir)
+    load_table_defs(config_dir)
+    if warm_settings.clock.tz:
+        ServerRuntime._build_clock(warm_settings.clock.tz)
 
     if entry.sub_process:
         supervisor = ProcessSupervisor(child_main)
@@ -590,21 +600,22 @@ def main(argv: list[str] | None = None) -> None:
 
         async def main_proc() -> None:
             nonlocal main_runtime
-            ctx = build_context(config_dir, server_no, PROCESS_MAIN, 0, main_pid)
-            pyline_api.bind(ctx)
-            pyline_log.setup_logging(
-                ctx.settings.log,
-                process_tag=PROCESS_MAIN,
-                run_dir=Path(ctx.settings.log.log_dir),
-            )
-            runtime = ServerRuntime(ctx)
-            main_runtime = runtime
-            _install_signal_handlers(runtime)  # F-20: main process too
-            # Watch only after the runtime exists: a child that died while the
-            # main process was still setting up must find a runtime to tear
-            # down, otherwise the main process would run on without it.
-            supervisor.start_child_watch(on_child_died)
+            runtime: ServerRuntime | None = None
             try:
+                ctx = build_context(config_dir, server_no, PROCESS_MAIN, 0, main_pid)
+                pyline_api.bind(ctx)
+                pyline_log.setup_logging(
+                    ctx.settings.log,
+                    process_tag=PROCESS_MAIN,
+                    run_dir=Path(ctx.settings.log.log_dir),
+                )
+                runtime = ServerRuntime(ctx)
+                main_runtime = runtime
+                _install_signal_handlers(runtime)  # F-20: main process too
+                # Watch only after the runtime exists: a child that died while the
+                # main process was still setting up must find a runtime to tear
+                # down, otherwise the main process would run on without it.
+                supervisor.start_child_watch(on_child_died)
                 boot_task = asyncio.get_running_loop().create_task(runtime.boot())
                 try:
                     await boot_task
@@ -613,8 +624,14 @@ def main(argv: list[str] | None = None) -> None:
                 finally:
                     await _settle_shutdown(runtime)
             finally:
-                # Children must die with the main process even when boot fails.
+                # Children must die with the main process even when boot OR THE
+                # PRE-BOOT CONSTRUCTION fails: build_context/ServerRuntime used
+                # to sit outside this guard, so a bad config file discovered
+                # there crashed the main process with live children and no
+                # graceful teardown (the children's parent-watch was the only
+                # backstop -- crash-mode exits, no save flush).
                 await supervisor.terminate_children()
+            assert runtime is not None  # reached only on the success path
             if not runtime.save_flush_ok:
                 raise SystemExit(3)  # dirty data could not be flushed at shutdown
 

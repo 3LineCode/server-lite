@@ -15,6 +15,18 @@ def _fmt_value(value: object) -> str:
 
 def format_exception(exc: BaseException) -> str:
     """Full traceback with per-frame locals and instance attributes."""
+    return _format_exception(exc, set())
+
+
+def _format_exception(exc: BaseException, seen: set[int]) -> str:
+    # F-90c: __cause__ chains can be cyclic (A caused by B caused by A --
+    # easily produced by re-raising in error handlers). Walking it without
+    # a seen set recursed forever; the set holds id()s because exceptions
+    # are unhashable-by-value and identity is exactly what "already
+    # visited" means here.
+    if id(exc) in seen:
+        return f"{type(exc).__name__}: <cycle>"
+    seen = seen | {id(exc)}
     lines: list[str] = [f"{type(exc).__name__}: {exc}"]
     tb = exc.__traceback__
     frames = []
@@ -36,7 +48,7 @@ def format_exception(exc: BaseException) -> str:
     cause = exc.__cause__
     if cause is not None:
         lines.append("caused by:")
-        lines.append(format_exception(cause))
+        lines.append(_format_exception(cause, seen))
     return "\n".join(lines)
 
 

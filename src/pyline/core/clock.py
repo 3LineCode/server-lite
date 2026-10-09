@@ -95,11 +95,33 @@ class GameClock:
         return self.local(ts).hour
 
     def next_halfhour_after(self, ts: float) -> float:
-        """Timestamp of the first :00/:30 boundary STRICTLY after ``ts``."""
-        local = self.local(ts)
-        minute = 30 if local.minute < 30 else 60
-        nxt = local.replace(minute=0, second=0, microsecond=0) + dt.timedelta(minutes=minute)
-        return nxt.timestamp()
+        """Timestamp of the first :00/:30 boundary STRICTLY after ``ts``.
+
+        DST-safe (F-89): wall-clock arithmetic on the local datetime walks
+        across DST edges the wrong way. On a fall-back day ``01:30 + 1h``
+        produces wall 02:00 resolved with the PRE-transition offset,
+        skipping the repeated 01:00/01:30 boundaries that really exist in
+        UTC; on a spring-forward day the nonexistent 02:00/02:30 land on the
+        right instants only by luck of fold resolution. Instead: enumerate
+        the wall grid around ``ts`` (both folds of ambiguous times), map
+        every candidate back to real instants, and take the earliest one
+        strictly after ``ts``. Boundary instants stay 30 real minutes apart
+        across every transition, so the resulting sequence is monotonic
+        with no skipped or duplicated boundaries.
+        """
+        base = self.local(ts).replace(minute=0, second=0, microsecond=0)
+        best: float | None = None
+        # +-hours of wall candidates: a DST shift moves the wall clock by at
+        # most a couple of hours, so this window always contains the next
+        # boundary even when the wall clock jumps in either direction.
+        for minutes in range(-120, 241, 30):
+            candidate = base + dt.timedelta(minutes=minutes)
+            for fold in (0, 1):
+                instant = candidate.replace(fold=fold).timestamp()
+                if instant > ts and (best is None or instant < best):
+                    best = instant
+        assert best is not None, "wall window must contain the next boundary"
+        return best
 
     def next_halfhour_boundary(self) -> tuple[float, int]:
         """Return ``(deadline, hour_at_deadline)`` for the next :00/:30 boundary."""

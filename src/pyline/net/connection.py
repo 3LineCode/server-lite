@@ -24,11 +24,14 @@ import time
 from collections import deque
 from collections.abc import Callable
 
+from prometheus_client import Counter
+
 from pyline.net.protocol import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_FRAME,
     Frame,
     FrameDecoder,
+    ProtocolError,
     encode_message,
 )
 from pyline.obs.metrics import get_metrics
@@ -46,6 +49,21 @@ MessageCallback = Callable[[str, bytes], None]
 # but a peer spraying malformed messages must not turn that into a log flood.
 DISPATCH_ERROR_LIMIT = 10
 DISPATCH_ERROR_WINDOW = 1.0
+
+# F-72: connection attempts refused by the accept-path caps. Declared here
+# rather than obs.metrics because this module must stay independently
+# importable; the pyline_* namespace is shared.
+_CONNECTIONS_REJECTED = Counter(
+    "pyline_connections_rejected_total",
+    "Incoming connections refused by the global/per-IP accept caps",
+    ("reason",),
+)
+
+# F-72: defaults mirror SocketSettings.max_connections / .max_connections_per_ip
+# so a caller that passes nothing (e.g. today's runtime wiring) still gets the
+# documented caps enforced.
+DEFAULT_MAX_CONNECTIONS = 4096
+DEFAULT_MAX_CONNECTIONS_PER_IP = 256
 
 
 class ConnectionClosedError(ConnectionError):
@@ -82,6 +100,8 @@ class Connection:
         self._handshake_timeout = handshake_timeout
         self._idle_timeout = idle_timeout
         self._chunk_size = chunk_size
+        # F-71: kept for the send-side reassembled-size check.
+        self._max_frame = max_frame
         self._on_message = on_message
         self._on_verified = on_verified
         self._decoder = FrameDecoder(max_frame=max_frame)
@@ -100,8 +120,25 @@ class Connection:
         self._error_times: deque[float] = deque()
         self._write_failed = False
         self._closing = False
+        # F-78: strong references to fire-and-forget close() tasks. A bare
+        # create_task result can be garbage-collected mid-run (the library's
+        # own F-20 discipline); a lost close task used to leave the socket
+        # open until the idle timeout.
+        self._bg_close_tasks: set[asyncio.Task[None]] = set()
         self._metrics = get_metrics()
         self._metrics.connections.inc()
+
+    def _spawn_close(self, reason: str) -> None:
+        """Schedule close() and keep the reference (F-78)."""
+        task = asyncio.get_running_loop().create_task(self.close(reason))
+        self._bg_close_tasks.add(task)
+
+        def _done(t: asyncio.Task[None]) -> None:
+            self._bg_close_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                logger.error("deferred close of %s failed: %r", self, t.exception())
+
+        task.add_done_callback(_done)
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -161,7 +198,7 @@ class Connection:
                             logger.exception("on_verified hook failed for %s", self)
                     return True
                 logger.warning("rejecting unauthenticated frame %r from %s", frame.flag, self)
-                asyncio.get_running_loop().create_task(self.close("handshake rejected"))
+                self._spawn_close("handshake rejected")
                 return False
             if frame.flag == WELCOME_FLAG:
                 self.verified = True
@@ -198,7 +235,7 @@ class Connection:
                 self._dispatch_errors,
             )
             if len(self._error_times) >= DISPATCH_ERROR_LIMIT:
-                asyncio.get_running_loop().create_task(self.close("dispatch error storm"))
+                self._spawn_close("dispatch error storm")
                 return False
         return True
 
@@ -262,18 +299,29 @@ class Connection:
     def send_message(self, flag: str, payload: bytes) -> None:
         """Queue one message (non-blocking). Raises ConnectionClosedError if
         the connection is closed (or closing) or the peer consumes too slowly
-        (send queue full by message count or queued bytes)."""
+        (send queue full by message count or queued bytes). Raises
+        ProtocolError if the payload alone exceeds ``max_frame`` (F-71)."""
         if self.closed or self._closing:
             raise ConnectionClosedError(f"connection {self} closed ({self.close_reason})")
+        # F-71: fail BEFORE encoding. Every individual chunk of an oversized
+        # message is a legal frame inside the byte budget, so the old path
+        # happily streamed it -- the peer then accumulated the chunks until
+        # its 16 MiB reassembly cap killed the connection minutes later (or
+        # never, for chunk sizes above the cap). The reassembled size is just
+        # len(payload); rejecting here turns a delayed disconnect into an
+        # immediate, local error.
+        if len(payload) > self._max_frame:
+            raise ProtocolError(
+                f"payload of {len(payload)} bytes exceeds max frame size "
+                f"{self._max_frame}; refusing to send"
+            )
         frames = encode_message(flag, payload, chunk_size=self._chunk_size)
         # F-21: budget check on the encoded wire size (frames include headers)
         # before anything is queued -- the same close-and-raise path as the
         # count-based limit below.
         frame_bytes = sum(len(chunk) for chunk in frames)
         if self._queued_bytes + frame_bytes > self._send_queue_bytes:
-            asyncio.get_running_loop().create_task(
-                self.close(f"send queue overflow (bytes > {self._send_queue_bytes})")
-            )
+            self._spawn_close(f"send queue overflow (bytes > {self._send_queue_bytes})")
             raise ConnectionClosedError(
                 f"send queue bytes exceeded for {self}; closing "
                 f"(queued={self._queued_bytes}, message={frame_bytes})"
@@ -281,7 +329,7 @@ class Connection:
         try:
             self._send_queue.put_nowait(frames)
         except asyncio.QueueFull:
-            asyncio.get_running_loop().create_task(self.close("send queue overflow"))
+            self._spawn_close("send queue overflow")
             raise ConnectionClosedError(f"send queue full for {self}; closing") from None
         self._queued_bytes += frame_bytes
 
@@ -359,6 +407,43 @@ async def open_connection(
     return conn
 
 
+class _ConnectionLimiter:
+    """F-72: global + per-peer-IP accept caps for one listening server.
+
+    Each accepted socket costs a file descriptor, three tasks and up to
+    ``max_frame`` of decode buffer BEFORE the token handshake proves the
+    peer is legitimate -- unbounded accepts are therefore a cheap resource
+    exhaustion attack. Slots are taken at accept time (not after handshake)
+    and returned from the connection's close hook, which every Connection
+    runs exactly once via its read loop's finally.
+    """
+
+    def __init__(self, max_connections: int, max_per_ip: int) -> None:
+        self._max = max_connections
+        self._max_per_ip = max_per_ip
+        self._active = 0
+        self._per_ip: dict[str, int] = {}
+
+    def try_acquire(self, ip: str) -> str | None:
+        """Reserve a slot for ``ip``; returns the rejection reason or None."""
+        if self._max > 0 and self._active >= self._max:
+            return "global"
+        if self._max_per_ip > 0 and self._per_ip.get(ip, 0) >= self._max_per_ip:
+            return "per_ip"
+        self._active += 1
+        self._per_ip[ip] = self._per_ip.get(ip, 0) + 1
+        return None
+
+    def release(self, ip: str) -> None:
+        count = self._per_ip.get(ip)
+        if count is not None:
+            if count <= 1:
+                self._per_ip.pop(ip, None)
+            else:
+                self._per_ip[ip] = count - 1
+        self._active = max(self._active - 1, 0)
+
+
 async def serve(
     host: str,
     port: int,
@@ -366,12 +451,37 @@ async def serve(
     token: str,
     on_message: MessageCallback,
     on_connected: Callable[[Connection], None],
+    max_connections: int = DEFAULT_MAX_CONNECTIONS,
+    max_connections_per_ip: int = DEFAULT_MAX_CONNECTIONS_PER_IP,
     **kwargs: object,
 ) -> asyncio.AbstractServer:
-    """Listen for verified connections; ``on_connected`` fires post-handshake."""
+    """Listen for verified connections; ``on_connected`` fires post-handshake.
+
+    F-72: connections beyond ``max_connections`` (global) or
+    ``max_connections_per_ip`` (same peer IP) are refused at accept time and
+    counted in ``pyline_connections_rejected_total{reason}``. The defaults
+    mirror SocketSettings; pass explicit values to tighten them (the runtime
+    does not forward the settings yet -- its defaults coincide with these)."""
+
+    limiter = _ConnectionLimiter(max_connections, max_connections_per_ip)
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername") or ("?", 0)
+        reason = limiter.try_acquire(peer[0])
+        if reason is not None:
+            # No Connection is created: no tasks, no decode buffer, no token
+            # comparison -- the socket is dropped immediately.
+            _CONNECTIONS_REJECTED.labels(reason=reason).inc()
+            logger.warning(
+                "refusing connection from %s:%s (%s cap reached)",
+                peer[0],
+                peer[1],
+                "per-IP" if reason == "per_ip" else "global",
+            )
+            writer.close()
+            with contextlib.suppress(Exception, TimeoutError):
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+            return
 
         def verified_hook(conn: Connection) -> None:
             on_connected(conn)
@@ -386,6 +496,11 @@ async def serve(
             on_verified=verified_hook,
             **kwargs,  # type: ignore[arg-type]
         )
+
+        def release_slot(_conn: Connection, ip: str = peer[0]) -> None:
+            limiter.release(ip)
+
+        conn.add_close_hook(release_slot)
         await conn.start()
 
     return await asyncio.start_server(handle, host, port)

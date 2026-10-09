@@ -4,7 +4,7 @@ and the Redis family, with async semantics instead of callbacks)."""
 from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
-from typing import Any, cast
+from typing import Any
 
 from pyline import api
 from pyline.db.service import DatabaseAccess
@@ -31,7 +31,9 @@ __all__ = [
 
 
 def _db() -> DatabaseAccess:
-    return cast(DatabaseAccess, api.service("db"))
+    # F-87: typed bag access -- presence and type are checked at the
+    # boundary instead of cast()ing and failing at first attribute use.
+    return api.ctx().service("db", DatabaseAccess)
 
 
 def transaction() -> AbstractAsyncContextManager[TransactionExecutor]:

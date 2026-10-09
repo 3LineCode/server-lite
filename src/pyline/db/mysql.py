@@ -41,7 +41,7 @@ async def ensure_database(settings: MySQLSettings) -> None:
         host=settings.host,
         port=settings.port,
         user=settings.user,
-        password=settings.password,
+        password=settings.password.get_secret_value(),
         charset=settings.charset,
         autocommit=True,
     )
@@ -61,6 +61,10 @@ class MySQLError(Exception):
 
 class MySQLLostError(MySQLError):
     """Keepalive missed its limit; the pool is considered dead."""
+
+
+class PoolAcquireTimeoutError(MySQLError):
+    """F-62: no free connection within ``settings.mysql.acquire_timeout``."""
 
 
 class _TxSession:
@@ -99,7 +103,7 @@ class MySQLSession:
             host=s.host,
             port=s.port,
             user=s.user,
-            password=s.password,
+            password=s.password.get_secret_value(),
             db=s.db_name,
             charset=s.charset,
             autocommit=True,
@@ -176,7 +180,7 @@ class MySQLPool:
             host=s.host,
             port=s.port,
             user=s.user,
-            password=s.password,
+            password=s.password.get_secret_value(),
             db=s.db_name,
             charset=s.charset,
             minsize=s.min_conn,
@@ -195,7 +199,7 @@ class MySQLPool:
             host=s.host,
             port=s.port,
             user=s.user,
-            password=s.password,
+            password=s.password.get_secret_value(),
             db=s.db_name,
             charset=s.charset,
             autocommit=True,
@@ -213,10 +217,37 @@ class MySQLPool:
         rows = cast(list[tuple[Any, ...]], await self._run("query", sql, args))
         return [tuple(row) for row in rows]
 
-    async def _run(self, mode: str, sql: str, args: Sequence[Any]) -> object:
+    def _require_pool(self) -> asyncmy.Pool:
         if self._pool is None or self._closed:
             raise MySQLError("mysql pool is not connected")
-        async with self._pool.acquire() as conn:
+        return self._pool
+
+    async def _acquire(self, pool: asyncmy.Pool) -> Any:
+        """F-62: bound the pool wait.  ``pool.acquire()`` itself waits
+        forever; a half-dead server used to park every caller past
+        ``max_conn`` indefinitely -- the (maxsize+1)-th caller never got a
+        socket error, only silence."""
+        timeout = self._settings.acquire_timeout
+        try:
+            return await asyncio.wait_for(pool.acquire(), timeout=timeout)
+        except TimeoutError:
+            raise PoolAcquireTimeoutError(
+                f"no mysql connection free within {timeout:.1f}s "
+                f"(pool for {self._settings.db_name} at "
+                f"{self._settings.host}:{self._settings.port})"
+            ) from None
+
+    async def _release(self, pool: asyncmy.Pool, conn: Any) -> None:
+        # asyncmy's release() is not a coroutine but returns an awaitable
+        # wakeup task.  A closed connection, or one still inside a
+        # transaction, is dropped by the pool instead of being recycled --
+        # relied on by the F-68 discard path.
+        await pool.release(conn)
+
+    async def _run(self, mode: str, sql: str, args: Sequence[Any]) -> object:
+        pool = self._require_pool()
+        conn = await self._acquire(pool)
+        try:
             await self._ensure_isolation(conn)
             async with conn.cursor() as cursor:
                 await cursor.execute(sql, tuple(args))
@@ -224,6 +255,8 @@ class MySQLPool:
                     return [tuple(row) for row in await cursor.fetchall()]
                 await conn.commit()
                 return cursor.rowcount
+        finally:
+            await self._release(pool, conn)
 
     @contextlib.asynccontextmanager
     async def transaction(self) -> AsyncIterator[_TxSession]:
@@ -233,25 +266,47 @@ class MySQLPool:
         afterwards; an exception body-side rolls back before propagating, and
         a failed COMMIT also attempts a rollback so the connection cannot go
         back into the pool with an open transaction.
+
+        F-62: the acquisition itself is bounded by ``acquire_timeout``.
+        F-68: when COMMIT *and* the rescue ROLLBACK both fail, the
+        connection's transaction state is unknowable -- it is closed outright
+        instead of being handed back to the pool.
         """
-        if self._pool is None or self._closed:
-            raise MySQLError("mysql pool is not connected")
-        async with self._pool.acquire() as conn:
+        pool = self._require_pool()
+        conn = await self._acquire(pool)
+        discard = False
+        try:
             await self._ensure_isolation(conn)
             session = _TxSession(conn)
             await session.execute("BEGIN")
             try:
                 yield session
             except BaseException:
-                with contextlib.suppress(Exception):
-                    await session.execute("ROLLBACK")
+                discard = not await self._rescue_rollback(session)
                 raise
             try:
                 await session.execute("COMMIT")
             except BaseException:
-                with contextlib.suppress(Exception):
-                    await session.execute("ROLLBACK")
+                discard = not await self._rescue_rollback(session)
                 raise
+        finally:
+            if discard:
+                # F-68: never recycle a connection whose unit broke in an
+                # unknown state; closing it first makes the pool's release
+                # drop it (and open a replacement) instead of reusing it.
+                with contextlib.suppress(Exception):
+                    await conn.ensure_closed()
+            await self._release(pool, conn)
+
+    @staticmethod
+    async def _rescue_rollback(session: _TxSession) -> bool:
+        """Best-effort rollback of a broken unit; False when it also failed
+        (the caller must then discard the connection, F-68)."""
+        try:
+            await session.execute("ROLLBACK")
+        except BaseException:
+            return False
+        return True
 
     async def open_session(self) -> MySQLSession:
         """Open a dedicated transaction session (F-43); see :class:`MySQLSession`."""

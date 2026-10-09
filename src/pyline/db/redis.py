@@ -26,7 +26,7 @@ class RedisClient:
         self._client = aioredis.Redis(
             host=s.host,
             port=s.port,
-            password=s.password,
+            password=s.password.get_secret_value() if s.password else None,
             db=s.db_index,
             max_connections=s.conn_cnt,
             decode_responses=True,

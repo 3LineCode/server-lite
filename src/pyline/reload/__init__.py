@@ -18,6 +18,9 @@ rollback on failure) and hardened with the F-29 three-layer defence:
 Documented, deliberate restrictions (inherited from the prototype's own
 field notes):
 
+* Only already-imported modules can be reloaded: ``reload_module`` rejects a
+  name that is not in ``sys.modules`` instead of importing it (F-96 -- the
+  watcher used to auto-execute stray files' side effects inside the server).
 * Do not change a class's inheritance -- restart the process instead.
 * Do not change a function's closure/free-variable layout. Closure *captured
   values* are preserved across reloads (never re-bound to new values).

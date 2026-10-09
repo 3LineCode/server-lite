@@ -157,6 +157,178 @@ class TestSendQueueBytesF21:
         await conn_mod.close_server(server)
 
 
+class TestSendSideFrameCapF71:
+    async def test_oversized_payload_rejected_immediately(self) -> None:
+        """F-71: a payload larger than max_frame raises on the SEND side
+        before any byte hits the wire. Each chunk used to be a legal frame
+        inside the byte budget, so the stream went out and only the peer's
+        16 MiB reassembly cap caught it -- minutes later, as a disconnect."""
+        from pyline.net.protocol import ProtocolError
+
+        got: dict = {}
+        server, port = await start_echo_server(got)
+        client = await conn_mod.open_connection(
+            "127.0.0.1",
+            port,
+            token=TOKEN,
+            on_message=lambda f, p: None,
+            max_frame=64 * 1024,
+            chunk_size=1024,  # every chunk individually tiny and legal
+            **KW,
+        )
+        await asyncio.sleep(0.1)
+        with pytest.raises(ProtocolError, match="max frame"):
+            client.send_message("flood", b"x" * (64 * 1024 + 1))
+        # nothing was queued: the connection itself is untouched
+        assert not client.closed
+        client.send_message("chat", b"still-fine")
+        await asyncio.sleep(0.2)
+        assert got.get("chat") == [b"still-fine"]
+        await client.close("done")
+        await conn_mod.close_server(server)
+
+    async def test_exact_max_frame_is_allowed(self) -> None:
+        """F-71 boundary sanity: a payload of exactly max_frame passes (the
+        decoder accepts a reassembled message of exactly max_frame)."""
+        got: dict = {}
+        server, port = await start_echo_server(got)
+        client = await conn_mod.open_connection(
+            "127.0.0.1",
+            port,
+            token=TOKEN,
+            on_message=lambda f, p: None,
+            max_frame=8 * 1024,
+            chunk_size=1024,
+            **KW,
+        )
+        await asyncio.sleep(0.1)
+        blob = b"y" * (8 * 1024)
+        client.send_message("big", blob)
+        await asyncio.sleep(0.3)
+        assert got.get("big") == [blob]
+        await client.close("done")
+        await conn_mod.close_server(server)
+
+
+class TestConnectionCapsF72:
+    async def test_global_cap_rejects_beyond_limit(self) -> None:
+        """F-72: with a 2-connection cap the third accept is refused
+        pre-handshake (no tasks, no decode buffer) and counted."""
+        from prometheus_client import REGISTRY
+
+        conns: list[conn_mod.Connection] = []
+        server = await conn_mod.serve(
+            "127.0.0.1",
+            0,
+            token=TOKEN,
+            on_message=lambda f, p: None,
+            on_connected=lambda c: None,
+            max_connections=2,
+            **KW,
+        )
+        port = server.sockets[0].getsockname()[1]
+        before = (
+            REGISTRY.get_sample_value("pyline_connections_rejected_total", {"reason": "global"})
+            or 0.0
+        )
+        try:
+            for _ in range(2):
+                conns.append(
+                    await conn_mod.open_connection(
+                        "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
+                    )
+                )
+            await asyncio.sleep(0.1)
+            assert all(c.verified for c in conns)
+
+            third = await conn_mod.open_connection(
+                "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
+            )
+            for _ in range(60):
+                if third.closed:
+                    break
+                await asyncio.sleep(0.05)
+            assert third.closed, "connection beyond the global cap was accepted"
+            after = (
+                REGISTRY.get_sample_value("pyline_connections_rejected_total", {"reason": "global"})
+                or 0.0
+            )
+            assert after == before + 1
+            # the first two are unaffected
+            assert all(not c.closed for c in conns)
+        finally:
+            for conn in conns:
+                await conn.close("done")
+            await third.close("done")
+            await conn_mod.close_server(server)
+
+    async def test_per_ip_cap_rejects_second_from_same_ip(self) -> None:
+        """F-72: the per-IP cap fires while the global cap is still far away
+        (one connection allowed total, two per IP)."""
+        server = await conn_mod.serve(
+            "127.0.0.1",
+            0,
+            token=TOKEN,
+            on_message=lambda f, p: None,
+            on_connected=lambda c: None,
+            max_connections=10,
+            max_connections_per_ip=1,
+            **KW,
+        )
+        port = server.sockets[0].getsockname()[1]
+        first = third = None
+        try:
+            first = await conn_mod.open_connection(
+                "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
+            )
+            await asyncio.sleep(0.1)
+            assert first.verified
+            third = await conn_mod.open_connection(
+                "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
+            )
+            for _ in range(60):
+                if third.closed:
+                    break
+                await asyncio.sleep(0.05)
+            assert third.closed, "second connection from the same IP was accepted"
+            assert not first.closed
+        finally:
+            if first is not None:
+                await first.close("done")
+            if third is not None:
+                await third.close("done")
+            await conn_mod.close_server(server)
+
+    async def test_slot_released_on_close_allows_reconnect(self) -> None:
+        """F-72: the cap counts live connections, not lifetime accepts -- a
+        closed connection returns its slot via the close hook."""
+        server = await conn_mod.serve(
+            "127.0.0.1",
+            0,
+            token=TOKEN,
+            on_message=lambda f, p: None,
+            on_connected=lambda c: None,
+            max_connections=1,
+            **KW,
+        )
+        port = server.sockets[0].getsockname()[1]
+        try:
+            first = await conn_mod.open_connection(
+                "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
+            )
+            await asyncio.sleep(0.05)
+            await first.close("done")
+            await asyncio.sleep(0.1)
+            second = await conn_mod.open_connection(
+                "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
+            )
+            await asyncio.sleep(0.1)
+            assert second.verified, "slot was not returned after close"
+            await second.close("done")
+        finally:
+            await conn_mod.close_server(server)
+
+
 class TestAuthCompareF22:
     async def test_near_miss_tokens_rejected(self) -> None:
         """F-22: constant-time comparison must still reject wrong tokens --

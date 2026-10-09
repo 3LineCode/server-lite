@@ -42,13 +42,14 @@ from pyline.obs.metrics import get_metrics  # noqa: E402
 # is enforced separately at swap time, so old cells stay self-consistent with
 # the swapped code. Closure *captured values* are therefore preserved across
 # reloads, never updated (see docs/hot-reload.md).
+# ``__dict__`` is also absent: it is merged instead of swapped (see
+# _update_function, F-100) so runtime-attached function attributes survive.
 _FUNC_ATTRS = (
     "__code__",
     "__defaults__",
     "__kwdefaults__",
     "__annotations__",
     "__doc__",
-    "__dict__",
 )
 
 _RELOADING: set[str] = set()
@@ -80,7 +81,12 @@ def reload_module(module_name: str) -> types.ModuleType:
     """Reload ``module_name`` in place, preserving object identity."""
     module = sys.modules.get(module_name)
     if module is None:
-        module = importlib_import(module_name)
+        # F-96: the watcher used to auto-import unknown modules, so saving
+        # any stray .py file (a test, a build script) EXECUTED its import
+        # side effects inside the live server. A reload is only meaningful
+        # for code the server already runs; everything else must be imported
+        # explicitly first.
+        raise ReloadRejected(f"module {module_name!r} is not loaded; import it explicitly first")
     if module_name in _RELOADING:
         logger.debug("nested reload of %s ignored", module_name)
         return module
@@ -117,12 +123,6 @@ def reload_module(module_name: str) -> types.ModuleType:
     finally:
         _RELOADING.discard(module_name)
     return module
-
-
-def importlib_import(module_name: str) -> types.ModuleType:
-    import importlib
-
-    return importlib.import_module(module_name)
 
 
 def _read_and_parse(module: types.ModuleType) -> tuple[bytes, ast.Module]:
@@ -166,6 +166,10 @@ class _FnSpec:
 @dataclass(slots=True)
 class _ClassInfo:
     bases: list[str] = field(default_factory=list)
+    # F-100: module-qualified base keys parallel to ``bases``; ``None`` marks
+    # a base that cannot be resolved statically (the caller then falls back
+    # to the legacy bare-name comparison for that base only).
+    base_keys: list[str | None] = field(default_factory=list)
     functions: dict[str, _FnSpec] = field(default_factory=dict)
     has_slots: bool = False
     slot_names: frozenset[str] = frozenset()
@@ -173,15 +177,86 @@ class _ClassInfo:
     identity_dunders: frozenset[str] = frozenset()
 
 
+def _import_bindings(tree: ast.Module, module_name: str) -> dict[str, str]:
+    """Static ``bound name -> dotted object path`` map for top-level imports.
+
+    ``from m import n as k`` -> ``k: "m.n"``; ``import a.b as c`` ->
+    ``c: "a.b"``; ``import a.b`` -> ``a: "a"`` (the top package binds).
+    Relative imports resolve against ``module_name``'s package."""
+    package = module_name.rsplit(".", 1)[0] if "." in module_name else ""
+    bindings: dict[str, str] = {}
+
+    def _resolve_relative(level: int, tail: str) -> str:
+        # level 1 = the containing package, each extra level steps up.
+        parts = package.split(".") if package else []
+        if level > 1:
+            steps = level - 1
+            parts = parts[: len(parts) - steps] if steps <= len(parts) else []
+        prefix = ".".join(parts)
+        if tail and prefix:
+            return f"{prefix}.{tail}"
+        return tail or prefix
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.ImportFrom):
+            src = stmt.module or ""
+            if stmt.level:
+                src = _resolve_relative(stmt.level, src)
+            for alias in stmt.names:
+                bound = alias.asname or alias.name
+                bindings[bound] = f"{src}.{alias.name}" if src else alias.name
+        elif isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                if alias.asname:
+                    bindings[alias.asname] = alias.name
+                else:
+                    top = alias.name.split(".")[0]
+                    bindings[top] = top
+    return bindings
+
+
 def _base_name(expr: ast.expr) -> str:
-    """Comparable name for a base-class expression: ``list[int]`` and
-    ``module.Base`` must compare equal to their runtime ``__qualname__``
-    (``list`` / ``Base``), or every subscripted/dotted base is a false reject."""
+    """Display name for a base-class expression (``list[int]`` -> ``list``,
+    ``module.Base`` -> ``Base``) -- used in rejection messages and as the
+    legacy fallback comparison key."""
     if isinstance(expr, ast.Subscript):
         expr = expr.value
     if isinstance(expr, ast.Attribute):
         return expr.attr
     return ast.unparse(expr)
+
+
+def _base_key(expr: ast.expr, imports: dict[str, str], module: types.ModuleType) -> str | None:
+    """Module-qualified comparison key for one base expression, or ``None``
+    when the name cannot be resolved statically.
+
+    F-100: the legacy bare-name comparison accepted swapping a base for a
+    same-named class from a DIFFERENT module (``from other1 import Base`` ->
+    ``from other2 import Base``): validation passed, but _update_class never
+    re-points ``__bases__``, so the live class silently kept the OLD base
+    while the source advertised the new one. Resolvable names now compare by
+    ``module.qualname``; unresolvable ones keep the old bare-name semantics
+    so typing tricks (``Generic[T]``) are not false-rejected."""
+    if isinstance(expr, ast.Subscript):
+        expr = expr.value
+    if isinstance(expr, ast.Attribute):
+        parts = ast.unparse(expr).split(".")
+        if parts[0] in imports:
+            parts[0] = imports[parts[0]]
+        return ".".join(parts)
+    if isinstance(expr, ast.Name):
+        name = expr.id
+        if name in imports:
+            return imports[name]
+        existing = module.__dict__.get(name)
+        if isinstance(existing, type) and existing.__module__ == module.__name__:
+            return f"{module.__name__}.{name}"
+        import builtins
+
+        if hasattr(builtins, name):
+            return name
+        return None
+    return None  # calls / complex expressions: legacy fallback
 
 
 def _slots_names(value: ast.expr) -> tuple[frozenset[str], bool]:
@@ -243,10 +318,16 @@ def _fn_node_spec(node: ast.FunctionDef | ast.AsyncFunctionDef) -> _FnSpec:
     return _spec_from_arguments(node.args)
 
 
-def _class_info(node: ast.ClassDef) -> _ClassInfo:
+def _class_info(
+    node: ast.ClassDef, imports: dict[str, str], module: types.ModuleType
+) -> _ClassInfo:
     # ``class X:`` has no explicit bases but __bases__ == (object,)
     bases = [_base_name(b) for b in node.bases] or ["object"]
-    info = _ClassInfo(bases=bases)
+    base_exprs: list[ast.expr] = list(node.bases) or [ast.Name(id="object", ctx=ast.Load())]
+    info = _ClassInfo(
+        bases=bases,
+        base_keys=[_base_key(b, imports, module) for b in base_exprs],
+    )
     for stmt in node.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             info.functions[stmt.name] = _fn_node_spec(stmt)
@@ -264,7 +345,9 @@ def _class_info(node: ast.ClassDef) -> _ClassInfo:
     return info
 
 
-def _ast_summary(tree: ast.Module) -> dict[str, tuple[str, object]]:
+def _ast_summary(
+    tree: ast.Module, imports: dict[str, str], module: types.ModuleType
+) -> dict[str, tuple[str, object]]:
     """name -> ("function", _FnSpec) | ("class", _ClassInfo) | ("value", None).
 
     Assignments are reported as plain values: their runtime kind is unknown
@@ -275,7 +358,7 @@ def _ast_summary(tree: ast.Module) -> dict[str, tuple[str, object]]:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             summary[stmt.name] = ("function", _fn_node_spec(stmt))
         elif isinstance(stmt, ast.ClassDef):
-            summary[stmt.name] = ("class", _class_info(stmt))
+            summary[stmt.name] = ("class", _class_info(stmt, imports, module))
         elif isinstance(stmt, ast.Assign):
             for target in stmt.targets:
                 if isinstance(target, ast.Name):
@@ -287,7 +370,8 @@ def _ast_summary(tree: ast.Module) -> dict[str, tuple[str, object]]:
 
 def _validate_structure(old: types.ModuleType, tree: ast.Module) -> None:
     problems: list[str] = []
-    summary = _ast_summary(tree)
+    imports = _import_bindings(tree, old.__name__)
+    summary = _ast_summary(tree, imports, old)
     for name, old_obj in old.__dict__.items():
         # No dunder skip here (F-41): non-owned machinery (__builtins__,
         # __loader__, ...) is filtered by the __module__ ownership check below,
@@ -338,10 +422,40 @@ def _runtime_slot_names(cls: type) -> frozenset[str]:
     return frozenset(s for s in decl if isinstance(s, str))
 
 
+def _runtime_base_keys(cls: type) -> list[tuple[str, str]]:
+    """``(bare qualname, module-qualified)`` pair per runtime base class."""
+    return [
+        (
+            b.__qualname__,
+            b.__qualname__ if b.__module__ == "builtins" else f"{b.__module__}.{b.__qualname__}",
+        )
+        for b in cls.__bases__
+    ]
+
+
 def _check_class(name: str, old: type, info: _ClassInfo, problems: list[str]) -> None:
-    old_bases = [b.__qualname__ for b in old.__bases__]
-    if old_bases != info.bases:
-        problems.append(f"{name}: inheritance changed {old_bases} -> {info.bases}")
+    old_pairs = _runtime_base_keys(old)
+    if len(old_pairs) != len(info.bases):
+        problems.append(f"{name}: inheritance changed {info.bases} (base count differs)")
+    else:
+        for (bare, qualified), new_key, new_display in zip(
+            old_pairs, info.base_keys, info.bases, strict=True
+        ):
+            # F-100: resolvable AST bases compare module-qualified (catches
+            # the same-name different-module swap); unresolvable ones fall
+            # back to the legacy bare-name comparison.
+            if new_key is None:
+                if new_display != bare:
+                    problems.append(
+                        f"{name}: inheritance changed {[b for b, _ in old_pairs]} -> {info.bases}"
+                    )
+                    break
+            elif new_key != qualified:
+                problems.append(
+                    f"{name}: inheritance changed {[q for _, q in old_pairs]} -> "
+                    f"{[k if k is not None else d for k, d in zip(info.base_keys, info.bases, strict=True)]}"
+                )
+                break
     # Own ``__slots__`` only: hasattr() would also see inherited slots and
     # falsely reject every slot-less subclass of a slotted parent.
     old_has_slots = "__slots__" in old.__dict__
@@ -434,8 +548,15 @@ def _update_module(module: types.ModuleType, cache: ModCache) -> ReloadedClass:
     """
     class_map = ReloadedClass()
     for name, old_obj in cache.snapshot().items():
-        if name.startswith("__"):
-            continue  # module dunders (__name__, __loader__...) belong to importlib
+        if name.startswith("__") and name.endswith("__") and len(name) > 4:
+            # Real dunders (__name__, __loader__, __all__, __getattr__...)
+            # belong to importlib or are source metadata -- the fresh exec
+            # result stays. F-100: a leading-``__`` private WITHOUT the
+            # trailing dunder (``__flag``) is ordinary module state and now
+            # flows through the same runtime-state preservation below
+            # (it used to be excluded wholesale and silently reset on every
+            # reload, unlike any other plain value).
+            continue
         new_obj = module.__dict__.get(name)
         if new_obj is None or new_obj is old_obj:
             continue  # deleted in new version, or untouched by the reload
@@ -500,9 +621,29 @@ def _update_function(old_func: types.FunctionType, new_func: types.FunctionType)
     for attr in _FUNC_ATTRS:
         with contextlib.suppress(AttributeError, TypeError):
             setattr(old_func, attr, getattr(new_func, attr))
+    # F-100: ``__dict__`` holds runtime-attached state (caches, memo flags,
+    # registration marks) that the module-level policy never clobbers for
+    # plain values -- a wholesale swap dropped it on every reload, silently
+    # un-caching/de-registering the function. Merge instead: def-time
+    # attributes of the NEW function only fill in keys the old one never
+    # had; anything attached at runtime always wins.
+    for key, value in new_func.__dict__.items():
+        old_func.__dict__.setdefault(key, value)
 
 
 def _update_class(old_cls: type, new_cls: type, class_map: ReloadedClass) -> None:
+    if type(old_cls) is not type(new_cls):
+        # F-100: metaclass changes were silently ignored -- the class-dict
+        # diff below never touches ``__class__``, so the live class kept its
+        # old metaclass while the source advertised the new one (every
+        # enum/ABC trick built on it then misbehaved). In-place swapping a
+        # metaclass is not possible; reject explicitly (rolled back like any
+        # other reload failure).
+        raise ReloadRejected(
+            f"{old_cls.__qualname__}: metaclass changed "
+            f"{type(old_cls).__module__}.{type(old_cls).__qualname__} -> "
+            f"{type(new_cls).__module__}.{type(new_cls).__qualname__} (restart required)"
+        )
     class_map[old_cls] = new_cls
     raw_keep = getattr(old_cls, "__reloadkeep__", ())
     # tuple/list form lists kept attribute names; a bare True (value-level
@@ -603,15 +744,21 @@ class ModCache:
         self._func_snapshots: dict[int, tuple[types.FunctionType, tuple[object, ...]]] = {}
         for obj in self._snapshot.values():
             self._capture(obj)
-            if isinstance(obj, type) and self._owned(obj):
-                for member in obj.__dict__.values():
-                    self._capture(member)
 
     def _capture(self, obj: object) -> None:
         if isinstance(obj, types.FunctionType) and self._owned(obj):
-            self._func_snapshots[id(obj)] = (obj, _func_state(obj))
+            self._func_snapshots.setdefault(id(obj), (obj, _func_state(obj)))
         elif isinstance(obj, type) and self._owned(obj):
+            if obj in self._class_snapshots:
+                return  # already captured; also breaks pathological cycles
             self._class_snapshots[obj] = dict(obj.__dict__)
+            # F-100: recurse into the members. The old one-level iteration
+            # (module value -> class -> class members) never reached members
+            # of NESTED classes, so a rolled-back reload could leave a nested
+            # class half-updated -- exactly the F-29 bug class, one level
+            # deeper.
+            for member in obj.__dict__.values():
+                self._capture(member)
         elif isinstance(obj, (staticmethod, classmethod)):
             # The swap replaces the descriptor's inner function; rollback must
             # cover it or a failed reload leaves half-new static/class methods.

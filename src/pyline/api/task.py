@@ -52,5 +52,12 @@ async def on_quit(coro: Coroutine[Any, Any, object]) -> asyncio.Task[object]:
     task = asyncio.get_running_loop().create_task(coro)
     lifecycle = api.ctx().lifecycle
     if lifecycle is not None:
-        lifecycle.track_quit_task(task)
+        return lifecycle.track_quit_task(task)
+    # F-85: without the lifecycle wired (early boot, unit tests) the task
+    # had NO strong reference -- a pending task can be garbage-collected
+    # before it ever runs, the exact hazard spawn() guards against. Reuse
+    # spawn's discipline: background set + done-callback that also observes
+    # failures.
+    _bg.add(task)
+    task.add_done_callback(_bg_done)
     return task

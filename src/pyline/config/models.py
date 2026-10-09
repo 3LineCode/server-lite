@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from pyline.config.errors import ConfigError
 
@@ -26,11 +26,12 @@ class LogSettings(_StrictModel):
 
 
 class SocketSettings(_StrictModel):
-    # Secret reference ($env:/$file:/$plain:), resolved at load time.
-    token: str
+    # Secret reference ($env:/$file:/$plain:), resolved at load time into a
+    # SecretStr (F-53): the resolved value never shows in repr/logs.
+    token: SecretStr
     # Separate token for server-to-server/proxy links (F-16); falls back to
     # ``token`` so existing single-token deployments keep working.
-    inter_token: str | None = None
+    inter_token: SecretStr | None = None
     bind_host: str = "0.0.0.0"
     client_port: int = Field(ge=1, le=65535)
     server_port: int = Field(ge=1, le=65535)
@@ -46,11 +47,19 @@ class SocketSettings(_StrictModel):
     rpc_inflight_wait: float = Field(default=5.0, gt=0)
     handshake_timeout: float = Field(default=5.0, gt=0)
     idle_timeout: float = Field(default=60.0, gt=0)
+    # Global and per-peer-IP connection caps: each pending handshake costs
+    # tasks plus up to max_frame_size of decode buffer; unbounded accepts are
+    # a cheap FD/task exhaustion attack.
+    max_connections: int = Field(default=4096, ge=1)
+    max_connections_per_ip: int = Field(default=256, ge=1)
 
 
 class ZeroMQSettings(_StrictModel):
     bind_host: str = "tcp://127.0.0.1:2918"
-    bind_file: str = "/tmp/pyline.ipc"
+    # F-105: the scheme is load-bearing -- zmq.bind("/tmp/x.ipc") is an
+    # invalid address, so a bare-path default broke the whole bus on POSIX
+    # with default config (Windows uses bind_host, which hid it).
+    bind_file: str = "ipc:///tmp/pyline.ipc"
     hwm: int = Field(default=10_000, ge=1)
     reconnect_min_ms: int = Field(default=500, ge=100)
     reconnect_max_ms: int = Field(default=30_000, ge=1000)
@@ -71,8 +80,8 @@ class MySQLSettings(_StrictModel):
     host: str = "127.0.0.1"
     port: int = Field(default=3306, ge=1, le=65535)
     user: str
-    # Secret reference, resolved at load time.
-    password: str
+    # Secret reference, resolved at load time; masked in repr (F-53).
+    password: SecretStr
     db_name: str
     charset: str = "utf8mb4"
     max_conn: int = Field(default=4, ge=1)
@@ -83,19 +92,51 @@ class MySQLSettings(_StrictModel):
     # timeout a half-dead server parks every awaiting query forever.
     # (asyncmy has no write_timeout parameter -- read side only.)
     read_timeout: float = Field(default=30.0, gt=0)
+    # Bound on waiting for a free connection from the pool: without it the
+    # caller parks forever once the pool is exhausted (a half-dead DB holds
+    # every connection up to read_timeout before that, but a leak holds it
+    # forever).
+    acquire_timeout: float = Field(default=10.0, gt=0)
+
+    @model_validator(mode="after")
+    def _check_pool_bounds(self) -> MySQLSettings:
+        # F-90d: min_conn > max_conn is unsatisfiable -- the pool either
+        # never reaches its minimum or overgrows its maximum depending on
+        # the implementation. Both bounds are individually valid, so only a
+        # cross-field validator can catch it; ConfigError (not a
+        # pydantic-internal wrap) keeps the loader's fail-fast message
+        # contract.
+        if self.min_conn > self.max_conn:
+            raise ConfigError(
+                f"mysql.min_conn ({self.min_conn}) must not exceed mysql.max_conn ({self.max_conn})"
+            )
+        return self
 
 
 class RedisSettings(_StrictModel):
     host: str = "127.0.0.1"
     port: int = Field(default=6379, ge=1, le=65535)
-    # Secret reference (or $plain: with empty value for no-auth setups).
-    password: str | None = None
+    # Secret reference (or $plain: with empty value for no-auth setups);
+    # masked in repr (F-53).
+    password: SecretStr | None = None
     db_index: int = Field(default=0, ge=0)
     conn_cnt: int = Field(default=2, ge=1)
     # redis-py official options (F-11): without a socket timeout a dead
     # server parks every awaiting caller forever.
     socket_timeout: float = Field(default=5.0, gt=0)
     health_check_interval: int = Field(default=30, ge=0)
+
+
+class ClockSettings(_StrictModel):
+    """Game-calendar timezone.
+
+    Empty string = the host's local timezone (current behaviour; the frozen
+    numbering anchors in ``core.clock`` were defined against local time, so
+    this must only be set for NEW projects whose calendar is meant to follow
+    a specific zone).
+    """
+
+    tz: str = ""
 
 
 class ProjectSettings(_StrictModel):
@@ -106,8 +147,15 @@ class ProjectSettings(_StrictModel):
     zeromq: ZeroMQSettings = ZeroMQSettings()
     mysql: MySQLSettings
     redis: RedisSettings
+    clock: ClockSettings = ClockSettings()
     # Prometheus export port on the MAIN process (F-28); null disables.
     metrics_port: int | None = Field(default=9100, ge=1, le=65535)
+    # F-54: bind address for the metrics endpoint. Loopback by default --
+    # metrics carry operational detail; expose them beyond the host only on a
+    # network you already trust, and set a token.
+    metrics_bind: str = "127.0.0.1"
+    # Optional bearer token (secret reference) required to scrape (F-54).
+    metrics_token: SecretStr | None = None
     # Hard bound per boot-step action: a hung connect aborts the boot
     # (the startup watchdog only observes stalls between steps).
     # None disables. Default is generous enough for schema migrations.
@@ -163,8 +211,21 @@ class ServerEntry(_StrictModel):
 
         Same offsetting scheme as the prototype: +10000 per index when the
         configured port is >10000, else +1000 per index.
+
+        F-84: ``server_port or 0`` used to hand callers port 0 when the
+        entry configured no ``server_port`` -- listeners bound an
+        OS-assigned port nobody could connect to, and peers dialed 0.
+        ``None`` means "this entry does not interconnect", which is a
+        configuration error the moment something needs the port, so raise
+        loudly instead of returning a bogus value.
         """
-        base = self.server_port or 0
+        base = self.server_port
+        if base is None:
+            raise ConfigError(
+                f"server {self.server_no} ({self.name!r}) has no server_port; "
+                "entries that interconnect (server-to-server links, proxies) must "
+                "declare server_port in servers.json5"
+            )
         if base > 10_000:
             return base + process_index * 10_000
         return base + process_index * 1_000

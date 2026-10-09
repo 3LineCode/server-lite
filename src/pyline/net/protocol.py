@@ -21,6 +21,11 @@ from dataclasses import dataclass
 MAGIC = b"PL"
 VERSION = 1
 FLAG_CHUNK_MORE = 0x01
+# F-78: only bit 0 of the flags byte is defined today. A peer setting any
+# other bit is speaking a future/foreign protocol revision -- honouring the
+# frame anyway would let that revision's messages be misinterpreted instead
+# of loudly rejected, so the decoder refuses unknown bits.
+KNOWN_FLAGS_MASK = FLAG_CHUNK_MORE
 HEADER_BASE = 9  # magic(2) + version(1) + flags(1) + flag_len(1) + payload_len(4)
 MAX_FLAG_LEN = 255
 DEFAULT_CHUNK_SIZE = 1024 * 1024
@@ -74,10 +79,18 @@ def _encode_frame(flag: bytes, payload: bytes, *, more: bool) -> bytes:
 
 
 class FrameDecoder:
-    """Incremental decoder: feed() raw socket bytes, receive decoded messages."""
+    """Incremental decoder: feed() raw socket bytes, receive decoded messages.
+
+    F-78: consumed bytes are tracked with an offset cursor and dropped in one
+    ``del`` per feed() call. The previous ``del buffer[:total]`` after every
+    frame was O(remaining bytes) per frame -- quadratic behaviour on a stream
+    of small frames arriving in large TCP segments (a busy gateway easily
+    pushes memmoves of megabytes per read).
+    """
 
     def __init__(self, *, max_frame: int = DEFAULT_MAX_FRAME) -> None:
         self._buffer = bytearray()
+        self._offset = 0
         self._max_frame = max_frame
         self._pending_flag: str | None = None
         self._pending_data = bytearray()
@@ -103,22 +116,32 @@ class FrameDecoder:
                 self._reset_pending()
             else:
                 frames.append(frame)
+        # F-78: single compaction per feed() instead of a memmove per frame.
+        if self._offset:
+            del self._buffer[: self._offset]
+            self._offset = 0
         return frames
 
     def _try_decode_one(self) -> Frame | None:
         buffer = self._buffer
-        if len(buffer) < HEADER_BASE:
+        offset = self._offset
+        if len(buffer) - offset < HEADER_BASE:
             return None
-        if bytes(buffer[:2]) != MAGIC:
+        if buffer[offset] != MAGIC[0] or buffer[offset + 1] != MAGIC[1]:
             raise ProtocolError("bad frame magic; peer is not speaking the pyline protocol")
-        version = buffer[2]
+        version = buffer[offset + 2]
         if version != VERSION:
             raise ProtocolError(f"unsupported protocol version {version}")
-        flags = buffer[3]
-        flag_len = buffer[4]
+        flags = buffer[offset + 3]
+        if flags & ~KNOWN_FLAGS_MASK:
+            # F-78: unknown flag bits are a protocol revision we cannot parse.
+            raise ProtocolError(
+                f"unknown frame flags 0x{flags:02x} (defined mask 0x{KNOWN_FLAGS_MASK:02x})"
+            )
+        flag_len = buffer[offset + 4]
         if flag_len == 0:
             raise ProtocolError("flag length is zero")
-        payload_len = int.from_bytes(buffer[5:9], "big")
+        payload_len = int.from_bytes(buffer[offset + 5 : offset + 9], "big")
         total = HEADER_BASE + flag_len + payload_len
         if payload_len > self._max_frame:
             raise ProtocolError(
@@ -126,14 +149,16 @@ class FrameDecoder:
             )
         if self._pending_size + payload_len > self._max_frame:
             raise ProtocolError("reassembled message exceeds max frame size")
-        if len(buffer) < total:
+        if len(buffer) - offset < total:
             return None
         try:
-            flag = bytes(buffer[HEADER_BASE : HEADER_BASE + flag_len]).decode("utf-8")
+            flag = bytes(buffer[offset + HEADER_BASE : offset + HEADER_BASE + flag_len]).decode(
+                "utf-8"
+            )
         except UnicodeDecodeError as exc:
             raise ProtocolError(f"flag is not valid utf-8: {exc}") from exc
-        payload = bytes(buffer[HEADER_BASE + flag_len : total])
-        del buffer[:total]
+        payload = bytes(buffer[offset + HEADER_BASE + flag_len : offset + total])
+        self._offset = offset + total
         return Frame(flag=flag, payload=payload, chunk_more=bool(flags & FLAG_CHUNK_MORE))
 
     def _accumulate_chunk(self, frame: Frame) -> None:

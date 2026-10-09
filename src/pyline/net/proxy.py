@@ -31,6 +31,7 @@ import pyline.net.connection as conn_mod
 from pyline.core.context import Context
 from pyline.net.ipc import main_service_no, service_no_bytes
 from pyline.net.router import MessageRouter, NoProxyAvailableError
+from pyline.obs.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +54,28 @@ def parse_forward(data: bytes) -> tuple[int, int, str, bytes, int]:
     Accepts the legacy 4-field form (no ``from_service``) for mixed-version
     clusters; those parse with ``from_service=0`` = origin unknown, which the
     RPC layer treats as untrusted (F-39/F-40).
+
+    F-78: a non-envelope payload (scalar, string, wrong element types) used
+    to escape as TypeError from the ``len()`` below and crash the receiving
+    loop; malformed envelopes now raise ValueError, which every caller
+    already treats as a drop-and-count condition.
     """
     fields = msgpack.unpackb(data, raw=False, strict_map_key=False)
+    if not isinstance(fields, list) or len(fields) not in (4, 5):
+        raise ValueError(f"@fwd envelope must be a 4/5-field list, got {type(fields).__name__}")
     if len(fields) == 4:
         target, flag, payload, hops = fields
-        return target, 0, flag, payload, hops
-    target, from_service, flag, payload, hops = fields
+        from_service = 0
+    else:
+        target, from_service, flag, payload, hops = fields
+    if (
+        not isinstance(target, int)
+        or not isinstance(from_service, int)
+        or not isinstance(flag, str)
+        or not isinstance(payload, bytes)
+        or not isinstance(hops, int)
+    ):
+        raise ValueError("@fwd envelope has wrong field types")
     return target, from_service, flag, payload, hops
 
 
@@ -67,25 +84,63 @@ def inter_token(ctx: Context) -> str:
 
     The fallback keeps single-token deployments working but widens the blast
     radius of a client-token leak to the inter-server plane -- warn so ops
-    can see it in the log instead of discovering it during an incident."""
+    can see it in the log instead of discovering it during an incident.
+
+    F-73: the warning is emitted once per process. ``inter_token`` is called
+    on every reconnect (and every server-side accept), so a flapping proxy
+    link used to re-log the same configuration fact on every attempt --
+    once is informative, every second is log spam that buries real events."""
     s = ctx.settings.socket
     if s.inter_token is None:
-        logger.warning(
-            "socket.inter_token not set; server-to-server links reuse the CLIENT "
-            "token -- configure a separate $env: reference for production"
-        )
-        return s.token
-    return s.inter_token
+        global _inter_token_warned
+        if not _inter_token_warned:
+            _inter_token_warned = True
+            logger.warning(
+                "socket.inter_token not set; server-to-server links reuse the CLIENT "
+                "token -- configure a separate $env: reference for production"
+            )
+        return s.token.get_secret_value()
+    return s.inter_token.get_secret_value()
 
 
-class ProxyServer:
+_inter_token_warned = False
+
+
+class _CloseSpawner:
+    """F-78: fire-and-forget ``connection.close()`` with a kept reference.
+
+    The library's own discipline (F-20): a bare ``create_task`` result can be
+    garbage-collected mid-run, silently skipping the close. Small mixin so
+    ProxyServer and ProxyClient share one implementation."""
+
+    def __init__(self) -> None:
+        self._close_tasks: set[asyncio.Task[None]] = set()
+
+    def _spawn_close(self, connection: conn_mod.Connection, reason: str) -> None:
+        task = asyncio.get_running_loop().create_task(connection.close(reason))
+        self._close_tasks.add(task)
+
+        def _done(t: asyncio.Task[None]) -> None:
+            self._close_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                logger.error("deferred close of %s failed: %r", connection, t.exception())
+
+        task.add_done_callback(_done)
+
+
+class ProxyServer(_CloseSpawner):
     """Accepts proxy connections on the proxy machine's main process."""
 
     def __init__(self, ctx: Context, router: MessageRouter) -> None:
+        super().__init__()
         self._ctx = ctx
         self._router = router
         self._nodes: dict[int, conn_mod.Connection] = {}  # main service no -> conn
+        self._machines: dict[conn_mod.Connection, int] = {}  # F-48: reverse of _nodes
         self._server: asyncio.AbstractServer | None = None
+        # F-78: malformed @fwd payloads (bad shape or adversarial nesting).
+        self.malformed_fwd = 0
+        self._metrics = get_metrics()
 
     def _inter_token(self) -> str:
         return inter_token(self._ctx)
@@ -110,7 +165,7 @@ class ProxyServer:
         known = any(entry.advertise_ip == peer_ip for entry in self._ctx.registry.entries())
         if not known and peer_ip not in ("127.0.0.1", "::1"):
             logger.warning("proxy connection from unconfigured IP %s; closing", peer_ip)
-            asyncio.get_running_loop().create_task(connection.close("ip not allowed"))
+            self._spawn_close(connection, "ip not allowed")
             return
         connection.set_message_handler(
             lambda flag, payload: self._on_frame(connection, flag, payload)
@@ -126,7 +181,7 @@ class ProxyServer:
             logger.warning(
                 "proxy IDENT for unknown machine %d from %s; closing", machine, connection
             )
-            asyncio.get_running_loop().create_task(connection.close("unknown machine"))
+            self._spawn_close(connection, "unknown machine")
             return
         peer_ip = connection.peer[0]
         if entry.advertise_ip != peer_ip and peer_ip not in ("127.0.0.1", "::1"):
@@ -136,7 +191,7 @@ class ProxyServer:
                 entry.advertise_ip,
                 peer_ip,
             )
-            asyncio.get_running_loop().create_task(connection.close("machine/ip mismatch"))
+            self._spawn_close(connection, "machine/ip mismatch")
             return
         existing = self._nodes.get(machine)
         if existing is not None and existing is not connection and not existing.closed:
@@ -147,13 +202,15 @@ class ProxyServer:
                 existing.peer,
                 connection.peer,
             )
-            asyncio.get_running_loop().create_task(connection.close("duplicate machine claim"))
+            self._spawn_close(connection, "duplicate machine claim")
             return
         self._nodes[machine] = connection
+        self._machines[connection] = machine
 
         def drop_node(_conn: conn_mod.Connection, m: int = machine) -> None:
             if self._nodes.get(m) is _conn:
                 self._nodes.pop(m, None)
+                self._machines.pop(_conn, None)
 
         connection.add_close_hook(drop_node)
         logger.info("proxy peer registered: machine %d (%s)", machine, connection.peer)
@@ -163,16 +220,45 @@ class ProxyServer:
             self._register_ident(connection, int.from_bytes(payload, "big"))
             return
         if flag == FWD_FLAG:
-            self._on_forward(payload)
+            self._on_forward(connection, payload)
             return
         logger.debug("proxy ignoring unknown flag %r", flag)
 
-    def _on_forward(self, payload: bytes) -> None:
+    def _on_forward(self, connection: conn_mod.Connection, payload: bytes) -> None:
         try:
             target, from_service, inner_flag, inner_payload, hops = parse_forward(payload)
-        except (ValueError, msgpack.exceptions.ExtraData):
-            logger.exception("malformed @fwd payload on proxy")
+        except (ValueError, msgpack.exceptions.ExtraData, RecursionError):
+            # F-78: RecursionError = adversarially deep msgpack nesting; a
+            # scalar payload now fails inside parse_forward as ValueError
+            # instead of a TypeError from len(). Both used to crash the frame
+            # handler's caller.
+            self.malformed_fwd += 1
+            logger.warning(
+                "malformed @fwd payload on proxy from %s (total=%d)",
+                connection.peer,
+                self.malformed_fwd,
+            )
             return
+        # F-48: bind the claimed origin to the sender's IDENT-registered
+        # machine. Without this, any connected machine could stamp a victim's
+        # service number on its envelope and sail past the F-39/F-40 origin
+        # checks (which compare against the *claim*, not the wire). This is
+        # the first proxy hop, so the claim is checkable; relay hops carry a
+        # validated third-party origin and are received by ProxyClient, which
+        # does not re-check. ``from_service == 0`` is the legacy no-origin
+        # form: it flows on, untrusted, exactly as before.
+        if from_service != 0:
+            machine = self._machines.get(connection)
+            if machine is None or main_service_no(from_service) != machine:
+                self._metrics.proxy_spoofed.inc()
+                logger.error(
+                    "@fwd from %s claims origin %d but connection is registered as "
+                    "machine %s; dropping",
+                    connection.peer,
+                    from_service,
+                    machine,
+                )
+                return
         if main_service_no(target) == self._ctx.main_service_no:
             self._router.route(inner_flag, inner_payload, target, from_service=from_service)
             return
@@ -201,19 +287,25 @@ class ProxyServer:
         if self._server is not None:
             await conn_mod.close_server(self._server)
             self._server = None
+        for task in list(self._close_tasks):  # F-78: settle deferred closes
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
-class ProxyClient:
+class ProxyClient(_CloseSpawner):
     """Connects to all configured proxy servers (excluding self), with
     exponential-backoff reconnect; used for cross-server sends."""
 
     def __init__(self, ctx: Context, router: MessageRouter) -> None:
+        super().__init__()
         self._ctx = ctx
         self._router = router
         self._proxies: dict[int, conn_mod.Connection] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._failed_sends = 0
         self._seq = itertools.count(1)
+        # F-78: malformed inbound @fwd payloads.
+        self.malformed_fwd = 0
 
     async def start(self) -> None:
         for proxy_no in self._ctx.registry.proxy_list():
@@ -270,21 +362,42 @@ class ProxyClient:
             self._proxies.pop(proxy_no, None)
 
     async def _wait_closed(self, connection: conn_mod.Connection) -> None:
-        while not connection.closed:
-            await asyncio.sleep(1.0)
+        """Park until the connection closes (F-78: event, not a 1s poll).
+
+        The old polling loop added up to a second of dead time to every
+        reconnect cycle and spun forever if a connection object leaked; the
+        close hook fires exactly once, from the connection itself. A
+        connection that is already closed runs the hook inline (no await in
+        between, so there is no missed-event window)."""
+        closed = asyncio.Event()
+        connection.add_close_hook(lambda _conn: closed.set())
+        await closed.wait()
 
     def _on_frame(self, flag: str, payload: bytes) -> None:
         if flag != FWD_FLAG:
             return
         try:
             target, from_service, inner_flag, inner_payload, _hops = parse_forward(payload)
-        except (ValueError, msgpack.exceptions.ExtraData):
-            logger.exception("malformed @fwd payload")
+        except (ValueError, msgpack.exceptions.ExtraData, RecursionError):
+            # F-78: RecursionError = adversarially deep msgpack nesting (the
+            # old classification let it escape and kill the maintain loop's
+            # frame handling); scalars now fail inside parse_forward.
+            self.malformed_fwd += 1
+            logger.warning("malformed @fwd payload (total=%d)", self.malformed_fwd)
             return
         self._router.route(inner_flag, inner_payload, target, from_service=from_service)
 
-    def send_to_service(self, target: int, flag: str, payload: bytes) -> None:
-        """Send cross-server via any connected proxy; raises if none."""
+    def send_to_service(
+        self, target: int, flag: str, payload: bytes, *, from_service: int | None = None
+    ) -> None:
+        """Send cross-server via any connected proxy; raises if none.
+
+        F-70: ``from_service`` is the validated original sender when the main
+        process forwards a relayed message (``@relay`` from a sub-process or
+        an ``@fwd`` received here); ``None`` keeps the historical behaviour
+        of stamping this process. The receiving proxy binds the claimed
+        origin to the sending connection's machine (F-48), so the origin
+        must always belong to this machine when relaying."""
         if not self._proxies:
             self._failed_sends += 1
             raise NoProxyAvailableError(
@@ -294,7 +407,8 @@ class ProxyClient:
         proxy = self._proxies.get(main_service_no(target))
         if proxy is None:
             proxy = next(iter(self._proxies.values()))
-        proxy.send_message(FWD_FLAG, build_forward(target, self._ctx.service_no, flag, payload, 0))
+        origin = self._ctx.service_no if from_service is None else from_service
+        proxy.send_message(FWD_FLAG, build_forward(target, origin, flag, payload, 0))
 
     async def close(self) -> None:
         """Shut down the client: stop the maintain loops AND close every
@@ -308,6 +422,9 @@ class ProxyClient:
         for connection in list(self._proxies.values()):
             await connection.close("proxy client shutdown")
         self._proxies.clear()
+        for task in list(self._close_tasks):  # F-78: settle deferred closes
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 __all__ = ["FWD_FLAG", "IDENT_FLAG", "MAX_HOPS", "ProxyClient", "ProxyServer"]

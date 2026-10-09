@@ -20,8 +20,10 @@ Migration model (migration plan F-06, Alembic-style):
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,6 +36,15 @@ logger = logging.getLogger(__name__)
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 VERSION_TABLE = "pyline_schema"
+# F-51: per-migration resume progress (statements applied by a failed attempt).
+PROGRESS_TABLE = "pyline_schema_progress"
+
+# F-67: cross-process migration mutex.  GET_LOCK is advisory and scoped to a
+# single connection, so the lock runs on one dedicated out-of-pool session for
+# the whole ensure+migrate cycle.  60 s is generous for a peer that is already
+# finishing its migrations; past it we fail loudly rather than run unsynchronized.
+_MIGRATION_LOCK_WAIT_SECONDS = 60
+_MIGRATION_LOCK_PREFIX = "pyline_schema."
 
 # Integer display widths (INT(4)) are deprecated in MySQL 8: information_schema
 # reports them without the width, so the drift check compares the bare name.
@@ -229,20 +240,27 @@ def _parse_type(type_str: str) -> tuple[str, int | None]:
     return name, length
 
 
+# MySQL only opens a ``--`` comment when whitespace (or end-of-line) follows
+# the dashes; that exact shape is cut, so ``--`` glued to an identifier is
+# left alone.
+_LINE_COMMENT_RE = re.compile(r"--(?:\s|$)")
+
+
 def _split_statements(sql_text: str) -> list[str]:
     """Split a migration file into statements on ``;``.
 
-    ``--`` comment lines are dropped.  String literals containing semicolons
-    are not supported -- migrations are DDL, keep values out of them.
+    ``--`` comments (whole lines and trailing after a statement) are stripped
+    BEFORE splitting (F-66): splitting first used to cut a comment containing
+    a semicolon in half and glue its tail onto the next statement.  String
+    literals containing semicolons are still not supported -- migrations are
+    DDL, keep values out of them.
     """
+    no_comments = "\n".join(
+        _LINE_COMMENT_RE.split(line, maxsplit=1)[0] for line in sql_text.splitlines()
+    )
     statements: list[str] = []
-    for chunk in sql_text.split(";"):
-        lines = [
-            line
-            for line in chunk.splitlines()
-            if line.strip() and not line.strip().startswith("--")
-        ]
-        statement = "\n".join(lines).strip()
+    for chunk in no_comments.split(";"):
+        statement = "\n".join(line for line in chunk.splitlines() if line.strip()).strip()
         if statement:
             statements.append(statement)
     return statements
@@ -267,10 +285,50 @@ class SchemaManager:
         self.alter_statements: list[str] = []
 
     async def ensure_all(self) -> None:
-        await self._ensure_database()
-        await self._ensure_version_table()
-        await self._ensure_tables()
-        await self._apply_migrations()
+        """Create/evolve the schema under a cross-process lock (F-67).
+
+        Two owns_db processes booting at the same time used to double-run the
+        migration loop and race the version table's SELECT-then-INSERT into
+        two rows; the whole cycle now runs while holding a MySQL named lock,
+        and a peer that cannot take it within the bounded wait fails startup
+        loudly instead of migrating unsynchronized.
+        """
+        async with self._cross_process_lock():
+            await self._ensure_database()
+            await self._ensure_version_table()
+            await self._ensure_tables()
+            await self._apply_migrations()
+
+    @contextlib.asynccontextmanager
+    async def _cross_process_lock(self) -> AsyncIterator[None]:
+        # The lock name is capped at MySQL's 64-char limit; db_name itself is
+        # identifier-validated in __init__ so the prefix cannot be injected.
+        lock_name = (_MIGRATION_LOCK_PREFIX + self._db_name)[:64]
+        session = await self._pool.open_session()
+        try:
+            rows = await session.query(
+                "SELECT GET_LOCK(%s, %s)", (lock_name, _MIGRATION_LOCK_WAIT_SECONDS)
+            )
+            raw = rows[0][0] if rows else 0
+            got = int(raw) if raw is not None else 0  # NULL: server-side error
+            if got != 1:
+                # 0 = still held by a peer after the wait; NULL = server error
+                raise SchemaError(
+                    f"could not acquire the schema migration lock {lock_name!r} "
+                    f"within {_MIGRATION_LOCK_WAIT_SECONDS}s "
+                    "(another process is migrating, or the server errored)"
+                )
+            try:
+                yield
+            finally:
+                # Best-effort: if RELEASE_LOCK itself fails, the lock dies with
+                # the closing connection anyway -- but say so in the log.
+                with contextlib.suppress(Exception):
+                    rows = await session.query("SELECT RELEASE_LOCK(%s)", (lock_name,))
+                if not rows or rows[0][0] != 1:
+                    logger.warning("RELEASE_LOCK(%r) did not confirm release", lock_name)
+        finally:
+            await session.close()
 
     async def _ensure_database(self) -> None:
         # The database name was identifier-validated in __init__.
@@ -366,18 +424,64 @@ class SchemaManager:
         return sorted(found)
 
     async def _apply_migrations(self) -> None:
+        """Apply pending migrations, resuming a partially-failed one (F-51).
+
+        MySQL DDL implicitly commits, so a multi-statement migration cannot be
+        atomic. Progress is recorded per statement: a restart resumes from the
+        failed statement instead of re-running the whole file (which used to
+        rely entirely on the "every script is idempotent" convention). The
+        failing statement itself is still re-executed -- keep statements
+        idempotent; the blast radius is now one statement, not one file.
+        """
         applied = await self.current_version()
-        for number, path in self._load_migrations():
-            if number <= applied:
-                continue
-            for statement in _split_statements(path.read_text(encoding="utf-8")):
+        pending = [(n, p) for n, p in self._load_migrations() if n > applied]
+        if not pending:
+            return
+        await self._pool.execute(
+            f"CREATE TABLE IF NOT EXISTS `{PROGRESS_TABLE}` (\n"
+            "  `migration` INT NOT NULL PRIMARY KEY,\n"
+            "  `statements` INT NOT NULL\n"
+            ") COMMENT 'pyline migration resume progress (F-51)'"
+        )
+        for number, path in pending:
+            statements = _split_statements(path.read_text(encoding="utf-8"))
+            done = await self._migration_progress(number)
+            if done > len(statements):
+                raise SchemaError(
+                    f"migration {path.name} has {len(statements)} statements but "
+                    f"{done} were recorded as applied on a previous attempt; the "
+                    "file changed in between -- resolve manually"
+                )
+            if done:
+                logger.warning(
+                    "resuming migration %s at statement %d/%d (an earlier attempt failed)",
+                    path.name,
+                    done + 1,
+                    len(statements),
+                )
+            for index in range(done, len(statements)):
+                statement = statements[index]
                 logger.info("applying migration %s: %s", path.name, statement.splitlines()[0])
                 await self._pool.execute(statement)
+                await self._pool.execute(
+                    f"INSERT INTO `{PROGRESS_TABLE}` (`migration`, `statements`) "
+                    f"VALUES (%s, %s) ON DUPLICATE KEY UPDATE `statements` = %s",
+                    (number, index + 1, index + 1),
+                )
             await self._pool.execute(
                 f"UPDATE `{VERSION_TABLE}` SET `version` = %s WHERE `version` < %s",
                 (number, number),
             )
+            await self._pool.execute(
+                f"DELETE FROM `{PROGRESS_TABLE}` WHERE `migration` = %s", (number,)
+            )
             logger.info("applied migration %s (version %d)", path.name, number)
+
+    async def _migration_progress(self, number: int) -> int:
+        rows = await self._pool.query(
+            f"SELECT `statements` FROM `{PROGRESS_TABLE}` WHERE `migration` = %s", (number,)
+        )
+        return int(rows[0][0]) if rows else 0
 
     def table(self, name: str) -> TableSpec:
         try:

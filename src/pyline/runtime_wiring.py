@@ -8,13 +8,15 @@ it in three places. Each concern now lives in its own wiring class:
 * :class:`ClockEventEmitter` -- the half-hour boundary -> calendar event chain;
 * :class:`DbLayer` -- owns-db vs remote-proxy decision and local pool setup;
 * :class:`DevtoolsLayer` -- monitor, metrics endpoint, console, file watcher;
-* :class:`TeardownPlan` -- the ordered, guarded, deadline-bounded shutdown.
+* :class:`TeardownPlan` -- the ordered, guarded, deadline-bounded shutdown
+  with per-step budgets (F-95).
 
-ServerRuntime orchestrates these; behavior is unchanged.
+ServerRuntime orchestrates these.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable, Coroutine
@@ -57,7 +59,9 @@ logger = logging.getLogger(__name__)
 
 ENV_UNSAFE_CONSOLE = "PYLINE_UNSAFE_CONSOLE"
 
-SpawnFn = Callable[[Coroutine[Any, Any, object]], None]
+# Returning the created task (so callers can keep references) is allowed;
+# None-returning spawners stay compatible.
+SpawnFn = Callable[[Coroutine[Any, Any, object]], object]
 
 
 class ClockEventEmitter:
@@ -77,12 +81,14 @@ class ClockEventEmitter:
         *,
         log_dir: Path,
         spawn: SpawnFn,
+        alarms: AlarmHub | None = None,
     ) -> None:
         self._clock = clock
         self._scheduler = scheduler
         self._bus = bus
         self._spawn = spawn
         self._log_dir = log_dir
+        self._alarms = alarms
         self._last_boundary = 0.0
         self._channel = logging.getLogger("pyline.channel.clock")
 
@@ -102,7 +108,13 @@ class ClockEventEmitter:
         self._schedule_next()
 
     def emit_missed_boundaries(self) -> None:
-        """Fire every :00/:30 boundary since the last one emitted."""
+        """Fire every :00/:30 boundary since the last one emitted.
+
+        More than 96 missed boundaries (two days of downtime) cannot be
+        drained -- catching up would only match real time. The surplus is
+        skipped, and the skip is alarmed instead of silent (F-52): daily-reset
+        logic that missed its :NewDayEvent needs an operator to notice.
+        """
         now_ts = self._clock.now()
         cursor = self._last_boundary
         for _ in range(96):  # at most two days of catch-up per tick
@@ -111,7 +123,27 @@ class ClockEventEmitter:
                 break
             self._fire_boundary_events(boundary)
             cursor = boundary
-        self._last_boundary = now_ts
+        skipped = 0
+        while self._clock.next_halfhour_after(cursor) <= now_ts:
+            cursor = self._clock.next_halfhour_after(cursor)
+            skipped += 1
+        if skipped:
+            logger.error(
+                "clock catch-up cap exceeded: %d half-hour boundary events skipped "
+                "(downtime over two days); calendar resets inside the skipped "
+                "window did NOT fire",
+                skipped,
+            )
+            if self._alarms is not None:
+                self._alarms.emit("clock_boundaries_skipped", {"skipped": skipped})
+        # F-98: advance monotonically. A debug SetTime that moves the clock
+        # BACKWARD used to drag _last_boundary down with it, so after the
+        # debug offset was restored every boundary inside the setback window
+        # (NewDayEvent included) fired a second time. max() keeps the
+        # high-water mark: a setback emits nothing, and the restore resumes
+        # exactly where the pre-setback stream stopped. The F-52 catch-up cap
+        # above still sees the true cursor and is unaffected.
+        self._last_boundary = max(self._last_boundary, now_ts)
 
     def _fire_boundary_events(self, ts: float) -> None:
         local = self._clock.local(ts)
@@ -151,13 +183,23 @@ class DbLayer:
     async def connect(self, rpc: RpcManager) -> DatabaseAccess:
         entry = self._ctx.entry
         if not entry.use_mysql and not entry.use_redis:
-            return DatabaseAccess(remote=rpc, db_service_no=self._ctx.db_service_no())
+            return self._remote_access(rpc)
         owns_db = self._ctx.is_db_process or not entry.sub_process
         if not owns_db:
-            return DatabaseAccess(remote=rpc, db_service_no=self._ctx.db_service_no())
+            return self._remote_access(rpc)
         await self._connect_local(rpc)
         assert self.db_service is not None
         return DatabaseAccess(local=self.db_service)
+
+    def _remote_access(self, rpc: RpcManager) -> DatabaseAccess:
+        """RPC-backed access to the db process (F-92).
+
+        ``Context.db_service_no()`` returns ``None`` when the topology has no
+        db sub-process; ``DatabaseAccess`` accepts that and only fails (with
+        a loud ConfigError) if the database is actually touched -- the boot
+        of a ``use_mysql=false use_redis=false`` pure-gateway server used to
+        crash here instead."""
+        return DatabaseAccess(remote=rpc, db_service_no=self._ctx.db_service_no())
 
     async def _connect_local(self, rpc: RpcManager) -> None:
         s = self._ctx.settings
@@ -223,9 +265,16 @@ class DevtoolsLayer:
         self.monitor: LoopLatencyMonitor | None = None
         self.console: Console | None = None
         self.watcher: FileWatcher | None = None
+        # F-99: keep the server object alive and reachable; an untracked
+        # ThreadingHTTPServer could never be closed and only died with the
+        # process (its daemon thread silently holding the port).
+        self.metrics_server: object | None = None
 
     def start(
-        self, *, reload_hook: Callable[[str], object], shutdown_hook: Callable[[str], object]
+        self,
+        *,
+        reload_hook: Callable[[str], Awaitable[None]],
+        shutdown_hook: Callable[[str], object],
     ) -> None:
         self.monitor = LoopLatencyMonitor(
             on_alert=lambda delay: self._alarms.emit("loop_latency", {"delay": delay})
@@ -244,38 +293,164 @@ class DevtoolsLayer:
                 shutdown_hook=shutdown_hook,
             )
             self.console.start()
-        self.watcher = FileWatcher([Path.cwd()])
+        # F-96: watch the BUSINESS package root, not the whole cwd. With the
+        # repo root under watch, saving any tests/*.py or build script
+        # auto-imported and executed its side effects inside the live server.
+        self.watcher = FileWatcher(
+            self._watch_roots(),
+            reload_hook=reload_hook,
+            # F-97: a reload that re-raises SystemExit must route into a
+            # graceful shutdown instead of killing the watcher task.
+            shutdown_hook=shutdown_hook,
+        )
         self.watcher.start()
 
+    def _watch_roots(self) -> list[Path]:
+        """Directory roots the file watcher observes (F-96).
+
+        The business module (PYLINE_EVENTS, default ``game.events``) names the
+        business package; its filesystem root is the only tree whose modules
+        the server may hot-reload. If the package cannot be located (a
+        business module that is not part of a package), fall back to cwd with
+        the extended ignore set (FileWatcher's own defaults cover tests/,
+        build/, .venv/, ...)."""
+        import importlib.util
+
+        module_name = os.environ.get("PYLINE_EVENTS", "game.events")
+        top_level = module_name.split(".")[0]
+        try:
+            spec = importlib.util.find_spec(top_level)
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None and spec.submodule_search_locations:
+            return [Path(next(iter(spec.submodule_search_locations)))]
+        logger.warning(
+            "business package %r not importable; file watcher falls back to "
+            "cwd (changes outside the business tree are filtered by the "
+            "ignore set)",
+            top_level,
+        )
+        return [Path.cwd()]
+
     def _start_metrics_server(self) -> None:
-        """Export Prometheus metrics on the main process (F-28)."""
+        """Export Prometheus metrics on the main process (F-28, F-54).
+
+        Binds loopback by default; an optional bearer token makes the endpoint
+        safe to expose on a trusted network (``metrics_token``).
+        """
         port = self._ctx.settings.metrics_port
         if port is None or not self._ctx.is_main_process:
             return
-        from prometheus_client import start_http_server
+        token = self._ctx.settings.metrics_token
+        self.metrics_server = start_metrics_endpoint(
+            self._ctx.settings.metrics_bind,
+            port,
+            token.get_secret_value() if token is not None else None,
+        )
 
-        start_http_server(port)
-        logger.info("prometheus metrics on :%d", port)
+    async def stop_metrics(self) -> None:
+        """Explicitly close the metrics endpoint (F-99): stop accepting,
+        join the serve_forever loop and release the port instead of leaking
+        the socket until process exit."""
+        server, self.metrics_server = self.metrics_server, None
+        if server is None:
+            return
+        shutdown = getattr(server, "shutdown", None)
+        close = getattr(server, "server_close", None)
+        if shutdown is not None:
+            shutdown()
+        if close is not None:
+            close()
+
+
+def start_metrics_endpoint(bind: str, port: int, token: str | None) -> object:
+    """Serve Prometheus metrics on ``bind:port`` (F-54).
+
+    With ``token``, every request must carry ``Authorization: Bearer <token>``
+    (constant-time compared) or is answered with 401.
+    """
+    import hmac
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    from prometheus_client.exposition import MetricsHandler
+
+    class _AuthMetricsHandler(MetricsHandler):
+        def do_GET(self) -> None:
+            if token is not None:
+                supplied = self.headers.get("Authorization", "")
+                if not hmac.compare_digest(supplied, f"Bearer {token}"):
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+            super().do_GET()
+
+    server: ThreadingHTTPServer = ThreadingHTTPServer((bind, port), _AuthMetricsHandler)
+    threading.Thread(target=server.serve_forever, daemon=True, name="pyline-metrics").start()
+    if token is not None:
+        logger.info("prometheus metrics on %s:%d (bearer token required)", bind, port)
+    else:
+        logger.info("prometheus metrics on %s:%d (no auth)", bind, port)
+    return server
 
 
 class TeardownPlan:
     """Ordered, guarded shutdown steps under one total deadline (F-45).
 
     A failure in one step logs and continues so the rest always get their
-    chance (F-20); the caller bounds the whole plan with ``shutdown_timeout``
-    and interprets the timeout (the flush bookkeeping stays with the runtime).
+    chance (F-20). F-95: every step ALSO gets its own budget --
+    ``min(step_timeout, remaining total)`` -- so a single hung step can no
+    longer consume the entire ``total_timeout`` and silently skip everything
+    behind it (mysql.close included). A per-step timeout is logged as
+    critical (data-loss class event) but the plan moves on.
     """
 
-    def __init__(self) -> None:
-        self._steps: list[tuple[str, Callable[[], Awaitable[object]]]] = []
+    def __init__(
+        self,
+        *,
+        total_timeout: float | None = None,
+        step_timeout: float | None = 15.0,
+    ) -> None:
+        self._steps: list[tuple[str, Callable[[], Awaitable[object]], float | None]] = []
+        self._total_timeout = total_timeout
+        self._step_timeout = step_timeout
 
-    def add(self, name: str, step: Callable[[], Awaitable[object]]) -> None:
-        self._steps.append((name, step))
+    def add(
+        self, name: str, step: Callable[[], Awaitable[object]], *, timeout: float | None = None
+    ) -> None:
+        """Append ``step``; ``timeout`` overrides the per-step cap (use it for
+        the one step the whole budget exists for, e.g. the save-flush: it
+        then only shares the remaining total instead of a fixed slice)."""
+        self._steps.append((name, step, timeout))
 
     async def run(self) -> None:
-        for name, step in self._steps:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._total_timeout if self._total_timeout is not None else None
+        for index, (name, step, step_override) in enumerate(self._steps):
+            budget = step_override if step_override is not None else self._step_timeout
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                budget = remaining if budget is None else min(budget, remaining)
+                if budget <= 0:
+                    logger.critical(
+                        "shutdown total budget exhausted before step %r; %d step(s) skipped",
+                        name,
+                        len(self._steps) - index,
+                    )
+                    return
             try:
-                await step()
+                if budget is None:
+                    await step()
+                else:
+                    await asyncio.wait_for(step(), timeout=budget)
+            except TimeoutError:
+                # F-95: the step hung; it was cancelled and the plan moves on
+                # so the remaining steps still run.
+                logger.critical(
+                    "shutdown step %r timed out after %.1fs (step cancelled; continuing)",
+                    name,
+                    budget,
+                )
             except Exception:
                 logger.exception("shutdown step %r failed (continuing)", name)
 

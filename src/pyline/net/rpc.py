@@ -105,12 +105,22 @@ class RpcManager(Network):
         self._own_service_no = own_service_no
         self._functions: dict[str, Callable[..., Any]] = {}
         self._pending: dict[int, _PendingCall] = {}
-        # call_id -> (running task, validated caller service no) -- the caller
-        # is who a MSG_CANCEL must come from (F-40).
-        self._running: dict[int, tuple[asyncio.Task[None], int]] = {}
+        # (caller service no, call_id) -> (running task, caller) -- the caller
+        # is who a MSG_CANCEL must come from (F-40). F-69: keyed by the
+        # composite ``(from_service, call_id)`` -- every process numbers its
+        # calls from 1, so two callers' first CALLs used to collide on bare
+        # ``call_id``: the second overwrote the first's entry and the first
+        # task's done-callback then popped the second's, leaving a CANCEL
+        # with no table entry and a remote task running forever. The caller
+        # half of the key comes from the transport-validated envelope origin
+        # (F-39), so it cannot be forged.
+        self._running: dict[tuple[int, int], tuple[asyncio.Task[None], int]] = {}
         self._call_seq = itertools.count(1)
         self._metrics = get_metrics()
         self.timed_out_calls = 0
+        # F-78: msgpack can also raise RecursionError (deeply nested payload)
+        # -- counted, not just logged.
+        self.malformed_messages = 0
         # F-19: inbound concurrency cap. A bare task per CALL let any
         # authenticated peer stack unbounded work with a CALL storm; execution
         # now queues on this semaphore, and callers that wait longer than
@@ -119,6 +129,9 @@ class RpcManager(Network):
         self._inflight_wait = inflight_wait
         self._inflight = asyncio.Semaphore(max_inflight)
         self.busy_rejects = 0
+        # F-77: notify-style calls (call_id 0) rejected while busy used to
+        # vanish without a trace; counted now.
+        self.busy_notify_drops = 0
 
     # ------------------------------------------------------------------ #
     # Registration
@@ -240,8 +253,13 @@ class RpcManager(Network):
     def handle_message(self, flag: str, payload: bytes, from_service: int = 0) -> None:
         try:
             message = msgpack.unpackb(payload, raw=False, strict_map_key=False)
-        except (ValueError, msgpack.exceptions.ExtraData):
-            logger.exception("malformed rpc payload")
+        except (ValueError, msgpack.exceptions.ExtraData, RecursionError):
+            # F-78: RecursionError covers adversarially deep msgpack nesting
+            # (msgpack builds containers recursively while unpacking); only
+            # ValueError/ExtraData used to be caught, so one such payload
+            # used to tear the connection down instead of dropping the frame.
+            self.malformed_messages += 1
+            logger.warning("malformed rpc payload (total=%d)", self.malformed_messages)
             return
         if not isinstance(message, list) or not message:
             logger.warning("malformed rpc message shape")
@@ -311,12 +329,57 @@ class RpcManager(Network):
         self._inbound.add(task)
         task.add_done_callback(self._inbound_done)
         if call_id:
-            self._running[call_id] = (task, from_service_claim)
+            # F-69: composite key -- see _running's declaration comment.
+            key = (from_service_claim, call_id)
+            self._running[key] = (task, from_service_claim)
 
-            def drop_running(_task: asyncio.Task[None], cid: int = call_id) -> None:
-                self._running.pop(cid, None)
+            def drop_running(_task: asyncio.Task[None], k: tuple[int, int] = key) -> None:
+                self._running.pop(k, None)
 
             task.add_done_callback(drop_running)
+
+    async def _acquire_slot(self) -> bool:
+        """Bounded wait for an execution slot; ``False`` means busy (F-19).
+
+        F-77: a plain ``wait_for(semaphore.acquire())`` leaks permits through
+        a cancellation window. When the grant lands in the same loop
+        iteration in which the caller is cancelled (or the wait times out),
+        the permit is consumed but the caller never resumes from the
+        acquire -- its ``finally: release()`` below never runs, and after a
+        few unlucky cancellations the server reports busy forever. Here the
+        acquire runs as an explicit task wrapped in ``shield``; a flag set
+        atomically by that task (no await between grant and flag) records
+        whether the permit was consumed, and every non-taking exit path
+        hands a raced-in grant straight back.
+        """
+        granted = False
+
+        async def _acquire() -> None:
+            nonlocal granted
+            await self._inflight.acquire()
+            granted = True
+
+        acq = asyncio.ensure_future(_acquire())
+        took = False
+        try:
+            await asyncio.wait_for(asyncio.shield(acq), timeout=self._inflight_wait)
+            took = True
+            return True
+        except TimeoutError:
+            # Busy: the wait expired. The finally block cancels the acquire
+            # and reclaims any permit that raced in.
+            return False
+        finally:
+            if not took:
+                # Timeout or caller cancellation (MSG_CANCEL). If the grant
+                # raced in before the cancellation was delivered the acquire
+                # task still ran to its flag assignment, so the permit was
+                # consumed and must be returned here (F-77). When it did not,
+                # CPython's Semaphore itself gives an assigned-but-unconsumed
+                # permit back and ``granted`` stays False.
+                acq.cancel()
+                if granted:
+                    self._inflight.release()
 
     async def _execute(
         self, call_id: int, from_service: int, func_path: str, args: list[Any]
@@ -327,11 +390,9 @@ class RpcManager(Network):
             # F-19: wait bounded for an execution slot. On timeout the function
             # is never touched -- the caller learns the server is busy instead
             # of the task waiting forever (or the table growing unbounded).
-            # wait_for releases the slot again if the wait itself is cancelled
-            # (MSG_CANCEL), so CancelledError propagates untouched.
-            try:
-                await asyncio.wait_for(self._inflight.acquire(), timeout=self._inflight_wait)
-            except TimeoutError:
+            # Cancellation (MSG_CANCEL) propagates untouched and, with the
+            # F-77 helper, never strands a permit.
+            if not await self._acquire_slot():
                 self.busy_rejects += 1
                 logger.warning(
                     "rpc inflight limit (%d) reached; rejecting call %d to %r "
@@ -344,6 +405,15 @@ class RpcManager(Network):
                 )
                 if call_id:  # notify-style calls (call_id 0) expect no reply
                     self._send(from_service, [MSG_RESULT, call_id, 0, BUSY_MESSAGE])
+                else:
+                    # F-77: nothing is replied to a notify, so the drop used to
+                    # be invisible -- count it and leave a debug trace.
+                    self.busy_notify_drops += 1
+                    logger.debug(
+                        "notify-style call %r dropped: rpc inflight limit reached (total=%d)",
+                        func_path,
+                        self.busy_notify_drops,
+                    )
                 return
             try:
                 try:
@@ -424,7 +494,10 @@ class RpcManager(Network):
                 "unknown" if from_service == 0 else "mismatch", "CANCEL", from_service
             )
             return
-        entry = self._running.get(call_id)
+        # F-69: the composite key scopes the lookup to THIS caller's call --
+        # another service calling with the same call_id must not be found (and
+        # cannot be cancelled) here.
+        entry = self._running.get((from_service, call_id))
         if entry is None:
             return
         task, caller = entry

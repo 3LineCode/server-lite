@@ -1,6 +1,7 @@
 """Tracked containers: dict/list subclasses that mark their owner dirty on
 mutation (the ergonomic core of the prototype's ObsDict/ObsList, without the
-co_names bytecode magic -- the touch callback is declared explicitly)."""
+co_names bytecode magic -- the touch callback is declared explicitly, and
+optional so dataclasses.asdict can rebuild copies, F-64)."""
 
 from __future__ import annotations
 
@@ -9,48 +10,60 @@ from typing import Any, SupportsIndex
 
 
 class TrackedDict[K, V](dict[K, V]):
-    """A dict that calls ``touch()`` on every mutation."""
+    """A dict that calls ``touch()`` on every mutation.
+
+    ``touch`` is optional (F-64): ``dataclasses.asdict`` rebuilds container
+    fields via ``type(obj)(...)`` without extra keywords, which made ``asdict``
+    on a model holding a TrackedDict raise TypeError -- even though
+    ``dataclass_codec`` (asdict-based) plus tracked containers is exactly the
+    documented combination.  A copy without a callback simply stops reporting
+    mutations; serialized copies are read-only, so nothing is lost.
+    """
 
     def __init__(
         self,
         *args: Mapping[K, V] | Iterable[tuple[K, V]],
-        touch: Callable[[], None],
+        touch: Callable[[], None] | None = None,
         **kwargs: V,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._touch = touch
 
+    def _notify(self) -> None:
+        if self._touch is not None:
+            self._touch()
+
     def __setitem__(self, key: K, value: V) -> None:
         super().__setitem__(key, value)
-        self._touch()
+        self._notify()
 
     def __delitem__(self, key: K) -> None:
         super().__delitem__(key)
-        self._touch()
+        self._notify()
 
     def pop(self, key: K, *default: V) -> V:  # type: ignore[override]
         result = super().pop(key, *default)
-        self._touch()
+        self._notify()
         return result
 
     def popitem(self) -> tuple[K, V]:
         result = super().popitem()
-        self._touch()
+        self._notify()
         return result
 
     def clear(self) -> None:
         super().clear()
-        self._touch()
+        self._notify()
 
     def update(  # type: ignore[override]
         self, other: Mapping[K, V] | Iterable[tuple[K, V]] = (), **kwargs: V
     ) -> None:
         super().update(other, **kwargs)
-        self._touch()
+        self._notify()
 
     def setdefault(self, key: K, default: V | None = None) -> V:
         result = super().setdefault(key, default)  # type: ignore[arg-type]
-        self._touch()
+        self._notify()
         return result
 
     def __ior__(  # type: ignore[misc, override]
@@ -59,19 +72,23 @@ class TrackedDict[K, V](dict[K, V]):
         # dict.__ior__ bypasses update(); without this override ``d |= {...}``
         # mutates without ever marking the owner dirty (silent data loss).
         super().__ior__(other)
-        self._touch()
+        self._notify()
         return self
 
 
 class TrackedList[V](list[V]):
-    """A list that calls ``touch()`` on every mutation."""
+    """A list that calls ``touch()`` on every mutation.
 
-    def __init__(self, *args: Iterable[V], touch: Callable[[], None]) -> None:
+    ``touch`` is optional for the same ``asdict`` reason as TrackedDict (F-64).
+    """
+
+    def __init__(self, *args: Iterable[V], touch: Callable[[], None] | None = None) -> None:
         super().__init__(*args)
         self._touch = touch
 
     def _changed(self) -> None:
-        self._touch()
+        if self._touch is not None:
+            self._touch()
 
     def append(self, item: V) -> None:
         super().append(item)

@@ -1,7 +1,7 @@
 """Data layer: MySQL, Redis, schema migration, serialization, ORM, auto-save."""
 
 from pyline.db.autosave import SaveScheduler
-from pyline.db.mysql import MySQLError, MySQLLostError, MySQLPool
+from pyline.db.mysql import MySQLError, MySQLLostError, MySQLPool, PoolAcquireTimeoutError
 from pyline.db.orm import (
     Codec,
     DataclassCodec,
@@ -38,6 +38,7 @@ __all__ = [
     "MySQLError",
     "MySQLLostError",
     "MySQLPool",
+    "PoolAcquireTimeoutError",
     "RedisClient",
     "SaveScheduler",
     "SaveState",

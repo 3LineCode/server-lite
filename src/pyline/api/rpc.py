@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 from pyline import api
 from pyline.net.rpc import RpcManager
@@ -12,7 +12,8 @@ __all__ = ["call", "current_caller", "notify"]
 
 
 def _rpc() -> RpcManager:
-    return cast(RpcManager, api.service("rpc"))
+    # F-87: typed bag access instead of an unchecked cast.
+    return api.ctx().service("rpc", RpcManager)
 
 
 async def call(

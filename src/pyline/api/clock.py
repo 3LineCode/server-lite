@@ -3,14 +3,13 @@ helper set ships in template/game/com_time.py)."""
 
 from __future__ import annotations
 
-from typing import cast
-
 from pyline import api
 from pyline.core.clock import GameClock
 
 
 def _clock() -> GameClock:
-    return cast(GameClock, api.service("clock"))
+    # F-87: typed bag access instead of an unchecked cast.
+    return api.ctx().service("clock", GameClock)
 
 
 def now() -> float:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -23,6 +24,92 @@ async def _stubborn_child(process_type: str, index: int) -> None:
 
 async def _dying_child(process_type: str, index: int) -> None:
     raise SystemExit(7)
+
+
+class _FakeChild:
+    """Duck-typed stand-in for mp.Process (fast unit path for watch logic)."""
+
+    def __init__(self, exitcode: int | None) -> None:
+        self.exitcode = exitcode
+        self.pid = 4242
+        self.terminated = False
+
+    def is_alive(self) -> bool:
+        return self.exitcode is None
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.exitcode = -15
+
+
+class TestDuplicateProcessTypeF81:
+    def test_spawn_rejects_duplicate_types(self) -> None:
+        """F-81: a duplicated process_type silently overwrote the children
+        slot -- both were spawned, only the last was watched/terminated."""
+        sup = ProcessSupervisor(_quiet_child)
+        with pytest.raises(ValueError, match=r"duplicate sub-process types \['db'\]"):
+            sup.spawn_subprocesses(("db", "game", "db"), main_pid=0)
+        assert not sup._children  # rejected BEFORE any spawn: no orphans
+
+
+class TestWatchSemanticsF82:
+    async def test_raising_callback_falls_back_to_fail_fast(self) -> None:
+        """F-82: a buggy on_child_died used to kill the watch task silently,
+        leaving the remaining children unmanaged."""
+        sup = ProcessSupervisor(_quiet_child)
+        sup._children = {"dead": _FakeChild(7), "sibling": _FakeChild(None)}
+        calls: list[str] = []
+
+        async def bad_callback(process_type: str, exitcode: int | None) -> None:
+            calls.append(process_type)
+            raise RuntimeError("callback bug")
+
+        with pytest.raises(ChildDiedError, match="dead"):
+            await sup._watch_children(bad_callback)
+        assert calls == ["dead"]  # callback was invoked exactly once
+        # the sibling was terminated by the fail-fast fallback, not leaked
+        sibling = sup._children["sibling"]
+        assert isinstance(sibling, _FakeChild)
+        assert sibling.terminated is True
+
+    async def test_raising_callback_logged_as_critical(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        sup = ProcessSupervisor(_quiet_child)
+        sup._children = {"dead": _FakeChild(1)}
+
+        async def bad_callback(process_type: str, exitcode: int | None) -> None:
+            raise RuntimeError("callback bug")
+
+        with (
+            caplog.at_level(logging.CRITICAL, logger="pyline.core.supervisor"),
+            pytest.raises(ChildDiedError),
+        ):
+            task = asyncio.get_running_loop().create_task(sup._watch_children(bad_callback))
+            await asyncio.wait_for(task, 5.0)
+        assert any("on_child_died callback failed" in r.message for r in caplog.records)
+
+    async def test_watch_task_death_is_observed_not_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """F-82: via start_child_watch (fire-and-forget), the ChildDiedError
+        used to die unretrieved inside the task; the done-callback must
+        retrieve AND escalate it."""
+        sup = ProcessSupervisor(_quiet_child)
+        sup._children = {"dead": _FakeChild(9)}
+        with caplog.at_level(logging.CRITICAL, logger="pyline.core.supervisor"):
+            sup.start_child_watch(None)
+            assert sup._watch_task is not None
+            await asyncio.wait_for(_task_done(sup._watch_task), 5.0)
+            # done-callbacks run on the next loop tick after completion
+            await asyncio.sleep(0.05)
+        assert any("child watch task died" in r.message for r in caplog.records)
+
+
+async def _task_done(task: asyncio.Task[None]) -> None:
+    while not task.done():
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0)  # let the done-callbacks run
 
 
 @pytest.mark.integration

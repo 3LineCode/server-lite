@@ -189,7 +189,22 @@ class EventBus:
         return self._mro_cache[event_type]
 
     async def emit(self, event: Any, *, reverse: bool = False) -> None:
-        """Dispatch ``event`` to all layers, in layer order (or reverse)."""
+        """Dispatch ``event`` to all layers, in layer order (or reverse).
+
+        Serial dispatch is the CONTRACT, not an implementation detail
+        (F-90a, documented decision -- no behavior change): handlers run
+        strictly one after another, framework -> public -> business (or the
+        reverse for quit-style events), and ``await`` inside a handler
+        delays every later handler on the chain. This ordering guarantee is
+        load-bearing for quit events: business teardown must finish before
+        the framework services it calls into are closed, which rules out
+        concurrent fan-out on this bus. Consequence: a slow handler stalls
+        the whole dispatch -- heavy work belongs in a task
+        (``loop.create_task`` / ``api.task.spawn``) scheduled from the
+        handler, not awaited inline. A timeout here would be wrong: cutting
+        a quit handler off mid-flush loses data, and there is no safe
+        cutoff the bus could pick for arbitrary business code.
+        """
         layers = reversed(_VALID_LAYERS) if reverse else iter(_VALID_LAYERS)
         keys = self._subscription_keys(type(event))
         for layer in layers:

@@ -87,6 +87,64 @@ async def test_shutdown_runs_hooks_and_quits_tasks() -> None:
     assert manager.state == LifecycleState.QUIT
 
 
+class TestShutdownJoinF58:
+    """F-58: the parking loop must join the fire-and-forget teardown.
+
+    request_shutdown flips the state to QUIT before its hooks run, so
+    in_quit() becomes true while the save-flush is still in flight. Without
+    wait_shutdown_complete() the main coroutine returned, asyncio.run
+    cancelled the teardown mid-flush, and save_flush_ok still read True
+    (exit 0 with dirty data lost)."""
+
+    async def test_wait_resolves_only_after_hooks_finish(self) -> None:
+        manager = LifecycleManager()
+        progress: list[str] = []
+
+        async def slow_flush() -> None:
+            await asyncio.sleep(0.2)
+            progress.append("flushed")
+
+        manager.on_shutdown(slow_flush)
+        shutdown_task = asyncio.get_running_loop().create_task(manager.request_shutdown("test"))
+        await asyncio.sleep(0.05)
+        assert manager.in_quit()
+        assert progress == []  # QUIT observed, teardown still running
+        await asyncio.wait_for(manager.wait_shutdown_complete(), 5.0)
+        assert progress == ["flushed"]  # ...but joined before returning
+        await shutdown_task
+
+    async def test_wait_resolves_when_hook_raises(self) -> None:
+        manager = LifecycleManager()
+
+        async def broken_hook() -> None:
+            raise RuntimeError("hook died")
+
+        manager.on_shutdown(broken_hook)
+        await manager.request_shutdown("test")
+        await asyncio.wait_for(manager.wait_shutdown_complete(), 5.0)
+
+    async def test_wait_noop_when_never_requested(self) -> None:
+        manager = LifecycleManager()
+        await asyncio.wait_for(manager.wait_shutdown_complete(), 1.0)
+
+    async def test_shutdown_before_boot_starts_is_clean(self) -> None:
+        """A shutdown landing before run_boot's first step must not KeyError.
+
+        This is the real-world window: runtime.boot() awaits event emits
+        before driving the sequence, and a signal-triggered shutdown task
+        can flip the state during one of those yields."""
+        manager = LifecycleManager(startup_timeout=10.0)
+        await manager.request_shutdown("signal during pre-boot")
+        await asyncio.wait_for(manager.run_boot(), 5.0)  # used to KeyError
+        assert manager.state == LifecycleState.QUIT
+
+    async def test_enter_after_quit_raises_runtime_error(self) -> None:
+        manager = LifecycleManager()
+        await manager.request_shutdown("test")
+        with pytest.raises(RuntimeError, match="already QUIT"):
+            await manager._enter(LifecycleState.CONN_DB)
+
+
 class TestBootHardeningF19:
     async def test_boot_fails_when_start_task_fails(self) -> None:
         """F-19: a failed startup task aborts the boot (was only logged)."""

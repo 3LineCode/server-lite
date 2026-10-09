@@ -74,6 +74,53 @@ executed for checking purposes, so import-time side effects run exactly once
   clobbers them (the prototype needed manual `if not "g_X" in globals()`
   guards for this).
 
+## Reload events (PreReloadEvent / OnReloadEvent)
+
+Every framework-driven reload (console `update`, file watcher) goes through
+one chain:
+
+1. `PreReloadEvent(module)` handlers run to completion **before** the module
+   swap. The runtime *awaits* them; a handler may quiesce traffic, serialize
+   state or unsubscribe stale handlers, and it is guaranteed that none of
+   the new code is live yet when they run.
+2. `reload_module` swaps the code in place (this document).
+3. `OnReloadEvent(module)` is emitted after the swap and the network-handler
+   rebind, as a fire-and-forget notification (restart tasks, refresh
+   caches).
+
+Calling `pyline.reload.reload_module` directly (no events) remains legal --
+the event chain is what the runtime's `reload_hook` adds around it. Handler
+failures are isolated by the bus and never abort the reload itself.
+
+## Known limits (accepted -- plan restarts around them)
+
+Static validation makes reloads safe against *layout* breakage; it cannot
+make the re-executed top level side-effect free, and it only sees what the
+AST can see:
+
+* **Top-level side effects are real and are NOT rolled back.** The new
+  source's module top level genuinely executes once during the swap. Network
+  calls, file writes, registration into other modules' globals, or spawned
+  tasks that escape before a failed reload leaves their traces behind. The
+  snapshot restores the *reloaded module's* namespace only -- state written
+  into other modules stays written. Keep top levels pure; register in hooks.
+* **Decorator-wrapped functions are checked by their wrapper's outer
+  signature only.** A decorator that adapts `(*args, **kwargs)` hides the
+  inner function's real signature from the validator; a call-incompatible
+  change inside the wrapper passes validation and fails at runtime. Validate
+  such changes by hand (or restart).
+* **Closure factories created by assignment are treated as values** and skip
+  signature validation entirely (`handler = make_handler(...)`).
+* **Only the reloaded module is validated.** Other modules' call sites keep
+  their old compiled bytecode: a change that is compatible per the table
+  above can still break an old caller in another module that passes
+  arguments positionally in a way the new signature no longer accepts at
+  *that* call's shape. Restart-sensitive changes deserve a restart.
+* **The watcher execs synchronously on the event loop.** Reloading a module
+  whose top level is slow blocks the loop for that duration (visible as a
+  `loop_latency` alert). Prefer small modules or console-triggered reloads
+  during quiet windows.
+
 ## Not supported
 
 C extension modules, metaclass changes, decorated functions whose closure

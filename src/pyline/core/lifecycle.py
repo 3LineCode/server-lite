@@ -95,6 +95,10 @@ class LifecycleManager:
         self._watchdog_task: asyncio.Task[None] | None = None
         self._shutdown_hooks: list[Callable[[], Awaitable[None]]] = []
         self._shutdown_requested = False
+        # F-58: resolved only after request_shutdown() has fully finished
+        # (hooks + quit-task drain), so the parking loop can join a
+        # fire-and-forget teardown instead of racing it.
+        self._shutdown_done: asyncio.Future[None] | None = None
         self.stuck_error: StartupStuckError | None = None
 
     # ------------------------------------------------------------------ #
@@ -137,6 +141,15 @@ class LifecycleManager:
         """Drive the sequence through all boot steps, honouring gates."""
         self.start_watchdog()
         for state in BOOT_STEPS:
+            if self.in_quit():
+                # Same F-19 semantics, covering the window where the shutdown
+                # lands between two steps (or before the first one): _enter
+                # would otherwise face QUIT, which is deliberately absent
+                # from _TRANSITIONS, and die with a bare KeyError instead of
+                # tearing down. in_quit() rather than a bare comparison --
+                # another task may flip the state at any await point.
+                logger.warning("boot aborted by shutdown request before %s", state.name)
+                return
             await self._enter(state)
             while True:
                 if self.stuck_error is not None:
@@ -160,6 +173,12 @@ class LifecycleManager:
         logger.info("startup finished: %s", self.state.name)
 
     async def _enter(self, state: LifecycleState) -> None:
+        if self.state is LifecycleState.QUIT:
+            # QUIT is reachable from any state and intentionally not in the
+            # transition table; raising the table's KeyError here would crash
+            # the boot task with no diagnostics (run_boot checks for this
+            # first, this guard covers direct callers).
+            raise RuntimeError(f"lifecycle already QUIT; cannot enter {state.name}")
         expected = _TRANSITIONS[self.state]
         if state is not expected:
             raise RuntimeError(f"illegal lifecycle transition {self.state.name} -> {state.name}")
@@ -238,23 +257,47 @@ class LifecycleManager:
 
         QUIT is the ONE transition allowed from any state (a half-booted
         server must still be able to tear down); that is why it bypasses
-        ``_TRANSITIONS`` -- the table models the linear boot chain only."""
+        ``_TRANSITIONS`` -- the table models the linear boot chain only.
+
+        The state flips to QUIT *before* the hooks run so a half-booted
+        server can always tear down; callers that park on ``in_quit()`` must
+        then join the teardown via ``wait_shutdown_complete()`` before
+        returning, or their own cleanup (e.g. asyncio.run's task
+        cancellation) will cut the hooks -- flushes included -- mid-flight.
+        """
         if self._shutdown_requested:
             return
         self._shutdown_requested = True
+        self._shutdown_done = asyncio.get_running_loop().create_future()
         logger.info("shutdown requested: %s", reason)
         self.state = LifecycleState.QUIT
-        for hook in self._shutdown_hooks:
-            try:
-                await hook()
-            except Exception:
-                logger.exception("shutdown hook %r failed", hook)
-        if self._quit_tasks:
-            logger.info("waiting for %d quit task(s)...", len(self._quit_tasks))
-            done, pending = await asyncio.wait(set(self._quit_tasks), timeout=self._quit_timeout)
-            for task in pending:
-                task.cancel()
-                logger.warning("quit task cancelled after deadline: %r", task)
-            for task in done:
-                if not task.cancelled() and task.exception() is not None:
-                    logger.error("quit task failed: %r", task)
+        try:
+            for hook in self._shutdown_hooks:
+                try:
+                    await hook()
+                except Exception:
+                    logger.exception("shutdown hook %r failed", hook)
+            if self._quit_tasks:
+                logger.info("waiting for %d quit task(s)...", len(self._quit_tasks))
+                done, pending = await asyncio.wait(
+                    set(self._quit_tasks), timeout=self._quit_timeout
+                )
+                for task in pending:
+                    task.cancel()
+                    logger.warning("quit task cancelled after deadline: %r", task)
+                for task in done:
+                    if not task.cancelled() and task.exception() is not None:
+                        logger.error("quit task failed: %r", task)
+        finally:
+            # F-58: resolve even if a hook raised BaseException or the task
+            # itself was cancelled -- wait_shutdown_complete() must never hang.
+            if not self._shutdown_done.done():
+                self._shutdown_done.set_result(None)
+
+    async def wait_shutdown_complete(self) -> None:
+        """Wait until a started request_shutdown() has fully finished.
+
+        No-op when shutdown was never requested (the caller then owns calling
+        ``request_shutdown`` itself)."""
+        if self._shutdown_done is not None:
+            await self._shutdown_done

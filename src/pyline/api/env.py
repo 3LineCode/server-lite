@@ -70,12 +70,20 @@ def process_index_of(process_type: str) -> int:
 def shutdown(reason: str) -> None:
     """Request graceful shutdown (old StopAio); schedules asynchronously."""
     lifecycle = api.ctx().lifecycle
-    if lifecycle is None:
-        os.kill(os.getpid(), 15)
+    if lifecycle is not None:
+        task = asyncio.get_running_loop().create_task(lifecycle.request_shutdown(reason))
+        _pending.add(task)
+        task.add_done_callback(_pending.discard)
         return
-    task = asyncio.get_running_loop().create_task(lifecycle.request_shutdown(reason))
-    _pending.add(task)
-    task.add_done_callback(_pending.discard)
+    # F-86: fallback when the lifecycle is not wired yet (early boot).
+    # The old ``os.kill(os.getpid(), 15)`` LOOKS graceful but on Windows any
+    # non-CTRL signal is TerminateProcess -- a hard kill with no flushes and
+    # no exit code control (the very behavior documented in
+    # supervisor._pid_alive, contradicting the graceful intent here). Be
+    # honest about it: explicit hard exit, documented as such, with the
+    # reason on stderr so operators can tell how the process died.
+    sys.stderr.write(f"hard shutdown (lifecycle not initialised): {reason}\n")
+    os._exit(1)
 
 
 def kill(reason: str) -> None:

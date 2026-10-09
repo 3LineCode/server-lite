@@ -2,6 +2,14 @@
 
 Subscribe to any pyline core event; handlers may be sync or async. This
 skeleton demonstrates the common lifecycle points.
+
+Hot-reload note: this module's ``register(bus)`` runs once, when the module
+is first imported. After ``update game.events`` the framework swaps the code
+of every function in place but does NOT re-run ``register`` -- handler
+additions/removals in a reloaded events module are yours to manage (call
+``register`` from a module-level ``__reload__()`` hook, or unsubscribe stale
+handlers in ``PreReloadEvent``). Existing handler code itself picks up the
+new bodies automatically; see docs/hot-reload.md.
 """
 
 from pyline.core.events import (

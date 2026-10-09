@@ -77,7 +77,7 @@ async def _drop_database(settings: MySQLSettings) -> None:
         host=settings.host,
         port=settings.port,
         user=settings.user,
-        password=settings.password,
+        password=settings.password.get_secret_value(),
         autocommit=True,
     )
     try:

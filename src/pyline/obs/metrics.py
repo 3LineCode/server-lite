@@ -52,6 +52,11 @@ class Metrics:
             f"{namespace}_ipc_spoofed_total",
             "ZMQ messages dropped: claimed from-service != actual sender identity",
         )
+        self.proxy_spoofed = Counter(
+            f"{namespace}_proxy_spoofed_total",
+            "Proxy @fwd messages dropped: claimed from-service machine != sending "
+            "connection's registered machine",
+        )
         self.rpc_origin_rejects = Counter(
             f"{namespace}_rpc_origin_rejects_total",
             "RPC messages dropped: result/call origin failed validation",
@@ -131,16 +136,30 @@ class AlarmHub:
         self._all: list[Callable[[str, dict[str, Any]], None]] = []
 
     def register(self, kind: str, callback: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
-        self._subs.setdefault(kind, []).append(callback)
+        # F-90b: same callback registered twice delivered every alarm twice
+        # (the hub has no dedupe) -- register() now no-ops on re-register,
+        # symmetric with EventBus.subscribe.
+        handlers = self._subs.setdefault(kind, [])
+        if callback not in handlers:
+            handlers.append(callback)
         return lambda: self._unsubscribe(kind, callback)
 
-    def register_all(self, callback: Callable[[str, dict[str, Any]], None]) -> None:
-        self._all.append(callback)
+    def register_all(self, callback: Callable[[str, dict[str, Any]], None]) -> Callable[[], None]:
+        """Subscribe to every alarm kind; returns the unsubscribe fn (F-90b:
+        the asymmetric ``-> None`` left catch-all subscribers permanently
+        wedged, and duplicate registrations double-delivered)."""
+        if callback not in self._all:
+            self._all.append(callback)
+        return lambda: self._unsubscribe_all(callback)
 
     def _unsubscribe(self, kind: str, callback: Callable[[dict[str, Any]], None]) -> None:
         handlers = self._subs.get(kind)
         if handlers and callback in handlers:
             handlers.remove(callback)
+
+    def _unsubscribe_all(self, callback: Callable[[str, dict[str, Any]], None]) -> None:
+        if callback in self._all:
+            self._all.remove(callback)
 
     def emit(self, kind: str, payload: dict[str, Any]) -> None:
         for callback in self._subs.get(kind, []):

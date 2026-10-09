@@ -19,7 +19,26 @@ directly.
 
 from __future__ import annotations
 
+from types import ModuleType
+from typing import TYPE_CHECKING
+
 from pyline.core.context import Context
+
+if TYPE_CHECKING:
+    # Static knowledge only: mypy keeps ``api.db.query`` style attribute
+    # access fully typed while the runtime import stays lazy (F-88).
+    from pyline.api import (  # noqa: F401
+        clock,
+        db,
+        debug,
+        env,
+        log,
+        orm,
+        registry,
+        rpc,
+        task,
+        timer,
+    )
 
 _BOUND: Context | None = None
 
@@ -55,7 +74,11 @@ def ctx() -> Context:
 
 
 def service(name: str) -> object:
-    """Fetch a runtime service handle registered by ServerRuntime."""
+    """Fetch a runtime service handle registered by ServerRuntime.
+
+    Untyped on purpose: some registrations are plain factory callables that
+    have no class to check against. Typed consumers use
+    ``ctx().service(name, cls)`` instead (F-87)."""
     value = ctx().services.get(name)
     if value is None:
         raise ApiServiceUnavailableError(
@@ -64,17 +87,35 @@ def service(name: str) -> object:
     return value
 
 
-# Convenience: make ``pyline.api.env`` etc. resolve without extra imports.
-# Imported at the END to keep bind()/ctx() defined before circular imports.
-from pyline.api import (  # noqa: E402,F401
-    clock,
-    db,
-    debug,
-    env,
-    log,
-    orm,
-    registry,
-    rpc,
-    task,
-    timer,
+# F-88: importing ``pyline.api`` used to pull every facade submodule, and
+# with them the heavy dependency chain (asyncmy via api.db, zmq via
+# api.rpc) -- even for tools that only wanted bind()/ctx(). PEP 562 lazy
+# attribute resolution keeps the public surface (``from pyline import api``
+# then ``api.timer.call(...)``) while importing a submodule only on first
+# attribute access.
+_SUBMODULES = (
+    "clock",
+    "db",
+    "debug",
+    "env",
+    "log",
+    "orm",
+    "registry",
+    "rpc",
+    "task",
+    "timer",
 )
+
+
+def __getattr__(name: str) -> ModuleType:
+    if name in _SUBMODULES:
+        import importlib
+
+        module = importlib.import_module(f"pyline.api.{name}")
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals().keys(), *_SUBMODULES})

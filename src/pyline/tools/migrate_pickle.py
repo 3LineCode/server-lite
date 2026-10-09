@@ -37,6 +37,7 @@ from typing import Any
 
 from pyline.config.loader import load_project_settings, load_table_defs
 from pyline.db.mysql import MySQLPool
+from pyline.db.schema import check_identifier
 from pyline.db.serialization import BLOB_MAGIC, dumps, loads
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,10 @@ async def migrate_blobs(
 ) -> MigrationReport:
     report = MigrationReport(execute=execute)
     for table, column in _blob_columns(tables):
+        # F-103: these names travel into f-string SQL below -- validate them
+        # the same way the schema layer does instead of trusting the config.
+        check_identifier(table)
+        check_identifier(column)
         col_report = ColumnReport(table=table, column=column)
         report.columns.append(col_report)
         spec_pk = _primary_key(tables, table)
@@ -141,7 +146,12 @@ async def migrate_blobs(
             try:
                 data = restricted_loads(bytes(blob))
                 converted = dumps(data, schema_version=1)
-                if loads(converted) != _normalize(data):
+                # F-65: normalize BOTH sides.  msgpack preserves int/bytes
+                # dict keys exactly like pickle does; comparing the raw loads
+                # result against the str()-keyed normalization reported every
+                # non-string-keyed row as a round-trip mismatch, so it was
+                # left as pickle and unreadable (bad magic) at runtime.
+                if _normalize(loads(converted)) != _normalize(data):
                     raise ValueError("round-trip mismatch")
             except Exception as exc:
                 col_report.failed += 1
@@ -159,7 +169,7 @@ async def migrate_blobs(
 def _primary_key(tables: dict[str, Any], table: str) -> str:
     for col_name, col_def in tables[table].fields.items():
         if col_def.primary:
-            return str(col_name)
+            return check_identifier(str(col_name))
     raise SystemExit(f"table {table!r} has no primary key column in tables config")
 
 

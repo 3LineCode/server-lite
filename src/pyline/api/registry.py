@@ -23,6 +23,11 @@ def server_by_ip(ip: str) -> int | None:
 
 
 def server_port(server_no: int) -> int:
+    """Inter-connect port of a server's main process.
+
+    Raises ConfigError for entries without ``server_port`` (F-84): they
+    cannot be addressed, and pretending port 0 works just moved the failure
+    to a confusing connect() attempt."""
     return api.ctx().registry.entry(server_no).process_port(0)
 
 

@@ -56,6 +56,40 @@ async def test_repeating_and_cancel() -> None:
     await sched.close()
 
 
+async def test_repeating_cancel_frees_pending_entry_f83(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-83: cancelling a repeating timer only flipped the stopped flag --
+    the pending entry kept occupying its slot until the deadline came round
+    and run_once no-op'd."""
+    monkeypatch.setattr("pyline.core.scheduler.SHORT_DELAY", 0.3)
+    sched = Scheduler(loop=asyncio.get_running_loop())
+    handle = sched.call_repeating(30.0, lambda: None, label="long-repeating")  # wheel path
+    assert sched.pending_count() == 1
+    handle.cancel()
+    assert sched.pending_count() == 0  # entry freed immediately, not at expiry
+
+    short = sched.call_repeating(30.0, lambda: None, label="short-repeating")
+    assert sched.pending_count() == 1
+    short.cancel()
+    assert sched.pending_count() == 0  # call_later path frees its slot too
+    await sched.close()
+
+
+async def test_repeating_left_tracks_next_beat_f83() -> None:
+    """F-83: left() was frozen at the FIRST deadline -- after the first tick
+    it reported 0.0 forever; it must track the next pending beat."""
+    sched = Scheduler(loop=asyncio.get_running_loop())
+    fires: list[float] = []
+    handle = sched.call_repeating(0.1, lambda: fires.append(time.monotonic()))
+    await asyncio.sleep(0.15)  # first beat fired, second is pending
+    remaining = handle.left()
+    assert 0.0 < remaining <= 0.1  # distance to the NEXT beat
+    assert len(fires) >= 1
+    handle.cancel()
+    await sched.close()
+
+
 async def test_repeating_reschedules_on_grid_not_on_fire_time() -> None:
     # regression: re-arming from the actual fire time let a slow callback
     # accumulate drift; the next deadline must stay on the original grid.

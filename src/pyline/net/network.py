@@ -88,9 +88,13 @@ class Network:
         """
         try:
             sub, args = unpack_call(payload)
-        except (ValueError, msgpack.exceptions.ExtraData):
+        except (ValueError, msgpack.exceptions.ExtraData, RecursionError):
+            # F-78: RecursionError covers adversarially deep msgpack nesting
+            # (msgpack builds containers recursively while unpacking); it is
+            # not a ValueError, so one such payload used to escape this
+            # handler and tear down the dispatch path.
             self._unknown_subs += 1
-            logger.exception("bad payload for flag %r (total=%d)", flag, self._unknown_subs)
+            logger.warning("bad payload for flag %r (total=%d)", flag, self._unknown_subs)
             return
         handler = self._handlers.get(sub)
         if handler is None:

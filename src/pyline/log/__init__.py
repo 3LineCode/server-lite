@@ -16,11 +16,22 @@ import structlog
 
 from pyline.config.models import LogSettings
 
-_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+# F-80: pid + logger name in every line. Multi-process deployments share the
+# run dir; without the pid the operator cannot tell which process wrote a
+# line, and without the logger name every stdlib line looks identical.
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] pid=%(process)d %(name)s: %(message)s"
 
 
 def setup_logging(settings: LogSettings, *, process_tag: str, run_dir: Path) -> None:
-    """Configure the process-wide logging pipeline once at boot."""
+    """Configure the process-wide logging pipeline once at boot.
+
+    F-80: the main process and every sub-process used to write the SAME
+    ``os.log`` -- concurrent writers interleave under POSIX and on Windows
+    the midnight rollover's ``os.rename`` fails outright (file open in
+    another process). Each process now writes its own ``os-<tag>.log``
+    (``process_tag`` is always provided by the runtime, so the plain
+    ``os.log`` name survives only for an empty tag).
+    """
     root = logging.getLogger()
     root.setLevel(settings.level)
 
@@ -28,8 +39,9 @@ def setup_logging(settings: LogSettings, *, process_tag: str, run_dir: Path) -> 
     console.setFormatter(logging.Formatter(_LOG_FORMAT))
     _set_handlers(root, console)
 
+    file_name = f"os-{process_tag}.log" if process_tag else "os.log"
     file_handler = logging.handlers.TimedRotatingFileHandler(
-        run_dir / "os.log",
+        run_dir / file_name,
         when="midnight",
         backupCount=settings.retention_days,
         encoding="utf-8",
@@ -63,28 +75,41 @@ def _set_handlers(root: logging.Logger, *handlers: logging.Handler) -> None:
         root.addHandler(handler)
 
 
-# Keyed by (name, target path, rotation): the same channel name requested
-# with a different run_dir (multi-setup tests, re-init) used to silently
-# return the OLD channel writing to the OLD file (F-22).
-_file_channels: dict[tuple[str, str, int], logging.Logger] = {}
+# Keyed by channel name only, holding (target path, rotation, logger): the
+# named logger is a stdlib singleton, so at most one live target may exist
+# per name. The same channel name requested with a different run_dir
+# (multi-setup tests, re-init) used to silently return the OLD channel
+# writing to the OLD file (F-22), and simply adding another handler produced
+# a double-writing logger: every record landed in BOTH the old and the new
+# file (F-79). The cache now tracks the single live target per name.
+_file_channels: dict[str, tuple[str, int, logging.Logger]] = {}
 
 
 def file_logger(name: str, run_dir: Path, *, rotation_mb: int = 64) -> logging.Logger:
     """Get (or create) a dedicated rotating file channel, e.g. ``file_logger("database")``.
 
     Writes to ``<run_dir>/<name>.log`` with size-based rotation; used for
-    operational channels like verify/audit/save in the prototype.
+    operational channels like verify/audit/save in the prototype. Requesting
+    the same name with a different ``run_dir``/``rotation_mb`` RETARGETS the
+    channel: the previous handler is detached and closed first (F-79), so the
+    name never writes to a stale file.
     """
     target = run_dir / f"{name}.log"
-    key = (name, str(target), rotation_mb)
-    channel = _file_channels.get(key)
-    if channel is not None:
-        return channel
+    cached = _file_channels.get(name)
+    if cached is not None and cached[0] == str(target) and cached[1] == rotation_mb:
+        return cached[2]
+
     channel = logging.getLogger(f"pyline.channel.{name}")
+    # The logger object is a per-name singleton shared across callers: detach
+    # whatever it currently holds before installing the new target, or the
+    # old handler keeps writing (and holds the old file open on Windows).
+    for old_handler in list(channel.handlers):
+        channel.removeHandler(old_handler)
+        old_handler.close()
     channel.setLevel(logging.INFO)
     channel.propagate = False
     handler = logging.handlers.RotatingFileHandler(
-        run_dir / f"{name}.log",
+        target,
         maxBytes=rotation_mb * 1024 * 1024,
         backupCount=7,
         encoding="utf-8",
@@ -92,12 +117,20 @@ def file_logger(name: str, run_dir: Path, *, rotation_mb: int = 64) -> logging.L
     )
     handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s"))
     channel.addHandler(handler)
-    _file_channels[key] = channel
+    _file_channels[name] = (str(target), rotation_mb, channel)
     return channel
 
 
 def clear_file_channels() -> None:
-    """Drop cached channels (test isolation / re-setup)."""
+    """Drop cached channels (test isolation / re-setup).
+
+    F-79: also closes the dropped handlers -- an open RotatingFileHandler
+    pins the old file on Windows and blocks tmp_path cleanup.
+    """
+    for _target, _rotation, channel in _file_channels.values():
+        for handler in list(channel.handlers):
+            channel.removeHandler(handler)
+            handler.close()
     _file_channels.clear()
 
 

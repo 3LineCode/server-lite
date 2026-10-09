@@ -4,19 +4,48 @@
   roll over automatically (``d_Time``/``d_Data``/``d_Last``).
 * ``DataOP``: the day/week/timed/permanent/temporary KV families, one layer
   of history for day/week data.
-* ``SaverDataOP``: mixin combining DataOP with an ORM-tracked model.
 
 Serialization keeps the prototype's ``{"T": .., "D": .., "L": ..}`` /
 ``{"d__Last": ..}`` shapes so existing persisted blobs stay readable. The
 prototype's TimeUpset key/duration confusion is fixed (duration now keyed
 by the key, not compared against a duration value).
+
+Persistence with the framework ORM (``pyline.api.orm``): there is no
+"SaverDataOP" magic mixin -- combine the pieces yourself::
+
+    from pyline.api import orm
+    from pyline.db.orm import DataclassCodec, TrackableModel
+
+    class PlayerData(DataOP, TrackableModel):
+        def __init__(self) -> None:
+            self._d_op_init()          # day/week/timed/... containers
+
+        @classmethod
+        def _hydrate(cls, saved: dict) -> PlayerData:
+            player = cls()
+            player.DataOPLoad(saved)
+            return player
+
+    codec = DataclassCodec(PlayerData.DataOPSave, PlayerData._hydrate)
+    saver = orm.make_saver("tbl_player", "data", uid, codec=codec)
+    player = await saver.load()
+    if player is None:                 # first login: insert the row
+        player = PlayerData()
+        saver.set_data(player)
+    player.bind_saver(saver)           # attribute writes mark the saver dirty
+
+    ...
+    player.DayAdd("login_count")       # plain-attribute writes inside
+    player.touch()                     # DataOP are NOT seen automatically:
+                                       # dict mutations need an explicit touch
+    # auto-save flushes dirty savers in the background; see pyline.api.orm.
+
+``DataOPSave``/``DataOPLoad`` exclude ``m_Temp`` (session-only data).
 """
 
 from __future__ import annotations
 
 from typing import Any
-
-from pyline.api import clock
 
 from .com_time import GetDayNo, GetTime, GetWeekNo
 

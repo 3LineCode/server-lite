@@ -23,14 +23,16 @@ from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager
 from typing import Any
 
+from pyline.config.errors import ConfigError
 from pyline.db.mysql import MySQLPool, MySQLSession
 from pyline.db.redis import RedisClient
 from pyline.db.transaction import (
     TransactionExecutor,
+    TransactionJournal,
     bind_transaction,
     current_transaction,
 )
-from pyline.net.rpc import RpcManager
+from pyline.net.rpc import RpcManager, RpcTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,7 @@ RPC_TX_EXECUTE = "pyline.db.tx_execute"
 RPC_TX_QUERY = "pyline.db.tx_query"
 RPC_TX_COMMIT = "pyline.db.tx_commit"
 RPC_TX_ROLLBACK = "pyline.db.tx_rollback"
+RPC_TX_STATUS = "pyline.db.tx_status"
 
 
 class TransactionGoneError(Exception):
@@ -91,7 +94,12 @@ class _TxRecord:
 
     def __init__(self, session: MySQLSession) -> None:
         self.session = session
-        self.created = time.monotonic()
+        self.last_active = time.monotonic()
+
+    def touch(self) -> None:
+        """F-47: the TTL bounds *idle* time -- an active transaction must not
+        be rolled back for simply being long."""
+        self.last_active = time.monotonic()
 
     async def dispose(self, *, rollback: bool) -> None:
         if rollback:
@@ -110,6 +118,7 @@ class DatabaseService:
         *,
         tx_ttl: float = 60.0,
         max_transactions: int = 32,
+        outcome_ttl: float = 300.0,
     ) -> None:
         self._pool = pool
         self._redis = redis
@@ -121,6 +130,13 @@ class DatabaseService:
         self._tx_ttl = tx_ttl
         self._max_transactions = max_transactions
         self._dispose_tasks: set[asyncio.Task[None]] = set()
+        # F-61: how finished transactions ended, so a caller whose COMMIT rpc
+        # timed out can reconcile the ambiguous outcome.  Entries expire on
+        # their own; past the ttl the answer decays to "unknown", which the
+        # caller already treats as failure + retry (upserts are idempotent).
+        self._outcomes: dict[str, tuple[str, float]] = {}
+        self._outcome_ttl = outcome_ttl
+        self._closed = False
 
     def expose(self, rpc: RpcManager) -> None:
         rpc.register(RPC_QUERY, self.rpc_query)
@@ -133,6 +149,7 @@ class DatabaseService:
         rpc.register(RPC_TX_QUERY, self.rpc_tx_query)
         rpc.register(RPC_TX_COMMIT, self.rpc_tx_commit)
         rpc.register(RPC_TX_ROLLBACK, self.rpc_tx_rollback)
+        rpc.register(RPC_TX_STATUS, self.rpc_tx_status)
 
     async def rpc_query(self, sql: str, args: list[Any]) -> list[list[Any]]:
         rows = await self._pool.query(sql, tuple(args))
@@ -156,6 +173,8 @@ class DatabaseService:
         return len(self._tx)
 
     async def rpc_tx_begin(self) -> str:
+        if self._closed:
+            raise ConnectionError("database service is closed")
         self._reap_expired()
         if isinstance(self._pool, NullPool):
             raise ConnectionError("mysql not enabled on this server")
@@ -183,37 +202,88 @@ class DatabaseService:
         return record
 
     async def rpc_tx_execute(self, tx_id: str, sql: str, args: list[Any]) -> int:
-        return await self._live_tx(tx_id).session.execute(sql, tuple(args))
+        self._reap_expired()
+        record = self._live_tx(tx_id)
+        record.touch()
+        return await record.session.execute(sql, tuple(args))
 
     async def rpc_tx_query(self, tx_id: str, sql: str, args: list[Any]) -> list[list[Any]]:
-        rows = await self._live_tx(tx_id).session.query(sql, tuple(args))
+        self._reap_expired()
+        record = self._live_tx(tx_id)
+        record.touch()
+        rows = await record.session.query(sql, tuple(args))
         return [list(row) for row in rows]
 
     async def rpc_tx_commit(self, tx_id: str) -> None:
         record = self._tx.pop(tx_id, None)
         if record is None:
             raise TransactionGoneError(f"transaction {tx_id} already finished")
-        await record.session.commit()
-        await record.session.close()
+        # F-47: a failed COMMIT must not leak the dedicated connection -- the
+        # record is already popped, so the caller's rollback remedy would
+        # only see TransactionGoneError and the session would stay open.
+        try:
+            await record.session.commit()
+        except BaseException:
+            # F-61: a failed COMMIT leaves the server-side outcome genuinely
+            # unknown (the connection may have died mid-commit), never
+            # "committed".
+            self._record_outcome(tx_id, "unknown")
+            raise
+        finally:
+            await record.session.close()
+        self._record_outcome(tx_id, "committed")
 
     async def rpc_tx_rollback(self, tx_id: str) -> None:
         record = self._tx.pop(tx_id, None)
         if record is None:
             raise TransactionGoneError(f"transaction {tx_id} already finished")
+        # F-61: recorded before the dispose so the outcome is visible even if
+        # the rollback itself then hangs or fails.
+        self._record_outcome(tx_id, "rolled_back")
         await record.dispose(rollback=True)
 
+    async def rpc_tx_status(self, tx_id: str) -> str:
+        """F-61: ``'committed' | 'rolled_back' | 'unknown'`` for a transaction.
+
+        ``unknown`` covers both expiry of the recorded outcome and a COMMIT
+        still in flight on another coroutine -- callers treat it as failure
+        plus retry, which upsert idempotency makes safe.
+        """
+        self._prune_outcomes()
+        entry = self._outcomes.get(tx_id)
+        if entry is not None:
+            return entry[0]
+        return "unknown"
+
+    def _record_outcome(self, tx_id: str, outcome: str) -> None:
+        now = time.monotonic()
+        self._outcomes = {
+            tx: (o, ts) for tx, (o, ts) in self._outcomes.items() if now - ts <= self._outcome_ttl
+        }
+        self._outcomes[tx_id] = (outcome, now)
+
+    def _prune_outcomes(self) -> None:
+        now = time.monotonic()
+        self._outcomes = {
+            tx: (o, ts) for tx, (o, ts) in self._outcomes.items() if now - ts <= self._outcome_ttl
+        }
+
     def _reap_expired(self) -> None:
-        """Lazy TTL sweep on every begin: abandoned sessions are rolled back.
+        """Lazy TTL sweep on begin/execute/query: abandoned sessions are
+        rolled back.
 
         A caller that dies between BEGIN and COMMIT would otherwise pin a
-        dedicated connection (and its locks) forever.
+        dedicated connection (and its locks) forever. The TTL bounds idle
+        time (F-47): activity via execute/query pushes ``last_active``
+        forward, so a legitimately long transaction is not reaped.
         """
         now = time.monotonic()
         for tx_id, record in list(self._tx.items()):
-            if now - record.created > self._tx_ttl:
+            if now - record.last_active > self._tx_ttl:
                 self._tx.pop(tx_id, None)
+                self._record_outcome(tx_id, "rolled_back")  # F-61
                 logger.error(
-                    "remote transaction %s exceeded ttl %.0fs; rolling back and "
+                    "remote transaction %s idle over ttl %.0fs; rolling back and "
                     "closing its session",
                     tx_id,
                     self._tx_ttl,
@@ -221,6 +291,41 @@ class DatabaseService:
                 task = asyncio.get_running_loop().create_task(record.dispose(rollback=True))
                 self._dispose_tasks.add(task)
                 task.add_done_callback(self._dispose_tasks.discard)
+
+    async def close(self, *, timeout: float = 10.0) -> None:
+        """F-101: shutdown hook for the DB process.
+
+        Roll back and close every live remote-transaction session (the
+        process used to just drop them and hope the TCP peer dying would
+        clean up), wait for the lazy TTL reapers so no dispose task outlives
+        this await, and refuse new transaction begins afterwards.  The pools
+        themselves stay owned by their wiring layer.
+        """
+        self._closed = True
+        loop = asyncio.get_running_loop()
+        disposes: list[asyncio.Task[None]] = []
+        for tx_id, record in list(self._tx.items()):
+            self._tx.pop(tx_id, None)
+            self._record_outcome(tx_id, "rolled_back")  # F-61
+            disposes.append(loop.create_task(record.dispose(rollback=True)))
+        disposes.extend(self._dispose_tasks)
+        if not disposes:
+            return
+        done, pending = await asyncio.wait(disposes, timeout=timeout)
+        for task in done:
+            if not task.cancelled() and task.exception() is not None:
+                logger.error("session dispose failed during close: %r", task.exception())
+        if pending:
+            logger.error(
+                "database service close(): %d session dispose(s) did not finish "
+                "within %.1fs; cancelling them",
+                len(pending),
+                timeout,
+            )
+            for task in pending:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
 
 class _RemoteTxExecutor:
@@ -242,20 +347,49 @@ class _RemoteTxExecutor:
 async def _remote_transaction(access: DatabaseAccess) -> AsyncIterator[TransactionExecutor]:
     tx_id = str(await access._remote_call(RPC_TX_BEGIN))
     executor = _RemoteTxExecutor(access, tx_id)
+    # F-60: the journal must outlive the bind -- the COMMIT rpc runs after
+    # the block body, outside bind_transaction, and its failure must still
+    # re-mark the savers that already flushed into the unit.
+    journal = TransactionJournal()
     try:
-        async with bind_transaction(executor):
+        async with bind_transaction(executor, journal=journal):
             yield executor
     except BaseException:
+        journal.remark_rolled_back()
         with contextlib.suppress(Exception):
             await access._remote_call(RPC_TX_ROLLBACK, tx_id)
         raise
-    await access._remote_call(RPC_TX_COMMIT, tx_id)
+    try:
+        await access._remote_call(RPC_TX_COMMIT, tx_id)
+    except RpcTimeoutError:
+        # F-61: the rpc timed out, but the DB process may have committed
+        # anyway -- reconcile the outcome once instead of guessing.  A
+        # reconciled success returns normally; anything else re-marks the
+        # flushed savers (idempotent upserts make a false failure safe) and
+        # re-raises.
+        if await access._tx_outcome(tx_id) == "committed":
+            return
+        journal.remark_rolled_back()
+        raise
+    except BaseException:
+        journal.remark_rolled_back()  # F-60: commit failed on the server side
+        raise
 
 
 @contextlib.asynccontextmanager
 async def _local_transaction(pool: PoolLike) -> AsyncIterator[TransactionExecutor]:
-    async with pool.transaction() as session, bind_transaction(session):
-        yield session
+    # F-60: keep the journal alive across the pool context's COMMIT.  The
+    # pool commits (and raises on failure) from its own __aexit__, which runs
+    # AFTER bind_transaction has exited cleanly -- without this wrapper a
+    # failed COMMIT left the flushed savers popped off the dirty queue while
+    # the database rolled their rows back (silent divergence).
+    journal = TransactionJournal()
+    try:
+        async with pool.transaction() as session, bind_transaction(session, journal=journal):
+            yield session
+    except BaseException:
+        journal.remark_rolled_back()
+        raise
 
 
 class DatabaseAccess:
@@ -268,15 +402,30 @@ class DatabaseAccess:
         remote: RpcManager | None = None,
         db_service_no: int | None = None,
     ) -> None:
-        if local is None and (remote is None or db_service_no is None):
+        if local is None and remote is None:
             raise ValueError("DatabaseAccess needs a local service or remote rpc target")
         self._local = local
         self._remote = remote
+        # F-104: ``db_service_no=None`` means this server has no db process at
+        # all (pure gateway: use_mysql off and no 'db' sub_process).  Boot
+        # must succeed for such a server, so the value is only checked when
+        # the database is actually touched -- loudly.
         self._db_service_no = db_service_no
 
     def _remote_call(self, func_path: str, *args: Any) -> Any:
-        assert self._remote is not None and self._db_service_no is not None
+        if self._remote is None or self._db_service_no is None:
+            raise ConfigError(
+                "this server has no db process (enable use_mysql or add a 'db' sub_process)"
+            )
         return self._remote.call(self._db_service_no, func_path, *args)
+
+    async def _tx_outcome(self, tx_id: str) -> str:
+        """F-61: best-effort outcome reconciliation; a failed status rpc
+        counts as unknown (the caller treats that as failure + retry)."""
+        try:
+            return str(await self._remote_call(RPC_TX_STATUS, tx_id))
+        except Exception:
+            return "unknown"
 
     @property
     def _local_pool(self) -> PoolLike:

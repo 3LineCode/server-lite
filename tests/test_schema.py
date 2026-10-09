@@ -26,6 +26,27 @@ def make_def() -> TableDef:
     )
 
 
+class FakeSchemaLockSession:
+    """Stands in for the dedicated MySQLSession that holds GET_LOCK (F-67)."""
+
+    def __init__(self, pool: SchemaFakePool) -> None:
+        self._pool = pool
+        self.closed = False
+        self.released = False
+
+    async def query(self, sql: str, args: tuple = ()) -> list[tuple]:
+        self._pool.lock_statements.append((sql, args))
+        if sql.startswith("SELECT GET_LOCK"):
+            return [(self._pool.get_lock_result,)]
+        if sql.startswith("SELECT RELEASE_LOCK"):
+            self.released = True
+            return [(1,)]
+        return []
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 class SchemaFakePool:
     """Minimal MySQLPool stand-in exercising SchemaManager's SQL contract."""
 
@@ -41,6 +62,17 @@ class SchemaFakePool:
         # columns: table -> list of (name, column_type, is_nullable)
         self.columns: dict[str, list[tuple[str, str, str]]] = dict(columns or {})
         self.version = version
+        # F-51: migration -> statements applied by a (possibly failed) attempt
+        self.migration_progress: dict[int, int] = {}
+        # F-67: the dedicated GET_LOCK session
+        self.get_lock_result = 1
+        self.lock_statements: list[tuple[str, tuple]] = []
+        self.sessions: list[FakeSchemaLockSession] = []
+
+    async def open_session(self) -> FakeSchemaLockSession:
+        session = FakeSchemaLockSession(self)
+        self.sessions.append(session)
+        return session
 
     async def execute(self, sql: str, args: tuple = ()) -> int:
         self.statements.append((sql, args))
@@ -50,6 +82,10 @@ class SchemaFakePool:
             self.columns.setdefault(create.group(1), [])
         elif sql.startswith(("INSERT INTO `pyline_schema`", "UPDATE `pyline_schema`")):
             self.version = args[0]
+        elif sql.startswith("INSERT INTO `pyline_schema_progress`"):
+            self.migration_progress[args[0]] = args[1]
+        elif sql.startswith("DELETE FROM `pyline_schema_progress`"):
+            self.migration_progress.pop(args[0], None)
         alter = re.search(r"ALTER TABLE `(\w+)` ADD COLUMN `(\w+)` (`\w+` \w+)", sql)
         if alter:
             self.columns.setdefault(alter.group(1), []).append(
@@ -63,6 +99,9 @@ class SchemaFakePool:
             return [(t,) for t in self.tables]
         if sql.startswith("SELECT `version` FROM `pyline_schema`"):
             return [(self.version,)]
+        if sql.startswith("SELECT `statements` FROM `pyline_schema_progress`"):
+            statements = self.migration_progress.get(args[0])
+            return [(statements,)] if statements is not None else []
         if "information_schema.COLUMNS" in sql:
             table = args[1]
             if "IS_NULLABLE" in sql:
@@ -216,6 +255,80 @@ class TestVersionedMigration:
         with pytest.raises(SchemaError, match="duplicate migration numbers"):
             await manager.ensure_all()
 
+    async def test_failed_migration_resumes_from_failed_statement(self, tmp_path: Path) -> None:
+        """F-51: a statement failing mid-file used to leave no progress; the
+        next boot re-ran the WHOLE file, trusting script idempotency. Now it
+        resumes from the failed statement only."""
+
+        class FailBoomOnce(SchemaFakePool):
+            boom_seen = False
+
+            async def execute(self, sql: str, args: tuple = ()) -> int:
+                if "CREATE TABLE `boom`" in sql and not self.boom_seen:
+                    self.boom_seen = True
+                    raise ConnectionError("migration statement failed")
+                return await super().execute(sql, args)
+
+        migrations = tmp_path / "migrations"
+        migrations.mkdir()
+        (migrations / "001_init.sql").write_text(
+            "CREATE TABLE `tbl_a` (id INT);\n"
+            "CREATE TABLE `boom` (id INT);\n"
+            "CREATE TABLE `tbl_c` (id INT);\n",
+            encoding="utf-8",
+        )
+        pool = FailBoomOnce()
+        manager = SchemaManager(pool, {"tbl_player": make_def()}, "db", migrations_dir=migrations)
+        with pytest.raises(ConnectionError, match="migration statement failed"):
+            await manager.ensure_all()
+        assert pool.migration_progress == {1: 1}  # first statement landed, second failed
+
+        # next boot: resumes at statement 2, does not re-run statement 1
+        pool2 = SchemaFakePool(tables={"pyline_schema", "pyline_schema_progress", "tbl_player"})
+        pool2.migration_progress = {1: 1}
+        manager2 = SchemaManager(pool2, {"tbl_player": make_def()}, "db", migrations_dir=migrations)
+        await manager2.ensure_all()
+        assert pool2.migration_progress == {}  # completed: progress row cleared
+        assert pool2.version == 1
+        firsts = [sql for sql, _ in pool2.statements if "tbl_a" in sql]
+        assert not firsts  # statement 1 was NOT re-executed
+        booms = [sql for sql, _ in pool2.statements if "`boom`" in sql and "CREATE" in sql]
+        assert len(booms) == 1
+        tbl_c = [sql for sql, _ in pool2.statements if "`tbl_c`" in sql and "CREATE" in sql]
+        assert len(tbl_c) == 1
+
+    async def test_completed_statements_only_crashed_before_version(self, tmp_path: Path) -> None:
+        """F-51: all statements landed but the process died before the version
+        update -- the next boot completes the version bump without re-running
+        any statement."""
+        migrations = tmp_path / "migrations"
+        migrations.mkdir()
+        (migrations / "001_init.sql").write_text(
+            "CREATE TABLE `tbl_a` (id INT);\nCREATE TABLE `tbl_b` (id INT);\n",
+            encoding="utf-8",
+        )
+        pool = SchemaFakePool(tables={"pyline_schema", "pyline_schema_progress", "tbl_player"})
+        pool.migration_progress = {1: 2}  # everything applied, version not bumped
+        manager = SchemaManager(pool, {"tbl_player": make_def()}, "db", migrations_dir=migrations)
+        await manager.ensure_all()
+        assert pool.version == 1
+        creates = [sql for sql, _ in pool.statements if "CREATE TABLE `tbl_" in sql]
+        assert not creates  # nothing re-executed
+
+    async def test_shrunk_migration_file_refused(self, tmp_path: Path) -> None:
+        """F-51: progress beyond the file's statement count means the file was
+        edited after a failed attempt -- refuse instead of mis-resuming."""
+        migrations = tmp_path / "migrations"
+        migrations.mkdir()
+        (migrations / "001_init.sql").write_text(
+            "CREATE TABLE `tbl_a` (id INT);\n", encoding="utf-8"
+        )
+        pool = SchemaFakePool(tables={"pyline_schema", "pyline_schema_progress", "tbl_player"})
+        pool.migration_progress = {1: 5}
+        manager = SchemaManager(pool, {"tbl_player": make_def()}, "db", migrations_dir=migrations)
+        with pytest.raises(SchemaError, match="the file changed in between"):
+            await manager.ensure_all()
+
     async def test_schema_drift_detected(self) -> None:
         pool = SchemaFakePool(
             tables={"tbl_player"},
@@ -268,3 +381,94 @@ class TestVersionedMigration:
         await manager.ensure_all()
         alters = [sql for sql, _ in pool.statements if sql.startswith("ALTER TABLE")]
         assert alters and all(sql.endswith("ALGORITHM=INSTANT, LOCK=NONE") for sql in alters)
+
+    async def test_migration_file_with_semicolon_comments(self, tmp_path: Path) -> None:
+        """F-66 end to end: a semicolon inside a ``--`` comment used to split
+        the comment open and glue its tail onto the next statement."""
+        migrations = tmp_path / "migrations"
+        migrations.mkdir()
+        (migrations / "001_c.sql").write_text(
+            "-- create the foo; bar tables\n"
+            "CREATE TABLE `tbl_a` (id INT); -- trailing note; with semicolon\n"
+            "\n-- a whole comment; line\n"
+            "CREATE TABLE `tbl_b` (id INT)\n;",
+            encoding="utf-8",
+        )
+        pool = SchemaFakePool()
+        manager = SchemaManager(pool, {"tbl_player": make_def()}, "db", migrations_dir=migrations)
+        await manager.ensure_all()
+        creates = [
+            sql
+            for sql, _ in pool.statements
+            if sql.startswith(("CREATE TABLE `tbl_a`", "CREATE TABLE `tbl_b`"))
+        ]
+        assert creates == ["CREATE TABLE `tbl_a` (id INT)", "CREATE TABLE `tbl_b` (id INT)"]
+
+
+class TestSplitStatementsF66:
+    def test_semicolon_inside_comment_does_not_split(self) -> None:
+        from pyline.db.schema import _split_statements
+
+        sql = (
+            "-- create the foo; bar tables\n"
+            "CREATE TABLE `a` (id INT); -- trailing note; with semicolon\n"
+            "\n-- a whole comment; line\n"
+            "CREATE TABLE `b` (id INT)\n;"
+        )
+        assert _split_statements(sql) == ["CREATE TABLE `a` (id INT)", "CREATE TABLE `b` (id INT)"]
+
+    def test_plain_statements_unchanged(self) -> None:
+        from pyline.db.schema import _split_statements
+
+        sql = "SELECT 1;\nSELECT 2;\n"
+        assert _split_statements(sql) == ["SELECT 1", "SELECT 2"]
+
+
+class TestMigrationLockF67:
+    async def test_ensure_all_takes_and_releases_named_lock(self) -> None:
+        """F-67: the whole ensure+migrate cycle runs while holding a MySQL
+        named lock scoped to this database, and the lock is released on the
+        dedicated session that took it."""
+        pool = SchemaFakePool()
+        manager = SchemaManager(pool, {"tbl_player": make_def()}, "test_db")
+        await manager.ensure_all()
+        assert len(pool.sessions) == 1
+        get_locks = [sql for sql, _ in pool.lock_statements if sql.startswith("SELECT GET_LOCK")]
+        assert get_locks == ["SELECT GET_LOCK(%s, %s)"]
+        _sql, args = pool.lock_statements[0]
+        assert args == ("pyline_schema.test_db", 60)
+        releases = [sql for sql, _ in pool.lock_statements if sql.startswith("SELECT RELEASE_LOCK")]
+        assert releases == ["SELECT RELEASE_LOCK(%s)"]
+        assert pool.sessions[0].released and pool.sessions[0].closed
+
+    async def test_lock_unavailable_fails_loudly(self) -> None:
+        """F-67: a peer holding the lock past the bounded wait is an error --
+        never a silent skip that would migrate unsynchronized."""
+        pool = SchemaFakePool()
+        pool.get_lock_result = 0
+        manager = SchemaManager(pool, {"tbl_player": make_def()}, "test_db")
+        with pytest.raises(SchemaError, match="migration lock"):
+            await manager.ensure_all()
+        assert pool.statements == []  # nothing was ensured or migrated
+        assert pool.sessions[0].closed  # the dedicated session is cleaned up
+
+    async def test_server_error_on_get_lock_fails_loudly(self) -> None:
+        pool = SchemaFakePool()
+        pool.get_lock_result = None  # NULL: server-side error
+        manager = SchemaManager(pool, {"tbl_player": make_def()}, "test_db")
+        with pytest.raises(SchemaError, match="migration lock"):
+            await manager.ensure_all()
+
+    async def test_lock_released_when_migration_fails(self) -> None:
+        """F-67: a migration statement exploding mid-file must still release
+        the lock and close the session (finally, not luck)."""
+
+        class BoomPool(SchemaFakePool):
+            async def execute(self, sql: str, args: tuple = ()) -> int:
+                raise ConnectionError("db gone mid-migration")
+
+        pool = BoomPool()
+        manager = SchemaManager(pool, {"tbl_player": make_def()}, "test_db")
+        with pytest.raises(ConnectionError, match="mid-migration"):
+            await manager.ensure_all()
+        assert pool.sessions[0].released and pool.sessions[0].closed

@@ -49,7 +49,11 @@ uv run mypy src
 
 v1.0.0-rc.1: P0-P5 core plus the full migration-finish pass (F-01..F-30 in
 `docs/migration-plan.md` -- data safety, network robustness, kernel,
-hot-reload guards, business facade) and the two code-review passes on top
-(F-31..F-37, F-38..F-45 -- see `CHANGELOG.md`). See `docs/plan.md`
-(master plan), `docs/hot-reload.md` (reload contract) and
-`docs/deployment.md` (trust model and platform limits before going public).
+hot-reload guards, business facade) and three code-review passes on top
+(F-31..F-37, F-38..F-45, F-46..F-57 -- see `CHANGELOG.md`; the latest closes
+every finding of the full project assessment: auto-save poison-row survival,
+remote-transaction connection/TTL safety, @fwd origin binding, secret repr
+masking, metrics endpoint auth, migration resume, coverage restored to 78%).
+See `docs/plan.md` (master plan), `docs/hot-reload.md` (reload contract and
+known limits) and `docs/deployment.md` (trust model and platform limits
+before going public).

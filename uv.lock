@@ -903,7 +903,7 @@ wheels = [
 
 [[package]]
 name = "pyline"
-version = "0.1.0"
+version = "1.0.0rc1"
 source = { editable = "." }
 dependencies = [
     { name = "aioconsole" },

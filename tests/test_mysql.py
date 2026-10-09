@@ -5,15 +5,19 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 import pyline.db.mysql as mysql_mod
 from pyline.config.models import MySQLSettings
-from pyline.db.mysql import MySQLPool, ensure_database
+from pyline.db.mysql import MySQLPool, PoolAcquireTimeoutError, ensure_database
 
 
 class FakeCursor:
     def __init__(self, exc: BaseException | None = None, row: tuple = (1,)) -> None:
         self._exc = exc
         self._row = row
+        self.rowcount = 1
+        self._sql = ""
 
     async def __aenter__(self) -> FakeCursor:
         return self
@@ -29,6 +33,9 @@ class FakeCursor:
     async def fetchone(self) -> tuple:
         return self._row
 
+    async def fetchall(self) -> list[tuple]:
+        return [self._row]
+
 
 class FakeConn:
     def __init__(self, exc: BaseException | None = None, row: tuple = (1,)) -> None:
@@ -40,6 +47,9 @@ class FakeConn:
         return FakeCursor(self._exc, self._row)
 
     async def ensure_closed(self) -> None:
+        pass
+
+    async def commit(self) -> None:
         pass
 
 
@@ -212,4 +222,208 @@ class TestRecovery:
         pool._keepalive_done(task)  # first death: fires on_lost, arms recovery
         pool._keepalive_done(task)  # repeat while already lost: no re-fire
         assert calls == [1]
+        await pool.close()
+
+
+class _StuckPool:
+    """asyncmy pool stand-in whose connections never come free (F-62)."""
+
+    def acquire(self) -> Any:
+        async def stuck() -> Any:
+            await asyncio.sleep(3600)
+            raise AssertionError("unreachable")
+
+        return stuck()
+
+    def release(self, conn: Any) -> Any:
+        async def noop() -> None:
+            return None
+
+        return noop()
+
+    def close(self) -> None:
+        pass
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+class TestPoolAcquireTimeoutF62:
+    async def test_query_times_out_when_no_connection_free(self) -> None:
+        """F-62: pool.acquire() waits forever; a half-dead server used to
+        park every caller past max_conn with no error at all."""
+        settings = MySQLSettings(user="root", password="x", db_name="d", acquire_timeout=0.05)
+        pool = MySQLPool(settings)
+        pool._pool = _StuckPool()  # type: ignore[assignment]
+        with pytest.raises(PoolAcquireTimeoutError, match="no mysql connection free"):
+            await pool.query("SELECT 1")
+        await pool.close()
+
+    async def test_transaction_acquire_times_out(self) -> None:
+        settings = MySQLSettings(user="root", password="x", db_name="d", acquire_timeout=0.05)
+        pool = MySQLPool(settings)
+        pool._pool = _StuckPool()  # type: ignore[assignment]
+        with pytest.raises(PoolAcquireTimeoutError, match="no mysql connection free"):
+            async with pool.transaction():
+                pass
+        await pool.close()
+
+    async def test_acquired_connection_is_released_after_use(self) -> None:
+        """The rewrite from `async with acquire()` to acquire/try/finally
+        must not leak the connection on either the query or the error path."""
+        released: list[Any] = []
+
+        class FreePool:
+            def acquire(self) -> Any:
+                async def get() -> Any:
+                    return FakeConn()
+
+                return get()
+
+            def release(self, conn: Any) -> Any:
+                released.append(conn)
+
+                async def noop() -> None:
+                    return None
+
+                return noop()
+
+            def close(self) -> None:
+                pass
+
+            async def wait_closed(self) -> None:
+                pass
+
+        settings = MySQLSettings(user="root", password="x", db_name="d")
+        pool = MySQLPool(settings)
+        pool._pool = FreePool()  # type: ignore[assignment]
+        rows = await pool.query("SELECT 1")
+        assert rows == [(1,)]
+        affected = await pool.execute("UPDATE t SET a = 1")
+        assert affected == 1
+        assert len(released) == 2
+
+        class BrokenConn(FakeConn):
+            def cursor(self) -> FakeCursor:
+                return FakeCursor(exc=ConnectionError("socket gone"))
+
+        class BrokenPool(FreePool):
+            def acquire(self) -> Any:
+                async def get() -> Any:
+                    return BrokenConn()
+
+                return get()
+
+        pool._pool = BrokenPool()  # type: ignore[assignment]
+        with pytest.raises(ConnectionError, match="socket gone"):
+            await pool.query("SELECT 1")
+        assert len(released) == 3  # released even when the statement failed
+        await pool.close()
+
+
+class _ScriptedCursor(FakeCursor):
+    """Fails the statements it is scripted to fail (F-68)."""
+
+    def __init__(self, fail_on: tuple[str, ...]) -> None:
+        super().__init__()
+        self._fail_on = fail_on
+
+    async def execute(self, sql: str, args: tuple = ()) -> None:
+        head = sql.strip().split(None, 1)[0].upper() if sql.strip() else ""
+        if head in self._fail_on:
+            raise ConnectionError(f"{head} failed")
+        self._sql = sql
+
+
+class _ScriptedConn(FakeConn):
+    def __init__(self, fail_on: tuple[str, ...]) -> None:
+        super().__init__()
+        self._fail_on = fail_on
+        self.ensure_closed_calls = 0
+
+    def cursor(self) -> FakeCursor:
+        return _ScriptedCursor(self._fail_on)
+
+    async def ensure_closed(self) -> None:
+        self.ensure_closed_calls += 1
+
+
+class _RecordingPool:
+    """Records release order relative to ensure_closed (F-68)."""
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+        self.events: list[str] = []
+
+    def acquire(self) -> Any:
+        async def get() -> Any:
+            return self._conn
+
+        return get()
+
+    def release(self, conn: Any) -> Any:
+        self.events.append("RELEASE")
+
+        async def noop() -> None:
+            return None
+
+        return noop()
+
+    def close(self) -> None:
+        pass
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+class TestDoubleFailureDiscardsConnectionF68:
+    def _pool(self, fail_on: tuple[str, ...]) -> tuple[MySQLPool, _RecordingPool, _ScriptedConn]:
+        settings = MySQLSettings(user="root", password="x", db_name="d")
+        conn = _ScriptedConn(fail_on)
+        inner = _RecordingPool(conn)
+        pool = MySQLPool(settings)
+        pool._pool = inner  # type: ignore[assignment]
+        return pool, inner, conn
+
+    async def test_commit_and_rollback_both_failing_closes_connection(self) -> None:
+        """F-68: when COMMIT *and* the rescue ROLLBACK both fail, the
+        connection's transaction state is unknowable -- it used to go back
+        into the pool anyway, handing the next acquirer a live grenade."""
+        pool, inner, conn = self._pool(("COMMIT", "ROLLBACK"))
+        with pytest.raises(ConnectionError, match="COMMIT failed"):
+            async with pool.transaction():
+                pass
+        assert conn.ensure_closed_calls == 1  # closed outright...
+        assert inner.events == ["RELEASE"]  # ...before the release (pool drops it)
+        await pool.close()
+
+    async def test_commit_failure_with_successful_rollback_keeps_connection(self) -> None:
+        """The rescue rollback still works: the connection is clean and may
+        return to the pool (no ensure_closed)."""
+        pool, inner, conn = self._pool(("COMMIT",))
+        with pytest.raises(ConnectionError, match="COMMIT failed"):
+            async with pool.transaction():
+                pass
+        assert conn.ensure_closed_calls == 0  # not discarded
+        assert inner.events == ["RELEASE"]  # recycled normally
+        await pool.close()
+
+    async def test_body_exception_with_successful_rollback_keeps_connection(self) -> None:
+        pool, inner, conn = self._pool(())
+        with pytest.raises(RuntimeError, match="business failure"):
+            async with pool.transaction():
+                raise RuntimeError("business failure")
+        assert conn.ensure_closed_calls == 0
+        assert inner.events == ["RELEASE"]
+        await pool.close()
+
+    async def test_body_exception_with_failing_rollback_discards_connection(self) -> None:
+        """F-68 applied symmetrically: a broken body-side rollback must not
+        recycle the connection either."""
+        pool, inner, conn = self._pool(("ROLLBACK",))
+        with pytest.raises(RuntimeError, match="business failure"):
+            async with pool.transaction():
+                raise RuntimeError("business failure")
+        assert conn.ensure_closed_calls == 1
+        assert inner.events == ["RELEASE"]
         await pool.close()

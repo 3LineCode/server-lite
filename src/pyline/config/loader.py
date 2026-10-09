@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import json5
-from pydantic import ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 
 from pyline.config.errors import ConfigError
 from pyline.config.models import (
@@ -17,14 +18,6 @@ from pyline.config.models import (
 )
 from pyline.config.secrets import resolve_secret
 
-# Paths (section, key) inside project.json5 that hold secret references.
-_SECRET_PATHS: tuple[tuple[str, str], ...] = (
-    ("socket", "token"),
-    ("socket", "inter_token"),
-    ("mysql", "password"),
-    ("redis", "password"),
-)
-
 
 def load_json5(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -32,7 +25,7 @@ def load_json5(path: Path) -> dict[str, Any]:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise ConfigError(f"cannot read config file {path}: {exc}") from exc
+        raise ConfigError(f"cannot read {path}: {exc}") from exc
     try:
         data = json5.loads(text)
     except ValueError as exc:
@@ -42,11 +35,37 @@ def load_json5(path: Path) -> dict[str, Any]:
     return data
 
 
+def _secret_paths(
+    model: type[BaseModel], prefix: tuple[str, ...] = ()
+) -> Iterator[tuple[str, ...]]:
+    """Paths of SecretStr-annotated fields, derived from the models (F-53).
+
+    The old hand-maintained list could silently miss a newly added secret
+    field -- inline plaintext would then pass validation unnoticed. Walking
+    the model annotations makes that impossible: every SecretStr field is a
+    secret, by construction.
+    """
+    for name, info in model.model_fields.items():
+        path = (*prefix, name)
+        annotations = [info.annotation, *get_args(info.annotation)]
+        if any(a is SecretStr for a in annotations):
+            yield path
+            continue
+        for annotation in annotations:
+            if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+                yield from _secret_paths(annotation, path)
+                break
+
+
 def _resolve_secrets(data: dict[str, Any], config_dir: Path) -> None:
-    for section, key in _SECRET_PATHS:
-        value = data.get(section, {}).get(key)
-        if isinstance(value, str):
-            data[section][key] = resolve_secret(value, config_dir=config_dir)
+    for path in _secret_paths(ProjectSettings):
+        section: Any = data
+        for key in path[:-1]:
+            section = section.get(key) if isinstance(section, dict) else None
+        if isinstance(section, dict):
+            value = section.get(path[-1])
+            if isinstance(value, str):
+                section[path[-1]] = resolve_secret(value, config_dir=config_dir)
 
 
 def load_project_settings(config_dir: Path) -> ProjectSettings:

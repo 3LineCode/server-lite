@@ -550,3 +550,175 @@ def test_module_getattr_signature_change_rejected(hotmod, tmp_path: Path) -> Non
     with pytest.raises(ReloadRejected, match="__getattr__"):
         reload_module("hotmod")
     assert hotmod.missing_thing == "fallback"
+
+
+# --------------------------------------------------------------------------- #
+# F-96 / F-100 refinements
+# --------------------------------------------------------------------------- #
+
+
+class TestNotLoadedRejectedF96:
+    def test_reload_of_not_loaded_module_rejected(self, hotmod, tmp_path: Path) -> None:
+        """F-96: the watcher used to auto-import unknown modules, so saving a
+        stray file executed its import side effects inside the live server.
+        Reload must refuse anything not already in sys.modules."""
+        (tmp_path / "straymod.py").write_text("SIDE_EFFECT = []\nSIDE_EFFECT.append(1)\n")
+        with pytest.raises(ReloadRejected, match="not loaded"):
+            reload_module("straymod")
+        assert "straymod" not in sys.modules  # and it was never imported
+
+
+class TestFunctionStateF100:
+    def test_runtime_attached_function_attrs_survive_reload(self, hotmod, tmp_path: Path) -> None:
+        """F-100: swapping ``__dict__`` wholesale dropped runtime-attached
+        caches/marks on every reload -- inconsistent with the module-level
+        "plain values are runtime state" policy."""
+        hotmod.value.cache_flag = 42
+        write_module(tmp_path, V2_FUNCTION_ONLY)
+        reload_module("hotmod")
+        assert hotmod.value() == 2  # new body
+        assert hotmod.value.cache_flag == 42  # runtime state kept
+
+    def test_def_time_function_attrs_fill_missing_keys(self, hotmod, tmp_path: Path) -> None:
+        """A decorator that tags its (returned-identical) function defines
+        def-time attributes; after a reload adds the decorator, the OLD
+        function object gains the new def-time keys via the merge."""
+        v1 = "def _tag(fn):\n    return fn\n\n\n@_tag\ndef tagged(x):\n    return x\n"
+        mod = _rewire(tmp_path, v1)
+        assert mod.tagged(1) == 1
+        assert not vars(mod.tagged)
+        v2 = (
+            "def _tag(fn):\n"
+            "    fn.tag = 'def-time'\n"
+            "    return fn\n"
+            "\n"
+            "\n"
+            "@_tag\n"
+            "def tagged(x):\n"
+            "    return x * 2\n"
+        )
+        write_module(tmp_path, v2)
+        reload_module("hotmod")
+        assert mod.tagged(2) == 4
+        assert mod.tagged.tag == "def-time"  # new def-time key filled in
+
+    def test_runtime_keys_win_over_def_time_keys(self, hotmod, tmp_path: Path) -> None:
+        v1 = (
+            "def _tag(fn):\n"
+            "    fn.tag = 'def-time'\n"
+            "    return fn\n"
+            "\n"
+            "\n"
+            "@_tag\n"
+            "def tagged(x):\n"
+            "    return x\n"
+        )
+        mod = _rewire(tmp_path, v1)
+        mod.tagged.tag = "runtime"
+        write_module(tmp_path, v1.replace("return x", "return x * 3"))
+        reload_module("hotmod")
+        assert mod.tagged(1) == 3
+        assert mod.tagged.tag == "runtime"  # runtime value preserved
+
+
+class TestModulePrivateStateF100:
+    def test_module_level_double_underscore_state_survives(self, hotmod, tmp_path: Path) -> None:
+        """F-100: a module-level ``__private`` plain value used to be swept
+        into the dunder skip and silently reset on every reload, unlike any
+        other plain module value."""
+        v1 = '__secret = {"n": 1}\n\n\ndef value() -> int:\n    return 1\n'
+        mod = _rewire(tmp_path, v1)
+        # getattr/setattr: ``mod.__secret`` inside this class body would be
+        # name-mangled to ``_Test..._secret`` by Python itself.
+        secret = getattr(mod, "__secret")
+        secret["n"] = 42
+        write_module(tmp_path, v1)
+        reload_module("hotmod")
+        assert getattr(mod, "__secret")["n"] == 42
+
+
+class TestBaseQualificationF100:
+    def test_same_name_base_from_different_module_rejected(self, hotmod, tmp_path: Path) -> None:
+        """F-100: bare-name base comparison accepted swapping
+        ``from other1 import Base`` for ``from other2 import Base``; the live
+        class then silently kept the OLD base forever."""
+        (tmp_path / "other1.py").write_text("class Base:\n    marker = 1\n")
+        (tmp_path / "other2.py").write_text("class Base:\n    marker = 2\n")
+        v1 = "from other1 import Base\n\n\nclass Child(Base):\n    def hi(self):\n        return 'v1'\n"
+        mod = _rewire(tmp_path, v1)
+        write_module(tmp_path, v1.replace("from other1 import Base", "from other2 import Base"))
+        with pytest.raises(ReloadRejected, match="inheritance"):
+            reload_module("hotmod")
+        assert mod.Child().hi() == "v1"
+        # and the rollback left the old base bound
+        import other1
+
+        assert issubclass(mod.Child, other1.Base)
+
+    def test_imported_base_unchanged_still_passes(self, hotmod, tmp_path: Path) -> None:
+        (tmp_path / "other1.py").write_text("class Base:\n    marker = 1\n")
+        v1 = "from other1 import Base\n\n\nclass Child(Base):\n    def hi(self):\n        return 'v1'\n"
+        mod = _rewire(tmp_path, v1)
+        write_module(tmp_path, v1.replace("return 'v1'", "return 'v2'"))
+        reload_module("hotmod")
+        assert mod.Child().hi() == "v2"
+
+
+class TestMetaclassGuardF100:
+    def test_metaclass_change_rejected_with_rollback(self, hotmod, tmp_path: Path) -> None:
+        """F-100: metaclass changes were silently ignored (the class-dict
+        diff never touches ``__class__``); now they are an explicit
+        ReloadRejected with full rollback."""
+        v1 = (
+            "class Meta(type):\n"
+            "    pass\n"
+            "\n"
+            "\n"
+            "class Greeter:\n"
+            "    def greet(self):\n"
+            "        return 'v1'\n"
+        )
+        mod = _rewire(tmp_path, v1)
+        write_module(tmp_path, v1.replace("class Greeter:", "class Greeter(metaclass=Meta):"))
+        with pytest.raises(ReloadRejected, match="metaclass"):
+            reload_module("hotmod")
+        assert mod.Greeter().greet() == "v1"
+        assert type(mod.Greeter) is type  # old metaclass intact
+
+
+class TestNestedClassRollbackF100:
+    def test_nested_class_dict_rolls_back(self, hotmod, tmp_path: Path) -> None:
+        """F-100: the deep snapshot only recursed one class level, so a
+        failed reload left NESTED classes half-updated (the F-29 bug class,
+        one level deeper)."""
+        v1 = (
+            "class Outer:\n"
+            "    class Inner:\n"
+            "        def m(self):\n"
+            "            return 'v1'\n"
+            "\n"
+            "\n"
+            "def _mk():\n"
+            "    factor = 2\n"
+            "\n"
+            "    def scaled(x):\n"
+            "        return x * factor\n"
+            "\n"
+            "    return scaled\n"
+            "\n"
+            "\n"
+            "scaled = _mk()\n"
+        )
+        mod = _rewire(tmp_path, v1)
+        v2 = (
+            v1.replace("return 'v1'", "return 'v2'")
+            .replace("return x * factor", "return x * factor + offset")
+            .replace("    factor = 2\n", "    factor = 2\n    offset = 1\n")
+        )
+        write_module(tmp_path, v2)
+        from pyline.reload import ReloadError
+
+        with pytest.raises(ReloadError, match="closure"):
+            reload_module("hotmod")
+        assert mod.Outer.Inner().m() == "v1"  # nested class fully restored
+        assert mod.scaled(21) == 42

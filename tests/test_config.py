@@ -46,8 +46,8 @@ class TestProjectSettings:
     def test_load_valid(self, config_dir: Path) -> None:
         settings = load_project_settings(config_dir)
         assert settings.project == "test-game"
-        assert settings.socket.token == "unit-test-token"
-        assert settings.mysql.password == "test"
+        assert settings.socket.token.get_secret_value() == "unit-test-token"
+        assert settings.mysql.password.get_secret_value() == "test"
 
     def test_unknown_key_fails(self, config_dir: Path) -> None:
         text = (config_dir / "project.json5").read_text(encoding="utf-8")
@@ -168,4 +168,83 @@ class TestLoaderHardeningF26:
             encoding="utf-8",
         )
         settings = load_project_settings(config_dir)
-        assert settings.socket.inter_token == "inner-token"
+        assert settings.socket.inter_token.get_secret_value() == "inner-token"
+
+
+class TestProcessPortF84:
+    def test_missing_server_port_raises_with_guidance(self) -> None:
+        """F-84: ``server_port or 0`` handed callers port 0 -- listeners
+        bound an OS-assigned port nobody could reach, peers dialed 0."""
+        from pyline.config.models import ServerEntry
+
+        entry = ServerEntry(server_no=10009, name="proxy", advertise_ip="10.0.0.9", is_proxy=True)
+        with pytest.raises(ConfigError, match="server_port"):
+            entry.process_port(0)
+
+    def test_configured_ports_keep_offset_scheme(self) -> None:
+        from pyline.config.models import ServerEntry
+
+        low = ServerEntry(server_no=1, name="a", advertise_ip="10.0.0.1", server_port=2520)
+        assert low.process_port(0) == 2520
+        assert low.process_port(2) == 4520  # +1000 per index at low bases
+        high = ServerEntry(server_no=2, name="b", advertise_ip="10.0.0.2", server_port=25200)
+        assert high.process_port(1) == 35200  # +10000 per index above 10000
+
+
+class TestMySQLPoolBoundsF90d:
+    def test_min_conn_above_max_conn_rejected(self) -> None:
+        from pyline.config.models import MySQLSettings
+
+        with pytest.raises(ConfigError, match=r"min_conn.*max_conn"):
+            MySQLSettings(user="root", password="$plain:x", db_name="d", min_conn=5, max_conn=4)
+
+    def test_equal_bounds_allowed(self) -> None:
+        from pyline.config.models import MySQLSettings
+
+        ok = MySQLSettings(user="root", password="$plain:x", db_name="d", min_conn=4, max_conn=4)
+        assert ok.min_conn == ok.max_conn
+
+
+class TestSecretMaskingF53:
+    def test_repr_never_leaks_resolved_secrets(self, config_dir: Path) -> None:
+        """F-53: printing settings (logs, error reports, debug consoles) used
+        to print the resolved token/password in clear text."""
+        settings = load_project_settings(config_dir)
+        rendered = repr(settings)
+        assert "unit-test-token" not in rendered
+        for line in rendered.splitlines():
+            if "token" in line or "password" in line:
+                assert "unit-test-token" not in line
+        # the value itself is still reachable where it is needed
+        assert settings.socket.token.get_secret_value() == "unit-test-token"
+
+    def test_secret_paths_derive_from_model(self) -> None:
+        """F-53: the loader's secret-field list walks the model annotations,
+        so a newly added SecretStr field is covered without touching the
+        loader -- inline plaintext in it fails at load time."""
+        from pydantic import BaseModel, SecretStr
+
+        from pyline.config.loader import _secret_paths
+
+        class _Nested(BaseModel):
+            key: SecretStr
+            plain: str
+
+        class _Outer(BaseModel):
+            nested: _Nested
+            optional: SecretStr | None = None
+            count: int = 0
+
+        paths = sorted(_secret_paths(_Outer))
+        assert paths == [("nested", "key"), ("optional",)]
+
+    def test_new_secret_field_rejects_inline_plaintext(self, config_dir: Path) -> None:
+        """End-to-end proof of the derived paths: an inline plaintext value in
+        a SecretStr field (here redis.password) is rejected at load."""
+        text = (config_dir / "project.json5").read_text(encoding="utf-8")
+        assert '"$plain:test"' in text
+        (config_dir / "project.json5").write_text(
+            text.replace('"$plain:test"', '"n0t-a-reference"', 1), encoding="utf-8"
+        )
+        with pytest.raises(ConfigError, match="reference"):
+            load_project_settings(config_dir)

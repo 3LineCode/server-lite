@@ -30,6 +30,7 @@ from pyline.db.serialization import (
     loads_migrated,
     peek_version,
 )
+from pyline.db.transaction import TransactionJournal, current_flush_journal
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +170,9 @@ class DataSaver:
         # join the running operation instead of racing it.
         self._load_future: asyncio.Future[Any] | None = None
         self._delete_future: asyncio.Future[None] | None = None
+        # F-63: the open transaction that owns this saver's next auto-save
+        # (set while its dirty marking is deferred into the journal).
+        self._pending_journal: TransactionJournal | None = None
         # F-34: flush() and delete() serialize on this lock so an upsert that
         # is already in flight can never land after a DELETE and resurrect
         # the row.  asyncio.Lock no longer binds to a loop at creation
@@ -277,8 +281,46 @@ class DataSaver:
                 "call load() or set_data() first"
             )
         self.state = SaveState.LOADED
+        if not self._auto_save or self._scheduler is None:
+            return
+        journal = current_flush_journal()
+        if journal is not None:
+            # F-63: marking dirty inside an open transaction must NOT reach
+            # the background queue yet -- the auto-save round runs without
+            # this journal in its context and would autocommit the row
+            # outside the unit (surviving a later rollback, punching through
+            # the unit's atomicity).  The journal re-queues the saver when
+            # the unit ends.
+            self._pending_journal = journal
+            journal.note_deferred(self)
+            return
+        self._scheduler.mark(self)
+
+    @property
+    def held_by_journal(self) -> TransactionJournal | None:
+        """F-63: the open transaction that owns this saver's next auto-save,
+        if its dirty marking is currently deferred into one."""
+        return self._pending_journal
+
+    def requeue_deferred(self) -> None:
+        """F-63: the transaction that deferred this saver has ended (committed
+        or rolled back); the in-memory data is what must be persisted next,
+        outside any unit.  The hold is cleared first so this cannot be
+        re-deferred into the dying journal's context."""
+        self._pending_journal = None
+        if self.state == SaveState.DELETED:
+            return
         if self._auto_save and self._scheduler is not None:
             self._scheduler.mark(self)
+
+    def _require_loaded(self, op: str) -> None:
+        """F-102: flushing a never-loaded saver would encode ``None`` into a
+        perfectly valid blob and overwrite the real row with it; refuse."""
+        if self.state not in (SaveState.LOADED, SaveState.MISSING):
+            raise OSError(
+                f"saver {self._column}[{self.key!r}] {op} before load; "
+                "call load() or set_data() first"
+            )
 
     async def flush(self) -> None:
         """Encode and upsert immediately.
@@ -290,20 +332,57 @@ class DataSaver:
         async with self._flush_lock:
             if self.state == SaveState.DELETED:
                 return
+            self._require_loaded("flushed")
             blob = self._codec.encode(self._data)
             await self._db.execute(self._spec.upsert_sql(self._column), (self.key, blob))
+            # F-50: if this upsert joined an ambient transaction, register it
+            # so a rollback re-marks the saver dirty (the DB keeps the old
+            # row while memory holds the new data).
+            journal = current_flush_journal()
+            if journal is not None:
+                journal.note_flush(self)
+                self._pending_journal = None  # F-63: the explicit flush supersedes a deferral
 
-    async def flush_row(self) -> tuple[Any, bytes] | None:
-        """Encode this saver's row for coalesced multi-row flushing (F-42).
+    def remark_dirty_after_rollback(self) -> None:
+        """F-50: this saver's upsert joined a transaction that rolled back;
+        re-enter the dirty queue so the data is retried outside the unit."""
+        if self.state == SaveState.DELETED:
+            return
+        if not self._auto_save or self._scheduler is None:
+            logger.warning(
+                "saver %r flushed inside a rolled-back transaction has no auto-save "
+                "scheduler; it will not be retried automatically",
+                self,
+            )
+            return
+        self.mark_dirty()
 
-        Returns ``(key, blob)``, or None when the row must be skipped (it was
-        deleted while waiting). Holds the same flush lock as flush()/delete()
-        so the F-34 serialization is preserved; the caller owns the SQL.
+    async def begin_flush_row(self) -> tuple[Any, bytes] | None:
+        """Acquire the flush lock and encode this saver's row (F-59).
+
+        Paired with :meth:`end_flush_row`.  The old ``flush_row()`` released
+        the lock when it returned ("the caller owns the SQL"), which let a
+        concurrent ``delete()`` land its DELETE in the unlocked gap between
+        encode and the coalesced upsert -- the upsert then resurrected the
+        row (an F-34 regression).  Here the lock stays held until the caller
+        releases it after the SQL carrying this row has executed.  Returns
+        ``(key, blob)`` with the lock held, or None (lock already released)
+        when the row was deleted while waiting.
         """
-        async with self._flush_lock:
-            if self.state == SaveState.DELETED:
-                return None
+        await self._flush_lock.acquire()
+        if self.state == SaveState.DELETED:
+            self._flush_lock.release()
+            return None
+        try:
+            self._require_loaded("batch-flushed")
             return (self.key, self._codec.encode(self._data))
+        except BaseException:
+            self._flush_lock.release()
+            raise
+
+    def end_flush_row(self) -> None:
+        """Release the flush lock taken by :meth:`begin_flush_row` (F-59)."""
+        self._flush_lock.release()
 
     def upsert_many_sql(self, rows: int) -> str:
         """Multi-row upsert for this saver's ``(table, column)`` (F-42)."""

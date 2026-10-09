@@ -1,9 +1,228 @@
 # Changelog
 
+## Unreleased: fifth review pass (F-58..F-105)
+
+Full-assessment fix pass (one P0, every P1/P2/P3 finding); every fix carries
+a regression test; ruff format+check and mypy --strict clean.
+
+### Shutdown & lifecycle (the P0)
+- F-58: a signal/console/child-death shutdown runs teardown fire-and-forget
+  while the parking loop only polls `in_quit()` -- which `request_shutdown`
+  sets *before* running its hooks. The main coroutine could return while
+  the save-flush was still in flight, `asyncio.run` then cancelled it
+  midway, and `save_flush_ok` still read True: exit 0 with dirty data lost,
+  defeating F-01. `request_shutdown` now resolves a completion future only
+  after hooks + quit-task drain (finally-guarded), and both parking loops
+  join it via `_settle_shutdown` before returning. `_spawn` also observes
+  background-task exceptions now, and a shutdown landing before/between
+  boot steps aborts the boot cleanly instead of a transition-table KeyError
+
+### Data safety
+- F-59: the F-42 coalesced upsert released each saver's flush lock after
+  encoding (`flush_row` returned "the caller owns the SQL") -- a concurrent
+  `delete()` could land its DELETE before the multi-row upsert resurrected
+  the row, and the saver was counted saved and never retried. Batch flush
+  now holds the locks until the group SQL has executed
+  (`begin_flush_row`/`end_flush_row`; single-row `flush()` unchanged)
+- F-60: a failed COMMIT no longer bypasses the F-50 journal -- the local
+  and remote transaction paths wrap the whole session stack, so commit
+  failure re-marks every saver in the unit (idempotent, safe on unknown
+  outcome)
+- F-61: a remote COMMIT that times out is reconciled once against the DB
+  process's recorded outcome (`RPC_TX_STATUS`: committed/rolled_back/
+  unknown) before being treated as failed -- a slow-but-successful commit
+  is no longer retried as a double-write
+- F-63: mutations inside `db.transaction()` no longer leak through the
+  background auto-save (autocommit mid-transaction): dirty marks are
+  deferred to the end of the unit and the flush loop skips savers held by
+  an active journal; shutdown `flush_all` deliberately still drains them
+  (never-drop wins over atomicity when the process is dying)
+- F-68: COMMIT+ROLLBACK double failure discards the connection instead of
+  returning an open-transaction socket to the pool
+- F-102: `DataSaver.flush()` before load no longer encodes `None` over an
+  existing row
+- F-101: `DatabaseService.close()` rolls back and closes active sessions,
+  awaits disposers, and refuses new begins
+
+### Network & mesh
+- F-69: the RPC `_running` table is keyed by `(from_service, call_id)` --
+  every process's counter starts at 1, so two concurrent callers of the
+  same service collided on call_id 1, corrupting CANCEL routing
+- F-70: cross-machine RPC to a *sub-process* used to dead-end (the bus
+  rewrote the origin to the local main; replies left the target's machine
+  with `CrossServerError`). The bus preserves the true origin, and
+  sub-processes relay cross-machine sends through their main (`@relay`,
+  envelope-isomorphic with `@fwd`, origin bound to the sender's local mesh
+  -- F-39/F-40/F-48 checks all preserved, two-machine e2e test included)
+- F-71: `send_message` rejects payloads over the frame cap up front
+  instead of shipping 16 MB of legal chunks that the peer discards
+- F-72: the client listener caps concurrent connections globally and per
+  peer IP (`socket.max_connections`, `max_connections_per_ip`), wired
+  through the runtime; refusals are counted, not allocated
+- F-74: idle destination-slot eviction can no longer cancel a writer
+  mid-multipart (which poisoned the shared socket); F-76 keeps writers
+  alive through non-ZMQ errors; F-75 chmods POSIX `ipc://` endpoints to
+  0600; F-73: the inter_token fallback warns once, not per reconnect
+- F-77: the RPC inflight semaphore cannot leak permits through the
+  grant-vs-cancel window; F-78: strong references for close tasks, wider
+  msgpack exception classification, offset-cursor frame decoding (no
+  per-frame O(n) buffer shift), unknown flag bits rejected at decode
+
+### Runtime & hot-reload
+- F-91: `PreReloadEvent` is now awaited *before* the code swap (it used to
+  be spawned fire-and-forget and ran after `reload_module` in practice,
+  breaking the documented quiesce contract); console/watcher hooks accept
+  async reload hooks
+- F-92: a `use_mysql=false` + `use_redis=false` server (pure gateway)
+  boots instead of crashing on `db_service_no()` -- DB-less
+  `DatabaseAccess` fails loudly on first use instead (F-104)
+- F-93: teardown closes every ingress (client listener, proxy links,
+  watcher, console) *before* the save-flush -- frames arriving after the
+  flush snapshot used to mutate data that would never be persisted;
+  zmq-bus closes after the flush (flush rides RPC through it)
+- F-94: `clock`/`alarms` register at runtime construction and `db`/
+  `make_saver` right after CONN_DB -- business BaseInit/FuncInit hooks can
+  actually use them
+- F-95: TeardownPlan has a per-step budget (`min(step cap, remaining
+  total)`) -- one hung step no longer starves mysql.close out of the
+  shutdown timeout; the save-flush is exempt from the per-step cap
+- F-96: the dev watcher roots at the business package (not the whole cwd),
+  ignores tests/build/venv/caches, and `reload_module` refuses modules
+  that were never imported instead of importing them as a side effect
+- F-97: a reload that raises SystemExit no longer silently kills the
+  watcher/console tasks (guarded, handed to the shutdown hook)
+- F-98: game-clock setback (SetTime) no longer replays calendar
+  boundaries when time is restored; F-99: the metrics HTTP server is
+  tracked and closed in teardown
+- F-100: `clock.tz` setting wires the GameClock timezone (fail-fast on
+  unknown zones; com_time derives through the clock); reload refinements:
+  function runtime attributes survive reloads (merge, not replace), nested
+  classes enter the deep rollback snapshot, module `__private` state is
+  preserved, base classes compare by module+qualname, metaclass changes
+  are explicitly rejected; template: ghost `SaverDataOP` docstring replaced
+  by the real DataOP/TrackableModel/make_saver recipe, dev bind_host is
+  127.0.0.1
+
+### Core & config
+- F-79/F-80: re-targeting a log channel to a new run_dir no longer stacks
+  handlers (double write); per-process log files are `os-{process_tag}.log`
+  with pid and logger name in the format -- note the main process file
+  moves from `os.log` to `os-main.log`
+- F-81/F-82: duplicate `sub_process` entries are rejected before spawn;
+  the child watch cannot die silently (observed exceptions, fail-fast
+  semantics when the callback itself fails)
+- F-83: cancelling a repeating timer clears its pending wheel slot
+  immediately and `left()` reports the next occurrence
+- F-84: `process_port()` with no configured `server_port` raises a
+  ConfigError with guidance instead of returning 0; F-90d validates
+  `min_conn <= max_conn`
+- F-85/F-86: `on_quit` keeps strong task references when no lifecycle is
+  bound; the shutdown fallback is an honest `os._exit` (the old
+  `os.kill(pid, 15)` was a Windows TerminateProcess in disguise)
+- F-87: `Context.service(name, cls)` gives typed service lookup (facades
+  no longer `cast`); F-88: `from pyline import api` no longer imports the
+  db/net dependency chain (lazy submodule attributes)
+- F-89: half-hour boundaries derive through calendar-aware arithmetic --
+  DST transition days no longer skip or duplicate a beat
+- F-90: AlarmHub `register_all` returns an unsubscribe and dedups;
+  exception-chain formatting guards cycles; serial event dispatch is now
+  documented as the contract (ordering over parallelism)
+
+### Schema & tools
+- F-65: the pickle migration tool no longer false-fails every dict with
+  non-string keys (both sides normalized before comparison) -- such rows
+  used to be "protected" as permanent pickle
+- F-66: migration statement splitting strips `--` comments *before*
+  splitting on `;`; F-67: migrations hold a MySQL `GET_LOCK` so two
+  `owns_db` processes cannot race the schema/version table
+- F-64: `TrackedDict`/`TrackedList` work with `dataclasses.asdict`
+  (optional `touch`); F-103: the migration tool validates identifiers
+- F-105: `zeromq.bind_file` defaults to a proper `ipc://` URL (a bare path
+  is not a valid zmq address -- the POSIX bus failed to bind on default
+  config; bare paths are normalized for old configs)
+
+## Unreleased: fourth review pass (F-46..F-57)
+
+Assessment-driven fix pass over every finding of the project review; every
+fix carries a regression test; ruff format+check and mypy --strict clean;
+300 unit tests passing, coverage 78% (the 75% CI gate had been drifting:
+72% before this pass, and the F-38..F-45 note below overstated its count).
+
+### Data safety
+- F-46: the auto-save loop can no longer be killed by a poison row -- a blob
+  that cannot be encoded used to escape `flush_batch` uncaught, silently
+  stopping every later save until shutdown. Encode failures are now
+  quarantined per-row (F-33 semantics: retry with backoff, no batch
+  starvation); any other unexpected flush error requeues the already-popped
+  savers (never-drop holds for bugs too) and the loop-level guard alarms
+  (`save_loop_error`) instead of dying; a dead loop task itself alarms
+  (`save_loop_died`) via a done-callback
+- F-47: a failed remote COMMIT no longer leaks its dedicated connection
+  (`rpc_tx_commit` closes the session in a finally; the record was already
+  popped, so the caller's rollback remedy only ever saw
+  `TransactionGoneError`); the 60 s session TTL now bounds *idle* time --
+  execute/query renew it, so a legitimately long transaction is not rolled
+  back for being long -- and the expiry sweep runs on execute/query too, not
+  only on the next begin
+- F-50: a transaction rollback re-marks every saver whose flush joined the
+  unit (`TransactionJournal`): the DB keeps the old row while memory held
+  the new data, and -- in the coalesced path -- the savers were already
+  popped off the dirty queue, so nothing would ever retry them
+- F-51: migrations are resumable per statement (`pyline_schema_progress`
+  table): MySQL DDL implicitly commits, so a failed multi-statement file
+  used to rely entirely on script idempotency and re-ran the whole file on
+  the next boot; it now resumes from the failed statement (a file that
+  shrank since the failed attempt is refused)
+
+### Trust model (mesh hardening, round 2)
+- F-48: the `@fwd` proxy validates the envelope's claimed `from_service`
+  against the sending connection's IDENT-registered machine at the first
+  hop (`proxy_spoofed_total`) -- any connected machine could previously
+  stamp a victim's service number on its envelope and sail past the
+  F-39/F-40 origin checks, which compare against the *claim*; relay hops
+  (validated third-party origins) and the legacy origin-unknown form are
+  unaffected
+- F-53: every secret-bearing setting is a `SecretStr` -- printing settings
+  (logs, error reports, consoles) no longer leaks resolved tokens/passwords.
+  The loader's secret-field list is now derived from the model annotations,
+  so a newly added secret field cannot be forgotten and let inline plaintext
+  pass silently
+- F-54: the Prometheus endpoint binds 127.0.0.1 by default and supports an
+  optional bearer token (`metrics_bind`, `metrics_token`; constant-time
+  compare, 401 otherwise)
+
+### Operations
+- F-49: ZMQ destination-table slots of peers silent past an idle TTL (empty
+  queue) are reclaimed when the table is full -- vanished peers (and bogus
+  targets a rogue DEALER named once) used to occupy their slot forever;
+  after 256 the bus refused every new destination permanently
+- F-52: exceeding the clock catch-up cap (>2 days of downtime) alarms
+  (`clock_boundaries_skipped`) and logs instead of silently skipping the
+  surplus boundaries -- daily resets that missed their `NewDayEvent` need
+  an operator, not a shrug
+
+### Tooling / engineering
+- F-57: the file watcher's module mapping picked the SHALLOWEST matching
+  sys.path entry -- the exact mapping its own comment forbids; the deepest
+  (package-root) entry now wins, matching the documented intent
+- F-55: version realigned (`pyproject` 0.1.0 -> 1.0.0rc1, matching the
+  README's v1.0.0-rc.1); local `__pycache__` clutter under `template/`
+  removed (never tracked)
+- F-56: coverage/tests restored above the CI gate -- console commands,
+  watcher mapping, debug formatting, log channels, task/env facades gained
+  first-time unit tests (runtime.py's multi-process paths remain the big
+  uncovered block, now the only one)
+- `docs/hot-reload.md` gains a "Known limits" section (top-level side
+  effects are real and not rolled back; decorated wrappers are checked by
+  outer signature only; the watcher execs on the event loop)
+- `docs/deployment.md` updated for the @fwd origin binding and the metrics
+  endpoint auth options
+
 ## Unreleased: third review pass (F-38..F-45)
 
 Every fix carries a regression test; ruff format+check and mypy --strict
-clean; 260 unit tests passing (vs 212 before).
+clean; 244 unit tests passing plus 7 live-service integration tests
+(vs 212 before; an earlier revision of this note overstated the count).
 
 ### Data safety / correctness
 - F-38: schema drift detection now expects exactly what `ddl()` emits for

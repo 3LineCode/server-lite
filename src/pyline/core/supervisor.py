@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 ChildMain = Callable[[str, int], Awaitable[None]]
 
 
+def _log_watch_death(task: asyncio.Task[None]) -> None:
+    """Done-callback for the fire-and-forget child watch task (F-82)."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.critical("child watch task died: %r", exc, exc_info=exc)
+
+
 class ProcessSupervisor:
     def __init__(self, child_main: ChildMain) -> None:
         self._child_main = child_main
@@ -39,6 +48,18 @@ class ProcessSupervisor:
     # ------------------------------------------------------------------ #
 
     def spawn_subprocesses(self, sub_process: tuple[str, ...], main_pid: int) -> None:
+        # F-81: duplicate process types used to overwrite the ``_children``
+        # slot -- BOTH children were spawned but only the last one was
+        # watched and terminated, leaving an orphan. Config models keep the
+        # tuple permissive (order is meaningful), so the supervisor is the
+        # single choke point that rejects duplicates. Validating BEFORE any
+        # spawn means no half-started children need reaping on failure.
+        if len(set(sub_process)) != len(sub_process):
+            duplicates = sorted({t for t in sub_process if sub_process.count(t) > 1})
+            raise ValueError(
+                f"duplicate sub-process types {duplicates} in sub_process={sub_process}; "
+                "each process type may be spawned at most once per server"
+            )
         ctx = mp.get_context("spawn")
         self._shutdown_event = ctx.Event()
         for index, process_type in enumerate(sub_process, start=1):
@@ -59,6 +80,12 @@ class ProcessSupervisor:
         self._watch_task = asyncio.get_running_loop().create_task(
             self._watch_children(on_child_died)
         )
+        # F-82: the watch task is fire-and-forget. Without this done-callback
+        # any exception it raises died unretrieved (only the GC-time
+        # "exception was never retrieved" warning, which nobody reads) and
+        # every child kept running unmanaged. The callback both retrieves the
+        # exception and escalates it to CRITICAL so the failure is visible.
+        self._watch_task.add_done_callback(_log_watch_death)
 
     async def _watch_children(
         self, on_child_died: Callable[[str, int | None], Awaitable[None]] | None
@@ -69,14 +96,46 @@ class ProcessSupervisor:
                     code = child.exitcode
                     logger.fatal("sub-process %s died (exitcode=%s)", process_type, code)
                     if on_child_died is not None:
-                        await on_child_died(process_type, code)
-                    else:
-                        for other in self._children.values():
-                            if other.is_alive():
-                                other.terminate()
-                        raise ChildDiedError(process_type, code)
+                        try:
+                            await on_child_died(process_type, code)
+                        except Exception:
+                            # F-82: a buggy callback used to kill the watch
+                            # task mid-notification, leaving the remaining
+                            # children unmanaged. The callback owns shutdown;
+                            # when it fails we cannot trust it to have torn
+                            # anything down, so we fall through to the same
+                            # fail-fast path as the no-callback branch
+                            # (terminate siblings, raise) instead of
+                            # continuing without supervision.
+                            logger.critical(
+                                "on_child_died callback failed after sub-process %s "
+                                "died (exitcode=%s); falling back to fail-fast teardown",
+                                process_type,
+                                code,
+                                exc_info=True,
+                            )
+                            await self._fail_fast(process_type, code)
+                        return
+                    await self._fail_fast(process_type, code)
                     return
             await asyncio.sleep(1.0)
+
+    async def _fail_fast(self, process_type: str, code: int | None) -> None:
+        """No-callback death handling (F-82): stop the siblings, then raise.
+
+        There is no runtime object to hand the failure to in this branch, so
+        the supervisor does the one thing it can still guarantee: no child
+        outlives a dead sibling (the whole server is one fail-fast unit).
+        The ChildDiedError propagates to the caller that awaited
+        ``_watch_children`` directly (tests, alternative hosts); via
+        ``start_child_watch`` it is retrieved and logged by
+        ``_log_watch_death`` instead of dying silently in a fire-and-forget
+        task.
+        """
+        for other in self._children.values():
+            if other.is_alive():
+                other.terminate()
+        raise ChildDiedError(process_type, code)
 
     async def terminate_children(self, *, grace: float = 10.0) -> None:
         """Signal children to stop, wait ``grace`` seconds, then kill."""

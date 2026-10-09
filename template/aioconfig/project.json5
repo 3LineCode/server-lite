@@ -13,7 +13,10 @@
     "socket": {
         // Secret reference: $env:VAR | $file:key | $plain:dev-only
         "token": "$env:PYLINE_TOKEN",
-        "bind_host": "0.0.0.0",
+        // Loopback default (F-100): the client listener accepts peers from
+        // whatever network the bind address exposes; point it at a real
+        // interface only when you mean to serve one.
+        "bind_host": "127.0.0.1",
         "client_port": 1520,
         "server_port": 2520,
         "max_frame_size": 16777216,

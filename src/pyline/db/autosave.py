@@ -17,6 +17,7 @@ from collections.abc import Callable
 from typing import Any
 
 from pyline.db.orm import DataSaver
+from pyline.db.transaction import current_flush_journal
 from pyline.obs.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,17 @@ class SaveScheduler:
     def start(self) -> None:
         if self._task is None:
             self._task = asyncio.get_running_loop().create_task(self._run())
+            # F-46: if the loop ever exits unexpectedly (guard bug, subclass
+            # override), auto-save silently stops -- that must be loud.
+            self._task.add_done_callback(self._on_loop_done)
+
+    def _on_loop_done(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.critical("auto-save loop died: %r", exc, exc_info=exc)
+            self._alarm("save_loop_died", {"error": repr(exc)})
 
     async def stop(self, *, timeout: float | None = None) -> bool:
         """Stop the loop, then bounded-retry drain of everything dirty.
@@ -137,10 +149,27 @@ class SaveScheduler:
     async def _run(self) -> None:
         while True:
             await asyncio.sleep(self._interval)
-            await self.flush_batch()
+            try:
+                await self.flush_batch()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # F-46: one poison row (a blob that cannot be encoded, a bug
+                # in a flush path) used to kill this task -- every later mark
+                # stayed in memory, unsaved and unalarmed, until shutdown.
+                self.failed_total += 1
+                self._metrics.save_failures.inc()
+                self._sync_metrics()
+                logger.critical("auto-save flush round failed; savers requeued", exc_info=True)
+                self._alarm("save_loop_error", {"queue_depth": self.queue_depth()})
 
     def _next_due(self, now: float) -> DataSaver | None:
         for saver in self._dirty:
+            if saver.held_by_journal is not None:
+                # F-63: an open transaction owns this saver's writes;
+                # flushing it here would autocommit outside the unit.  Leave
+                # it queued -- the journal re-marks it when the unit ends.
+                continue
             due = self._deferred.get(saver)
             if due is None or due <= now:
                 return saver
@@ -161,13 +190,30 @@ class SaveScheduler:
         # Savers whose outcome is not yet resolved; on cancellation they must
         # go back to the queue (the upsert may not have landed).
         unresolved: set[DataSaver] = {saver for saver, _ in batch}
+        # F-59: every encoded saver's flush lock, held until the SQL carrying
+        # its row has executed (or its row was handed to a path that re-takes
+        # the lock itself).  _flush_group drains this set; the finally block
+        # is the cancellation/bug safety net -- an unbalanced hold would
+        # deadlock the next delete()/flush() on that saver forever.
+        held: set[DataSaver] = set()
         try:
             # F-42: rows sharing (executor, table, column) coalesce into one
             # multi-row upsert -- one round-trip per table per batch instead
             # of one per saver (~batch_size/interval upserts/s before).
             groups: dict[tuple[int, str, str], list[tuple[DataSaver, int, Any, bytes]]] = {}
             for saver, failures in batch:
-                row = await saver.flush_row()
+                try:
+                    row = await saver.begin_flush_row()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # F-46: an unencodable row is quarantined exactly like a
+                    # failing flush (F-33 semantics for encode errors) --
+                    # requeued with backoff instead of aborting the batch and
+                    # starving every saver queued behind it.
+                    unresolved.discard(saver)
+                    self._record_flush_failure(saver, failures)
+                    continue
                 if row is None:
                     # deleted while waiting: nothing to persist, same as the
                     # old flush() no-op path
@@ -175,26 +221,52 @@ class SaveScheduler:
                     self.saved_total += 1
                     self._metrics.save_flushed.inc()
                     continue
+                held.add(saver)  # F-59: lock stays taken until the SQL lands
                 groups.setdefault((id(saver.executor), saver.table, saver.column), []).append(
                     (saver, failures, row[0], row[1])
                 )
             for members in groups.values():
-                resolved = await self._flush_group(members)
+                resolved = await self._flush_group(members, held)
                 unresolved -= resolved
         except asyncio.CancelledError:
             # Cancellation mid-flush (shutdown racing the loop task): requeue
             # everything unresolved for flush_all.
-            for saver, failures in batch:
-                if saver in unresolved:
-                    self._dirty.setdefault(saver, failures)
+            self._requeue_unresolved(batch, unresolved, backoff=False)
+            raise
+        except Exception:
+            # F-46: an unexpected error mid-flush must neither drop the
+            # already-popped savers (never-drop holds for bugs, not just DB
+            # outages) nor let the caller hot-loop on the same poison row.
+            self._requeue_unresolved(batch, unresolved, backoff=True)
             raise
         finally:
             for saver, _ in batch:
                 self._inflight.discard(saver)
+            for saver in held:
+                saver.end_flush_row()
         self._sync_metrics()
 
+    def _release_held(self, held: set[DataSaver], saver: DataSaver) -> None:
+        """Give back one F-59 lock; removed from ``held`` first so a bug in
+        end_flush_row cannot trigger a double release from the safety net."""
+        held.discard(saver)
+        saver.end_flush_row()
+
+    def _requeue_unresolved(
+        self,
+        batch: list[tuple[DataSaver, int]],
+        unresolved: set[DataSaver],
+        *,
+        backoff: bool,
+    ) -> None:
+        for saver, failures in batch:
+            if saver in unresolved:
+                self._dirty.setdefault(saver, failures)
+                if backoff and saver not in self._deferred:
+                    self._deferred[saver] = time.monotonic() + self._retry_cooldown
+
     async def _flush_group(
-        self, members: list[tuple[DataSaver, int, Any, bytes]]
+        self, members: list[tuple[DataSaver, int, Any, bytes]], held: set[DataSaver]
     ) -> set[DataSaver]:
         """Coalesced multi-row upsert for one (executor, table, column) group.
 
@@ -202,13 +274,24 @@ class SaveScheduler:
         retry). One poisoned row fails the whole statement, so on failure the
         group falls back to per-saver flushes -- preserving F-33's
         isolate-the-poison-row semantics and per-saver backoff accounting.
+
+        F-59: the members' flush locks (taken in flush_batch) are held for the
+        duration of the multi-row statement so a racing delete() can only land
+        strictly before or strictly after it -- never in between (which
+        resurrected the row).  The locks are released before any fallback that
+        calls saver.flush(), because flush() takes each lock itself.
         """
         resolved: set[DataSaver] = set()
 
         if len(members) == 1:
             # One row: the per-saver path IS the coalesced path (and a failure
             # must not be counted twice by a pointless multi->single retry).
+            # The lock goes back first: flush() re-takes it and keeps the F-34
+            # serialization for its own statement -- a delete() slipping in
+            # between can only win by making that flush a no-op, never by
+            # being overtaken by it.
             saver, failures, _k, _b = members[0]
+            self._release_held(held, saver)
             await self._flush_one(saver, failures)
             return {saver}
 
@@ -220,16 +303,24 @@ class SaveScheduler:
             if not chunk:
                 return
             head = chunk[0][0]
+            members_done = chunk  # chunk is rebound below; keep this batch
             params: list[Any] = []
-            for _saver, _failures, key, blob in chunk:
+            for _saver, _failures, key, blob in members_done:
                 params.append(key)
                 params.append(blob)
             try:
-                await head.executor.execute(head.upsert_many_sql(len(chunk)), tuple(params))
-                for saver, _f, _k, _b in chunk:
+                await head.executor.execute(head.upsert_many_sql(len(members_done)), tuple(params))
+                # F-50: a coalesced flush that joined an ambient transaction
+                # (flush_batch called inside `async with db.transaction():`)
+                # must re-mark its savers dirty if that unit rolls back -- the
+                # savers were already popped off the dirty queue.
+                journal = current_flush_journal()
+                for saver, _f, _k, _b in members_done:
                     resolved.add(saver)
                     self.saved_total += 1
                     self._metrics.save_flushed.inc()
+                    if journal is not None:
+                        journal.note_flush(saver)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -240,9 +331,18 @@ class SaveScheduler:
                     head.column,
                     exc_info=True,
                 )
-                for saver, failures, _k, _b in chunk:
+                # F-59: hand the locks back before the fallback -- flush()
+                # re-takes each one itself (holding them here would deadlock).
+                for saver, _f, _k, _b in members_done:
+                    self._release_held(held, saver)
+                for saver, failures, _k, _b in members_done:
                     await self._flush_one(saver, failures)
                     resolved.add(saver)
+            else:
+                # F-59: the SQL carrying these rows has landed; a delete()
+                # blocked on any of these locks now runs strictly after it.
+                for saver, _f, _k, _b in members_done:
+                    self._release_held(held, saver)
             chunk = []
             chunk_bytes = 0
 
@@ -263,28 +363,35 @@ class SaveScheduler:
         except asyncio.CancelledError:
             raise
         except Exception:
-            self.failed_total += 1
-            self._metrics.save_failures.inc()
-            failures += 1
-            self._dirty[saver] = failures
-            backoff = min(self._retry_cooldown * 2 ** (failures - 1), self._retry_cap)
-            self._deferred[saver] = time.monotonic() + backoff
-            logger.error(
-                "saver %r flush failed (attempt %d); retrying in %.0fs",
-                saver,
-                failures,
-                backoff,
-            )
-            if failures >= self._alarm_threshold:
-                self._alarm("save_retry", {"saver": repr(saver), "failures": failures})
+            self._record_flush_failure(saver, failures)
         else:
             self.saved_total += 1
             self._metrics.save_flushed.inc()
+
+    def _record_flush_failure(self, saver: DataSaver, failures: int) -> None:
+        self.failed_total += 1
+        self._metrics.save_failures.inc()
+        failures += 1
+        self._dirty[saver] = failures
+        backoff = min(self._retry_cooldown * 2 ** (failures - 1), self._retry_cap)
+        self._deferred[saver] = time.monotonic() + backoff
+        logger.error(
+            "saver %r flush failed (attempt %d); retrying in %.0fs",
+            saver,
+            failures,
+            backoff,
+        )
+        if failures >= self._alarm_threshold:
+            self._alarm("save_retry", {"saver": repr(saver), "failures": failures})
 
     # ---------------------------- shutdown ------------------------------ #
 
     async def flush_all(self, *, timeout: float | None = None) -> bool:
         """Drain every dirty saver, retrying within a bounded deadline."""
+        # F-63 note: unlike flush_batch's selection, the shutdown drain does
+        # NOT skip journal-held savers -- the process is going down, the
+        # owning transaction will never commit, and never-drop beats atomicity
+        # for data that would otherwise be lost with the process.
         limit = self._shutdown_flush_timeout if timeout is None else timeout
         deadline = time.monotonic() + limit
         self._deferred.clear()

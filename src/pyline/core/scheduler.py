@@ -44,9 +44,15 @@ class TimerHandle:
 
     __slots__ = ("_cancel_fn", "_cancelled", "_deadline")
 
-    def __init__(self, cancel_fn: Callable[[], None], deadline: float | None = None) -> None:
+    def __init__(
+        self,
+        cancel_fn: Callable[[], None],
+        deadline: float | Callable[[], float | None] | None = None,
+    ) -> None:
         self._cancelled = False
         self._cancel_fn = cancel_fn
+        # F-83: a repeating timer's "deadline" moves with every beat, so it
+        # is supplied as a callable; one-shot timers pass the fixed float.
         self._deadline = deadline
 
     def cancel(self) -> None:
@@ -59,10 +65,17 @@ class TimerHandle:
         return self._cancelled
 
     def left(self) -> float:
-        """Seconds until the scheduled deadline (0.0 when unknown/past)."""
-        if self._deadline is None:
+        """Seconds until the scheduled deadline (0.0 when unknown/past).
+
+        For repeating timers this is the distance to the NEXT beat, not the
+        first one (F-83: it used to be frozen at the first beat, reporting
+        0.0 forever after the first tick)."""
+        deadline = self._deadline
+        if callable(deadline):
+            deadline = deadline()
+        if deadline is None:
             return 0.0
-        return max(0.0, self._deadline - time.monotonic())
+        return max(0.0, deadline - time.monotonic())
 
 
 class Scheduler:
@@ -121,27 +134,42 @@ class Scheduler:
             raise ValueError(f"repeating interval must be > 0, got {interval}")
         if self._closed:
             raise RuntimeError("scheduler is closed")
-        stopped = {"v": False}
-        state = {"next_deadline": time.monotonic() + interval}
+        stopped = False
+        next_deadline = time.monotonic() + interval
+        pending: TimerHandle | None = None
 
         def run_once() -> None:
-            if stopped["v"]:
+            nonlocal stopped, next_deadline, pending
+            if stopped:
                 return
             try:
                 func(*args)
             except Exception:
                 logger.exception("repeating timer %r failed", label or func)
-            if stopped["v"]:
+            if stopped:
                 return
-            state["next_deadline"] += interval
+            next_deadline += interval
             now = time.monotonic()
-            if state["next_deadline"] <= now:
-                missed = math.ceil((now - state["next_deadline"]) / interval)
-                state["next_deadline"] += missed * interval
-            self.call_after(state["next_deadline"] - now, run_once, label=label)
+            if next_deadline <= now:
+                missed = math.ceil((now - next_deadline) / interval)
+                next_deadline += missed * interval
+            pending = self.call_after(next_deadline - now, run_once, label=label)
 
-        self.call_after(interval, run_once, label=label)
-        return TimerHandle(lambda: stopped.__setitem__("v", True), state["next_deadline"])
+        def cancel() -> None:
+            # F-83: cancelling used to only flip the stopped flag -- the
+            # pending entry kept occupying the wheel (or a call_later slot)
+            # until its deadline came round and run_once no-op'd. Cancel the
+            # inner handle too so the timer frees its slot immediately
+            # (visible in pending_count()) instead of idling to expiry.
+            nonlocal stopped
+            stopped = True
+            if pending is not None:
+                pending.cancel()
+
+        pending = self.call_after(interval, run_once, label=label)
+        # F-83: left() must track the NEXT beat, not stay frozen at the
+        # first deadline (it read 0.0 forever after the first tick).
+        return TimerHandle(cancel, lambda: next_deadline)
 
     def soon(self, func: Callable[..., object], *args: object) -> None:
         self.loop.call_soon(func, *args)

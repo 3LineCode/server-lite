@@ -17,6 +17,7 @@ with :meth:`Network.subscribe` and may be sync or async::
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Callable
 from typing import Any, ClassVar, cast
@@ -140,7 +141,10 @@ class Network:
     async def _run_handler(self, handler: Handler, sub: int, args: list[Any]) -> None:
         try:
             result = handler(*args)
-            if asyncio.iscoroutine(result):
+            # isawaitable, not iscoroutine (F-162): a handler returning a
+            # Task/Future/custom __await__ object used to have its result --
+            # and exception -- silently dropped.
+            if inspect.isawaitable(result):
                 await result
         except Exception:
             logger.exception(

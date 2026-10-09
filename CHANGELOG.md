@@ -1,5 +1,206 @@
 # Changelog
 
+## v1.0.0-rc.2: ninth review pass (F-155..F-164) -- full-repo assessment round 4
+
+Every finding of a full-repo assessment (core/net/db/reload/devtools/tests/
+CI/docs), each with a regression test in `tests/test_review_pass9.py`; ruff
+format+check, mypy --strict (src) and mypy on tests clean.
+
+### Hot reload
+- F-155: the signature guard compares default POSITIONS, not counts.
+  `def f(a, b=1)` -> `def f(a, b, c=1)` passed validation (prefix `[a, b]`
+  matches, default count 1 == 1) yet broke every old `f(1)` caller --
+  exactly the caller-breakage class the validator exists to prevent.
+  `_FnSpec.pos_default_count` is now a per-name `pos_defaults` set: a
+  shared parameter that loses its default is rejected, and extras must
+  each carry one.
+
+### Database
+- F-156: the ORM works in the `sub_process` topology. The saver factory
+  existed only where a local `SchemaManager` did -- the DB process, the
+  one process that skips BaseInit/FuncInit. Every business process's
+  `api.orm.make_saver` raised ApiServiceUnavailableError. Remote
+  processes now validate savers against a pool-less `TableCatalog` built
+  from the same tables.json5; every statement still rides
+  DatabaseAccess -> RPC -> the DB process (upserts from remote processes
+  keep the universally-compatible legacy VALUES() ODKU form).
+- F-157: a blob decode failure (corrupt blob, future version, failed
+  migration) escaped `_load_once` with the load future unresolved --
+  concurrent joiners parked on `asyncio.shield(_load_future)` forever and
+  the state stuck at LOADING. Decode errors now resolve the joiners with
+  the exception and reset the state to NEW so a retry is possible.
+- F-158: the coalesced multi-row flush inside a transaction now goes
+  through `DataSaver.mark_journal_flushed` -- `note_flush` alone left
+  `_pending_journal` pointing at the dead journal when a deferral landed
+  between the batch's selection and the upsert, and `held_by_journal`
+  then made the auto-save scheduler skip that saver forever (its data was
+  rescued only by the shutdown drain).
+- F-162: plain containers become tracked automatically. A decoded blob
+  comes back as plain dict/list and nothing re-bound them -- in-place
+  container mutation after every load round-trip was invisible unless the
+  developer re-wrapped each field by hand; forgetting `touch()` was
+  silent data loss. `set_data` and the load path now deep-wrap plain
+  dicts/lists into TrackedDict/TrackedList bound to the saver's dirty
+  mark (already-tracked containers pass through untouched).
+
+### Transport
+- F-159: the inbound RPC task pool is bounded (running + queued =
+  2 x `rpc_max_inflight`). The F-19 semaphore bounds execution, but every
+  CALL still spawned a task that parked up to `rpc_inflight_wait` in
+  `_acquire_slot` -- live task count was bounded only by arrival rate x
+  wait, a token-holder DoS. Beyond the pool bound a CALL is answered
+  busy immediately, without spawning anything.
+- F-161: the Windows selector-loop fd budget is enforced at bind time
+  (`serve()` on both the client listener and the proxy server):
+  `socket.max_connections` beyond ~448 (512-fd `select()` ceiling minus a
+  64-fd reserve) fails boot with an actionable ConfigError instead of
+  crashing the loop with "too many file descriptors in select()" under
+  load.
+- F-163: `srv_type=production` refuses to boot without an explicit
+  `socket.inter_token`. The client-token fallback IS the vulnerability in
+  production: every game client would hold a credential that fully
+  impersonates servers (bus, proxy, full SQL passthrough). Develop mode
+  keeps the once-per-process warning.
+- F-162 (same pass): `iscoroutine` -> `isawaitable` at every dispatch
+  site (event bus, network handlers, RPC execution, scheduler timers):
+  a handler/callback returning a Task/Future/custom `__await__` object
+  used to have its result -- and exception -- silently dropped.
+
+### Core
+- F-160: a sub-process death reaches the main runtime even when the
+  death callback fails or is absent. `ProcessSupervisor.start_child_watch`
+  takes an `on_unhandled_death` escalation hook (runtime shutdown in
+  production) that `_fail_fast` invokes BEFORE raising ChildDiedError --
+  the raise itself only ever reached the fire-and-forget watch task's
+  done-callback log, and the main process kept running with its db/proxy
+  process gone. Also: `_pid_alive` treats POSIX `PermissionError` from
+  `os.kill(pid, 0)` as alive (the process exists under another user; the
+  old false negative made a child suicide).
+- F-164: calendar events dispatch strictly in order. One fire-and-forget
+  spawn per event started tasks in creation order but interleaved them at
+  the first await -- an async NewHour handler could run after the
+  NewDay/NewWeek handlers behind it, while the serial bus contract
+  promises NewHour -> NewDay -> NewMonth -> NewYear -> NewWeek (midnight
+  reset logic depends on it). The boundary chain is one awaited
+  coroutine; catch-up boundaries serialize against each other too.
+
+### Docs / CI
+- docs/migration-plan.md: the risk register cited two mitigations that
+  were never implemented (`@reload_allow(...)`, `ipc_legacy=true`) --
+  replaced with what actually shipped.
+- docs/deployment.md: the inter_token separation and the Windows fd
+  ceiling are documented as ENFORCED (F-161/F-163), not advice.
+- .github/workflows/ci.yml: stale "held at 78" comment removed (the
+  gate has been 85 since pass 8).
+
+## v1.0.0-rc.2: eighth review pass (F-142..F-154) -- external assessment round 3
+
+Every finding of the third external assessment, each with a regression test
+(`tests/test_review_pass8.py` plus the F-147 handshake suite in
+`test_connection.py`); ruff format+check, mypy --strict (src) and mypy on
+tests clean; coverage 86%, CI gate raised to the migration plan's promised
+85 (was 78).
+
+### Database
+- F-142: the remote-transaction reaper and `close()` dispose sessions
+  UNDER the session lock (`_TxRecord.dispose` takes it itself). The TTL
+  sweep and shutdown path used to roll back / close a connection while a
+  statement was still in flight on it -- two queued 30 s-read-timeout
+  statements can outlive the TTL from the first touch -- which is exactly
+  the protocol-stream corruption the lock exists to prevent. COMMIT now
+  also holds the lock across close (a statement queued on the lock could
+  previously run concurrent with the close that followed it).
+- F-151: `_inflight` bookkeeping is now load-bearing (a saver re-marked
+  during its own flush is not re-picked mid-flight; it stays queued for
+  the next round), and a successful explicit `DataSaver.flush()` dequeues
+  the saver from the auto-save scheduler -- guarded by a per-saver dirty
+  generation counter so a mutation that lands DURING the upsert keeps the
+  saver queued. Previously every explicit flush guaranteed a redundant
+  duplicate upsert on the next round.
+
+### Transport security
+- F-143: the bus handshake re-runs on every transport-level reconnect. A
+  restarted main-process ROUTER begins with an empty authentication table;
+  DEALERs used to reconnect transparently at the ZMQ level but never re-
+  authenticate, so every frame from every running sub-process was silently
+  dropped until each child restarted. DEALERs now watch the ZMQ monitor
+  socket (EVENT_CONNECTED after a first completed handshake triggers a
+  full challenge-response with capped retry backoff) and re-offer AUTH0
+  every 30 s as a self-healing keepalive (a no-op on a ROUTER that still
+  knows the identity).
+- F-144: pre-auth destination slots are evicted first under table
+  pressure -- junk identities from local AUTH0 spam each used to allocate
+  a queue + writer that only the 300 s idle ttl could reclaim, letting a
+  rogue local process lock legitimate new DEALERs out of the bounded
+  destination table for minutes.
+- F-145: `route(..., raise_on_drop=True)` now raises `NoProxyAvailableError`
+  on the proxy legs too (no proxy connected / no proxy client configured)
+  instead of silently dropping and letting the caller burn its full RPC
+  timeout -- the exact failure mode F-128 removed for the bus legs.
+- F-146: inbound msgpack decoding enforces a TOTAL element budget across
+  all containers (list/object hooks with a running counter), not just the
+  per-container caps -- a 16 MiB frame of many small arrays used to pass
+  each cap individually while expanding ~30x the wire size in Python
+  objects. Legitimate single large containers still pass.
+- F-147: the TCP handshake is now MUTUAL -- `@auth` carries the client's
+  own nonce and `@welcome` must answer `HMAC(token, client_nonce)`, so the
+  client verifies the server holds the token (a machine-in-the-middle
+  could previously impersonate the server, harvest the digest and relay
+  cleartext application frames; the ZMQ plane was already mutual). Close
+  reasons claimed by rejection paths are no longer overwritten by the read
+  loop's generic "read eof".
+
+### Kernel
+- F-148: a failed idle-probe send (queue overflow / closing connection)
+  exits the idle watcher quietly instead of dying as an unretrieved task
+  exception one loop tick later.
+- F-150: a handler that raises `CancelledError` on its own no longer
+  truncates the event dispatch chain (on a reverse quit chain one such
+  handler silently skipped the teardown of every handler behind it);
+  genuine cancellation of the dispatching task still propagates
+  (`task.cancelling()` discriminates). The same discrimination guards the
+  shutdown-hook loop in `request_shutdown`.
+- F-153: clean sub-process exits during a planned shutdown log at INFO
+  (were `logger.fatal`), and the watcher keeps logging siblings after one
+  clean exit; a repeating timer whose beat is dispatched while the
+  scheduler closes returns quietly (was a logged RuntimeError traceback
+  per armed timer, every shutdown).
+
+### Hot reload
+- F-149: `async def` <-> `def` swaps are rejected (`ReloadRejected`) at
+  module level, method level, and at swap time for assignment-produced
+  closures -- the signature check alone cannot see the coroutine flag, and
+  the swap used to land code that TypeErrors every existing caller.
+- F-154: `__reloadkeep__` is per-class -- a base's keep-list no longer
+  pins attribute names in subclass diffs (getattr walked the MRO).
+
+### Schema
+- F-152: `row_exists` interpolates the validated `spec.name` (not the raw
+  argument), and the migration splitter honours MySQL `#` line comments
+  (a `;` inside one used to split the statement).
+
+### Tests / CI / docs
+- api facade submodules (db/rpc/orm/log) and `db/redis.py` unit paths now
+  have direct coverage (were 0% / 39% artifacts of the lazy-import design
+  and the marker split); CI coverage gate 78 -> 85 (measured 86%).
+- `docs/deployment.md`: trust model updated for the mutual TCP handshake,
+  total decode budget, bus re-authentication, pre-auth eviction, proxy
+  fail-fast, and an explicit inter_token-fallback blast-radius warning.
+- `docs/migration-plan.md`: acceptance-criteria status annotated
+  (delivered vs deferred: differential oracle, soak/nightly, mkdocs are
+  rc->GA gates, not rc gates).
+- `docs/hot-reload.md`: async/sync swap now forbidden; function->assignment
+  semantics documented; `__reloadkeep__` documented as per-class.
+
+### Known gaps (deliberate, documented)
+- Per-area coverage floors (core/net/db/reload >= 90%) remain unmet in two
+  places: reload/inplace.py 83%, runtime.py 69% (total is 86% with the 85
+  gate; the floors need a dedicated pass, tracked in
+  `docs/migration-plan.md` §5 status)
+- Windows signal-path shutdown flush still rests on `asyncio.run`
+  cancellation semantics rather than the signal-handler guarantees of the
+  POSIX path (documented in `docs/deployment.md`)
+
 ## Unreleased: seventh review pass (F-123..F-141) -- external assessment round 2
 
 Every remaining finding of the second full external assessment, each with a
@@ -578,9 +779,9 @@ this pass also cleared).
 - `ruff format` drift (19 files) cleared; format is part of the lint job
 
 ### Known gaps (deliberate, documented)
-- Sub-process Prometheus metrics are not scrapeable (only the main process
-  exports :9100); multiprocess mode or per-process ports needs a deployment
-  decision
+- ~~Sub-process Prometheus metrics are not scrapeable~~ -- resolved later in
+  this pass by F-137 (`metrics_all_processes: true` exports per-process
+  registries on `metrics_port + index`)
 - Polling loops (watchdog 20Hz, park 2Hz, ...) are intentionally kept --
   converting them to event-driven is a refactor with regression risk, not a
   defect fix

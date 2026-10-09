@@ -4,21 +4,25 @@ and send backpressure.
 Protocol names starting with ``@`` are reserved for connection control:
 
 * ``@challenge``   -- first frame from the server: 16 random bytes (nonce).
-* ``@auth``        -- client's reply: HMAC-SHA256(token, nonce) digest.
-* ``@welcome``     -- server's confirmation once the digest verified.
+* ``@auth``        -- client's reply: HMAC-SHA256(token, server_nonce) digest
+  (32 bytes) followed by the client's OWN 16-byte nonce (F-147).
+* ``@welcome``     -- server's confirmation: HMAC-SHA256(token, client_nonce)
+  (32 bytes) -- the server's proof that IT also holds the token.
 * ``@ping``/``@pong`` -- heartbeat probes (client probes, server answers).
 
-The token never crosses the wire: only keyed hashes of per-connection random
-nonces do, so a sniffed handshake is useless for replay (a new connection
-gets a fresh nonce) and leaks nothing about the token. The decode buffer is
-capped at ``preauth_max_frame`` (kilobytes) until the handshake verifies --
-an unauthenticated connection cannot park ``max_frame`` (16 MiB) of frames in
-the decoder. Everything else is dispatched to the application ``on_message``
-callback after verification. One reader task owns the stream (handshake is
-enforced inside the read loop plus a deadline timer), one writer task drains
-a bounded send queue; when the peer stops reading and the queue fills up --
-by message count OR queued bytes -- the connection is closed -- slow-consumer
-protection the prototype lacked.
+The handshake is MUTUAL (F-147): the client proves it holds the token and the
+server proves the same back, so neither direction trusts an unauthenticated
+peer. The token never crosses the wire: only keyed hashes of per-connection
+random nonces do, so a sniffed handshake is useless for replay (a new
+connection gets fresh nonces) and leaks nothing about the token. The decode
+buffer is capped at ``preauth_max_frame`` (kilobytes) until the handshake
+verifies -- an unauthenticated connection cannot park ``max_frame`` (16 MiB)
+of frames in the decoder. Everything else is dispatched to the application
+``on_message`` callback after verification. One reader task owns the stream
+(handshake is enforced inside the read loop plus a deadline timer), one
+writer task drains a bounded send queue; when the peer stops reading and the
+queue fills up -- by message count OR queued bytes -- the connection is
+closed -- slow-consumer protection the prototype lacked.
 """
 
 from __future__ import annotations
@@ -29,12 +33,14 @@ import hashlib
 import hmac
 import logging
 import secrets
+import sys
 import time
 from collections import deque
 from collections.abc import Callable
 
 from prometheus_client import Counter
 
+from pyline.config.errors import ConfigError
 from pyline.net.protocol import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_FRAME,
@@ -55,6 +61,9 @@ PONG_FLAG = "@pong"
 
 #: Length of the per-connection challenge nonce (bytes).
 CHALLENGE_NONCE_LEN = 16
+
+#: Length of an HMAC-SHA256 digest (the auth/proof payloads' fixed size).
+AUTH_DIGEST_LEN = 32
 
 DEFAULT_PREAUTH_MAX_FRAME = 64 * 1024
 
@@ -79,6 +88,32 @@ _CONNECTIONS_REJECTED = Counter(
 # documented caps enforced.
 DEFAULT_MAX_CONNECTIONS = 4096
 DEFAULT_MAX_CONNECTIONS_PER_IP = 256
+
+# F-161: CPython's win32 select() watches at most ~512 fds. The selector
+# loop pyline installs for pyzmq (net.loop_policy) inherits that ceiling for
+# EVERY socket it registers -- the client listener, proxy links, the bus.
+# docs/deployment.md documented the limit as advice; it is enforced now: a
+# config whose accept cap cannot fit under the ceiling fails at bind time
+# instead of crashing the loop with "too many file descriptors in select()"
+# under load. The reserve leaves room for non-listener sockets (bus DEALER,
+# outbound proxy links, stdio).
+_WINDOWS_SELECT_FDS = 512
+_WINDOWS_RESERVED_FDS = 64
+
+
+def check_windows_fd_budget(max_connections: int) -> None:
+    """Refuse an accept cap the Windows selector loop cannot honour (F-161)."""
+    if sys.platform != "win32":
+        return
+    ceiling = _WINDOWS_SELECT_FDS - _WINDOWS_RESERVED_FDS
+    if max_connections > ceiling:
+        raise ConfigError(
+            f"socket.max_connections={max_connections} exceeds the Windows "
+            f"selector-loop budget (~{_WINDOWS_SELECT_FDS} fds incl. a "
+            f"{_WINDOWS_RESERVED_FDS}-fd reserve for the bus/proxy/stdio): "
+            f"lower it to <= {ceiling} or deploy on POSIX "
+            "(see docs/deployment.md, 'Windows fd ceiling')"
+        )
 
 
 class ConnectionClosedError(ConnectionError):
@@ -126,6 +161,14 @@ class Connection:
         # unauthenticated connection could park ``max_frame`` in the decoder.
         self._decoder = FrameDecoder(max_frame=min(preauth_max_frame, max_frame))
         self._challenge_nonce: bytes | None = None
+        # F-147: the client-side nonce for the mutual handshake. The client
+        # challenges the server inside its @auth reply and verifies the
+        # server's @welcome proof against this value; None until the server's
+        # @challenge arrives.
+        self._client_nonce: bytes | None = None
+        # F-147: the proof the server will send with @welcome (computed from
+        # the client nonce received in @auth). Server side only.
+        self._welcome_proof: bytes | None = None
         self._send_queue: asyncio.Queue[list[bytes]] = asyncio.Queue(send_queue_limit)
         self._send_queue_bytes = send_queue_bytes
         # F-21: bytes queued for the write loop. ``send_queue_limit`` counts
@@ -141,6 +184,11 @@ class Connection:
         self._error_times: deque[float] = deque()
         self._write_failed = False
         self._closing = False
+        # F-147: reason claimed synchronously by a rejection path. The read
+        # loop's finally-close runs before any spawned close task gets a loop
+        # tick, so without this the generic "read eof" always overwrote the
+        # diagnostic reason ("handshake rejected") the rejection produced.
+        self._claimed_reason: str | None = None
         # F-78: strong references to fire-and-forget close() tasks. A bare
         # create_task result can be garbage-collected mid-run (the library's
         # own F-20 discipline); a lost close task used to leave the socket
@@ -157,7 +205,12 @@ class Connection:
         self._metrics.connections.inc()
 
     def _spawn_close(self, reason: str) -> None:
-        """Schedule close() and keep the reference (F-78)."""
+        """Schedule close() and keep the reference (F-78).
+
+        The reason is claimed synchronously (F-147): a caller that returns
+        False out of the read loop right after this would otherwise have its
+        own generic finally-close ("read eof") win the name."""
+        self._claimed_reason = self._claimed_reason or reason
         task = asyncio.get_running_loop().create_task(self.close(reason))
         self._bg_close_tasks.add(task)
 
@@ -208,21 +261,37 @@ class Connection:
         except Exception:
             logger.exception("read loop crashed for %s", self)
         finally:
-            await self.close("read eof")
+            await self.close(self._claimed_reason or "read eof")
 
     def _handle_frame(self, frame: Frame) -> bool:
         """Route one decoded frame; returns False to stop the read loop."""
         if not self.verified:
             if self.is_server_side:
                 if frame.flag == AUTH_FLAG and self._challenge_nonce is not None:
-                    # F-22 lineage: constant-time comparison of the digest.
-                    # The expected value is HMAC(token, this connection's
-                    # nonce); a sniffed digest from another connection fails
-                    # because nonces never repeat in practice (2^-128).
+                    # F-147: @auth carries HMAC(token, server_nonce) || the
+                    # client's own nonce. The digest halves stay
+                    # constant-time compared (F-22 lineage); a sniffed
+                    # digest from another connection fails because nonces
+                    # never repeat in practice (2^-128).
+                    if len(frame.payload) != AUTH_DIGEST_LEN + CHALLENGE_NONCE_LEN:
+                        logger.warning(
+                            "bad @auth payload length %d from %s", len(frame.payload), self
+                        )
+                        self._spawn_close("handshake rejected")
+                        return False
+                    claimed, client_nonce = (
+                        frame.payload[:AUTH_DIGEST_LEN],
+                        frame.payload[AUTH_DIGEST_LEN:],
+                    )
                     expected = hmac.new(
                         self._token_bytes, self._challenge_nonce, hashlib.sha256
                     ).digest()
-                    if hmac.compare_digest(frame.payload, expected):
+                    if hmac.compare_digest(claimed, expected):
+                        # The server's @welcome proof: HMAC(token, the
+                        # client's nonce) -- the mutual half of F-147.
+                        self._welcome_proof = hmac.new(
+                            self._token_bytes, client_nonce, hashlib.sha256
+                        ).digest()
                         self._verified()
                         return True
                 logger.warning("rejecting unauthenticated frame %r from %s", frame.flag, self)
@@ -234,11 +303,26 @@ class Connection:
                     self._spawn_close("handshake rejected")
                     return False
                 digest = hmac.new(self._token_bytes, frame.payload, hashlib.sha256).digest()
-                # verified stays False until the server's @welcome confirms the
-                # digest was accepted (F-17; it used to be set unconditionally).
-                self.send_message(AUTH_FLAG, digest)
+                # F-147: challenge the server back -- @auth carries our own
+                # fresh nonce so @welcome must prove the server holds the
+                # token too (the client used to accept any @welcome, which a
+                # machine-in-the-middle could send while relaying cleartext
+                # application frames).
+                self._client_nonce = secrets.token_bytes(CHALLENGE_NONCE_LEN)
+                self.send_message(AUTH_FLAG, digest + self._client_nonce)
                 return True
             if frame.flag == WELCOME_FLAG:
+                if self._client_nonce is None or len(frame.payload) != AUTH_DIGEST_LEN:
+                    logger.warning("malformed @welcome from %s; closing", self)
+                    self._spawn_close("handshake rejected")
+                    return False
+                expected = hmac.new(self._token_bytes, self._client_nonce, hashlib.sha256).digest()
+                if not hmac.compare_digest(frame.payload, expected):
+                    logger.error(
+                        "@welcome proof failed for %s; server does not hold the token", self
+                    )
+                    self._spawn_close("handshake rejected")
+                    return False
                 self._verified()
                 return True
             logger.warning("client ignoring pre-welcome frame %r from %s", frame.flag, self)
@@ -277,7 +361,11 @@ class Connection:
         self.verified = True
         self._decoder.set_max_frame(self._max_frame)
         if self.is_server_side:
-            self.send_message(WELCOME_FLAG, b"")
+            # F-147: the welcome carries the server's proof over the client's
+            # nonce (set while verifying @auth); the empty-payload welcome is
+            # gone -- the client now rejects it.
+            assert self._welcome_proof is not None
+            self.send_message(WELCOME_FLAG, self._welcome_proof)
         self._verified_event.set()
         if self._on_verified is not None:
             try:
@@ -343,7 +431,14 @@ class Connection:
                 # server that never probed used to idle-kill third-party
                 # clients that only answer pings. Replies refresh _last_recv
                 # on both sides, so mutual probes do not loop.
-                self.send_message(PING_FLAG, b"")
+                # F-148: an overflowing/already-closed send path raises out
+                # of send_message; the close it spawns is the correct
+                # outcome, but the escape used to kill this watcher with an
+                # unretrieved-exception warning one loop tick later.
+                try:
+                    self.send_message(PING_FLAG, b"")
+                except ConnectionClosedError:
+                    return
 
     # ------------------------------------------------------------------ #
     # Sending
@@ -527,6 +622,11 @@ async def serve(
     ``max_connections_per_ip`` (same peer IP) are refused at accept time and
     counted in ``pyline_connections_rejected_total{reason}``. The defaults
     mirror SocketSettings; the runtime forwards the configured values."""
+
+    # F-161: fail at bind time on Windows instead of crashing the selector
+    # loop under load (both listeners -- client and proxy -- go through
+    # here, and each accepts up to max_connections sockets).
+    check_windows_fd_budget(max_connections)
 
     limiter = _ConnectionLimiter(max_connections, max_connections_per_ip)
 

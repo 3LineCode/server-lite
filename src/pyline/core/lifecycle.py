@@ -313,6 +313,15 @@ class LifecycleManager:
             for hook in self._shutdown_hooks:
                 try:
                     await hook()
+                except asyncio.CancelledError:
+                    # F-150: a hook raising CancelledError on its own must
+                    # not truncate the teardown chain (the remaining hooks
+                    # are exactly the flushes shutdown exists to run); a
+                    # genuine cancellation of THIS task still propagates.
+                    task = asyncio.current_task()
+                    if task is not None and task.cancelling() > 0:
+                        raise
+                    logger.exception("shutdown hook %r raised CancelledError", hook)
                 except Exception:
                     logger.exception("shutdown hook %r failed", hook)
             if self._quit_tasks:

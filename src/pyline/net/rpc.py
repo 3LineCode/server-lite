@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import itertools
 import logging
 import time
@@ -129,6 +130,13 @@ class RpcManager(Network):
         # F-78: msgpack can also raise RecursionError (deeply nested payload)
         # -- counted, not just logged.
         self.malformed_messages = 0
+        # F-159: bound on inbound CALL tasks (running + queued). The F-19
+        # semaphore bounds EXECUTION, but every CALL used to still spawn a
+        # task that could park up to ``inflight_wait`` in _acquire_slot --
+        # live task count was bounded only by arrival rate x wait. Beyond
+        # ``max_inflight`` running + ``max_inflight`` queued, a new CALL is
+        # answered busy immediately, without spawning anything.
+        self._max_inbound_tasks = max_inflight * 2
         # F-19: inbound concurrency cap. A bare task per CALL let any
         # authenticated peer stack unbounded work with a CALL storm; execution
         # now queues on this semaphore, and callers that wait longer than
@@ -331,6 +339,25 @@ class RpcManager(Network):
                 from_service,
             )
             from_service_claim = from_service
+        if len(self._inbound) >= self._max_inbound_tasks:
+            # F-159: the task pool (running + semaphore-queued) is full --
+            # spawning yet another task that parks in _acquire_slot is the
+            # unbounded-arrival DoS the pool bound exists to stop. Answer
+            # busy immediately (same wire shape as the F-19 reject) instead.
+            self.busy_rejects += 1
+            logger.warning(
+                "rpc inbound task pool full (%d); rejecting call %d to %r "
+                "without executing (rejects=%d)",
+                self._max_inbound_tasks,
+                call_id,
+                func_path,
+                self.busy_rejects,
+            )
+            if call_id:  # notify-style calls (call_id 0) expect no reply
+                self._send(from_service_claim, [MSG_RESULT, call_id, 0, BUSY_MESSAGE])
+            else:
+                self.busy_notify_drops += 1
+            return
         task = asyncio.get_running_loop().create_task(
             self._execute(call_id, from_service_claim, func_path, args)
         )
@@ -433,7 +460,10 @@ class RpcManager(Network):
                         result_kind = 2
                         raise RpcUnknownFunctionError(func_path, "function not registered")
                     result = func(*args)
-                    if asyncio.iscoroutine(result):
+                    # isawaitable, not iscoroutine (F-162): a handler
+                    # returning a Task/Future/custom __await__ object used to
+                    # have its result -- and exception -- silently dropped.
+                    if inspect.isawaitable(result):
                         result = await result
                 except asyncio.CancelledError:
                     raise

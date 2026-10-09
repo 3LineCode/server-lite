@@ -19,6 +19,9 @@ KW = {
     "idle_timeout": 30.0,
     "send_queue_limit": 64,
 }
+# Server-side twin of KW: serve() additionally needs an accept cap that
+# fits the Windows fd budget (F-161).
+SERVER_KW = {**KW, "max_connections": 16}
 
 
 class _StubRouter:
@@ -76,7 +79,7 @@ async def start_proxy_server(ctx) -> tuple[ProxyServer, asyncio.AbstractServer, 
         token=proxy_mod.inter_token(ctx),
         on_message=lambda f, p: None,
         on_connected=server._on_connected,
-        **KW,  # type: ignore[arg-type]
+        **SERVER_KW,  # type: ignore[arg-type]
     )
     return server, srv, srv.sockets[0].getsockname()[1]
 
@@ -174,7 +177,7 @@ async def test_proxy_reconnect_survives_immediate_close(config_dir, tmp_path) ->
         on_connected=lambda conn: asyncio.get_running_loop().create_task(
             conn.close("instant close")
         ),
-        **KW,  # type: ignore[arg-type]
+        **SERVER_KW,  # type: ignore[arg-type]
     )
     port = srv.sockets[0].getsockname()[1]
 

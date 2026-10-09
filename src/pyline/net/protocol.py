@@ -45,6 +45,39 @@ MAX_DECODE_STR = 16 * 1024 * 1024
 MAX_DECODE_BIN = 16 * 1024 * 1024
 MAX_DECODE_EXT = 16 * 1024 * 1024
 MAX_DECODE_ELEMS = 1_048_576
+# F-146: ``max_array_len``/``max_map_len`` are PER-CONTAINER caps -- a frame
+# of many small containers passes each individually while the SUM of their
+# elements still expands ~30x the wire size. The hooks below count every
+# container slot as it is assembled and abort the decode once the running
+# total exceeds this bound. Worst-case overshoot is one full container past
+# the limit (elements are materialized before their hook fires), i.e. the
+# amplification of any single frame is bounded to a small multiple of its
+# wire size instead of the number of containers it can carry. Every
+# container slot costs >= 1 wire byte in msgpack, so a legitimate payload
+# never approaches the cap unless it is slot-dense tiny-value spam.
+MAX_DECODE_TOTAL_ELEMS = 2 * MAX_DECODE_ELEMS
+
+
+class _ElementBudget:
+    """Running total of decoded container slots (F-146).
+
+    ``list_hook``/``object_hook`` fire bottom-up as each container finishes,
+    so the count lags materialization by at most one container -- which is
+    exactly the overshoot the total cap's margin above ``MAX_DECODE_ELEMS``
+    covers."""
+
+    __slots__ = ("used",)
+
+    def __init__(self) -> None:
+        self.used = 0
+
+    def charge(self, size: int) -> None:
+        self.used += size
+        if self.used > MAX_DECODE_TOTAL_ELEMS:
+            raise ValueError(
+                f"msgpack payload exceeds the total element budget "
+                f"({self.used} > {MAX_DECODE_TOTAL_ELEMS} slots)"
+            )
 
 
 class ProtocolError(Exception):
@@ -57,8 +90,20 @@ def decode_payload(payload: bytes) -> Any:
     Every decode of data that crossed a trust boundary must go through here:
     the caps turn a pathological payload into a ``ValueError`` (which callers
     already treat as drop-and-count) instead of a memory blow-up. Nested
-    depth stays covered by the existing ``RecursionError`` handling (F-78).
+    depth stays covered by the existing ``RecursionError`` handling (F-78),
+    and the running element budget (F-146) bounds the total number of
+    container slots across ALL containers, not just per container.
     """
+    budget = _ElementBudget()
+
+    def _count_list(items: list[Any]) -> list[Any]:
+        budget.charge(len(items))
+        return items
+
+    def _count_map(mapping: dict[Any, Any]) -> dict[Any, Any]:
+        budget.charge(len(mapping))
+        return mapping
+
     return msgpack.unpackb(
         payload,
         raw=False,
@@ -68,6 +113,8 @@ def decode_payload(payload: bytes) -> Any:
         max_ext_len=MAX_DECODE_EXT,
         max_array_len=MAX_DECODE_ELEMS,
         max_map_len=MAX_DECODE_ELEMS,
+        list_hook=_count_list,
+        object_hook=_count_map,
     )
 
 

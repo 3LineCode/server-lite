@@ -51,7 +51,13 @@ executed for checking purposes, so import-time side effects run exactly once
   trailing optional parameters and new defaulted keyword-only parameters is
   allowed.
 * **Kind change** -- a module-level function becoming a class (or vice
-  versa).
+  versa), and **since F-149 also `async def` <-> `def`** in either
+  direction: the swap keeps every signature identical while flipping how
+  every existing caller must invoke the function (`await f()` vs `f()`),
+  which is exactly the caller-breakage class this validator exists to
+  prevent. The check covers module-level functions, methods, and the inner
+  functions of descriptors; a runtime coroutine-flag net in the swap path
+  catches assignment-produced closures the AST summary reports as values.
 * **Closure layout change** (`ReloadError` at swap time, rolled back) --
   e.g. a nested function gaining a new free variable. Note: closure
   *captured values* are preserved across reloads -- changing `factor = 2` to
@@ -81,7 +87,9 @@ executed for checking purposes, so import-time side effects run exactly once
   as a failed hook, never silently skipped;
 * `__reloadkeep__ = ("attr", ...)` on a class lists attributes that survive
   reloads untouched; an attribute carrying `__reloadkeep__ = True` is kept
-  individually;
+  individually. **The marker is per-class** (F-154): a base's keep-list is
+  NOT inherited into subclass diffs -- a subclass updates its own
+  attributes normally unless it declares its own marker;
 * module-level plain values are runtime state by default: a reload never
   clobbers them (the prototype needed manual `if not "g_X" in globals()`
   guards for this).
@@ -122,7 +130,12 @@ AST can see:
   change inside the wrapper passes validation and fails at runtime. Validate
   such changes by hand (or restart).
 * **Closure factories created by assignment are treated as values** and skip
-  signature validation entirely (`handler = make_handler(...)`).
+  signature validation entirely (`handler = make_handler(...)`). The mirror
+  image is also true and deliberate: replacing a `def f(): ...` with a plain
+  assignment (`f = factory()`) is allowed (the closure-factory pattern) --
+  the module attribute then holds whatever the assignment produced while
+  pre-existing `from mod import f` holders keep the old function object.
+  Restart if that divergence matters to you.
 * **Only the reloaded module is validated.** Other modules' call sites keep
   their old compiled bytecode: a change that is compatible per the table
   above can still break an old caller in another module that passes

@@ -20,7 +20,7 @@ from dataclasses import asdict, fields
 from enum import Enum
 from typing import Any, Protocol
 
-from pyline.db.schema import SchemaManager
+from pyline.db.schema import TableProvider
 from pyline.db.serialization import (
     BlobFormatError,
     BlobVersionError,
@@ -30,6 +30,7 @@ from pyline.db.serialization import (
     loads_migrated,
     peek_version,
 )
+from pyline.db.tracked import TrackedDict, TrackedList
 from pyline.db.transaction import TransactionJournal, current_flush_journal
 
 logger = logging.getLogger(__name__)
@@ -139,13 +140,38 @@ def dataclass_codec(
     return DataclassCodec(to_dict, from_dict, schema_version=schema_version, migrations=migrations)
 
 
+def _bind_tracking(value: Any, touch: Callable[[], None]) -> Any:
+    """F-162: wrap plain dicts/lists (recursively) in tracked containers.
+
+    A decoded blob comes back as plain ``dict``/``list``, and nothing re-bound
+    them -- attribute writes on a model went through ``TrackableModel``, but
+    in-place container mutation stayed invisible unless the developer
+    re-wrapped every field by hand after every load; forgetting ``touch()``
+    was silent data loss. Containers that are already tracked keep their
+    existing callback (no double wrap); every other object type (models
+    included) passes through untouched -- model attribute tracking is the
+    model's own ``__setattr__``.
+    """
+    if isinstance(value, TrackedDict):
+        return value
+    if isinstance(value, TrackedList):
+        return value
+    if isinstance(value, dict):
+        wrapped = {k: _bind_tracking(v, touch) for k, v in value.items()}
+        return TrackedDict(wrapped, touch=touch)
+    if isinstance(value, list):
+        wrapped_items = [_bind_tracking(v, touch) for v in value]
+        return TrackedList(wrapped_items, touch=touch)
+    return value
+
+
 class DataSaver:
     """One persisted blob at ``(table[column], key)``."""
 
     def __init__(
         self,
         db: QueryExecutor,
-        schema: SchemaManager,
+        schema: TableProvider,
         table: str,
         column: str,
         key: Any,
@@ -173,6 +199,11 @@ class DataSaver:
         # F-63: the open transaction that owns this saver's next auto-save
         # (set while its dirty marking is deferred into the journal).
         self._pending_journal: TransactionJournal | None = None
+        # F-151: bumped on every dirty marking. An explicit flush() snapshots
+        # it after encoding and only dequeues the saver from the scheduler
+        # when no mark landed in between -- a mutation during the flush's
+        # execute window must keep the saver queued for the next round.
+        self._dirty_seq = 0
         # F-34: flush() and delete() serialize on this lock so an upsert that
         # is already in flight can never land after a DELETE and resurrect
         # the row.  asyncio.Lock no longer binds to a loop at creation
@@ -199,7 +230,7 @@ class DataSaver:
         return self._data
 
     def set_data(self, data: Any) -> None:
-        self._data = data
+        self._data = _bind_tracking(data, self.mark_dirty)
         self.state = SaveState.LOADED
         self.mark_dirty()
 
@@ -246,12 +277,25 @@ class DataSaver:
             if not future.done():
                 future.set_result(self._data)
             return
-        if rows and rows[0][0] is not None:
-            self._data = self._codec.decode(rows[0][0])
-            self.state = SaveState.LOADED
-        else:
+        try:
+            if rows and rows[0][0] is not None:
+                self._data = _bind_tracking(self._codec.decode(rows[0][0]), self.mark_dirty)
+                self.state = SaveState.LOADED
+            else:
+                self._data = None
+                self.state = SaveState.MISSING
+        except BaseException as exc:
+            # F-157: a decode failure (corrupt blob, future version, failed
+            # migration) used to escape with the load future unresolved --
+            # every joiner parked on asyncio.shield(_load_future) forever and
+            # the state stayed LOADING (later load hooks silently queued on a
+            # saver that would re-run them on the next attempt). Resolve the
+            # joiners with the error and reset so a retry is possible.
             self._data = None
-            self.state = SaveState.MISSING
+            self.state = SaveState.NEW
+            if not future.done():
+                future.set_exception(exc)
+            raise
         for hook in self._load_hooks:
             try:
                 hook(self)
@@ -281,6 +325,7 @@ class DataSaver:
                 "call load() or set_data() first"
             )
         self.state = SaveState.LOADED
+        self._dirty_seq += 1  # F-151
         if not self._auto_save or self._scheduler is None:
             return
         journal = current_flush_journal()
@@ -313,6 +358,7 @@ class DataSaver:
         self._pending_journal = None
         if self.state == SaveState.DELETED:
             return
+        self._dirty_seq += 1  # F-151: journal hold released = data pending again
         if self._auto_save and self._scheduler is not None:
             self._scheduler.requeue(self)
 
@@ -331,20 +377,42 @@ class DataSaver:
         Serialized against delete() by the flush lock (F-34): the state is
         re-checked *after* acquiring it, so a delete that won the lock makes
         the in-waiting flush a no-op instead of resurrecting the row.
+        On success the saver is dequeued from the auto-save scheduler
+        (F-151) -- unless it was re-marked while the upsert was in flight,
+        which the dirty-generation snapshot detects.
         """
         async with self._flush_lock:
             if self.state == SaveState.DELETED:
                 return
             self._require_loaded("flushed")
             blob = self._codec.encode(self._data)
+            # F-151: generation of the data snapshot carried by this upsert.
+            seq = self._dirty_seq
             await self._db.execute(self._spec.upsert_sql(self._column), (self.key, blob))
+            if self._scheduler is not None and self._dirty_seq == seq:
+                # The queued entry would re-upsert exactly this row on the
+                # next round -- a guaranteed redundant write.
+                self._scheduler.forget(self)
             # F-50: if this upsert joined an ambient transaction, register it
             # so a rollback re-marks the saver dirty (the DB keeps the old
             # row while memory holds the new data).
             journal = current_flush_journal()
             if journal is not None:
-                journal.note_flush(self)
-                self._pending_journal = None  # F-63: the explicit flush supersedes a deferral
+                self.mark_journal_flushed(journal)
+
+    def mark_journal_flushed(self, journal: TransactionJournal) -> None:
+        """F-63/F-158: acknowledge a flush that joined ``journal``.
+
+        Registers the flush for rollback re-marking AND drops the deferral
+        hold. The coalesced multi-row path used to only ``note_flush``: the
+        journal stopped deferring the saver, but ``_pending_journal`` kept
+        pointing at the (now dead) journal, so ``held_by_journal`` made the
+        auto-save scheduler skip this saver forever -- its data was only
+        rescued by the shutdown drain. Both flush paths go through here so
+        the two halves can never diverge again.
+        """
+        journal.note_flush(self)
+        self._pending_journal = None
 
     def remark_dirty_after_rollback(self) -> None:
         """F-50: this saver's upsert joined a transaction that rolled back;
@@ -363,6 +431,7 @@ class DataSaver:
         # through ``requeue`` -- never dropped by the shutdown quitting guard
         # (a rollback can land inside the shutdown drain window).
         self.state = SaveState.LOADED
+        self._dirty_seq += 1  # F-151
         self._scheduler.requeue(self)
 
     async def begin_flush_row(self) -> tuple[Any, bytes] | None:
@@ -440,6 +509,8 @@ class SaveSchedulerLike(Protocol):
     def mark(self, saver: DataSaver) -> None: ...
 
     def requeue(self, saver: DataSaver) -> None: ...
+
+    def forget(self, saver: DataSaver) -> None: ...
 
 
 class TrackableModel:

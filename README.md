@@ -47,17 +47,20 @@ uv run mypy src tests
 
 ## Status
 
-v1.0.0-rc.1: P0-P5 core plus the full migration-finish pass (F-01..F-30 in
+v1.0.0-rc.2: P0-P5 core plus the full migration-finish pass (F-01..F-30 in
 `docs/migration-plan.md` -- data safety, network robustness, kernel,
-hot-reload guards, business facade) and six review passes on top
-(F-31..F-122 -- see `CHANGELOG.md`). The seventh pass (F-123..F-141) closes
-every finding of the second external assessment: HMAC challenge-response
-handshakes on the TCP and ZMQ planes (the token never crosses a wire),
-pre-auth frame caps and bounded msgpack decoding, byte-bounded bus queues
-with fast-fail RPC, versioned migrations wired into production, isolation/
-recycle/timeout correctness in the MySQL layer, serialized remote-
-transaction statements, spawn-window teardown safety, and kernel/DB
-observability with per-process metrics export (coverage 85%).
-See `docs/plan.md` (master plan), `docs/hot-reload.md` (reload contract and
-known limits) and `docs/deployment.md` (trust model and platform limits
-before going public).
+hot-reload guards, business facade) and nine review passes on top
+(F-31..F-164 -- see `CHANGELOG.md`). The seventh pass closed every finding
+of the second external assessment; the eighth (F-142..F-154) closed the
+third; the ninth (F-155..F-164) closed every finding of a full-repo
+assessment: the ORM now works in the multi-process topology (pool-less
+TableCatalog backs savers in business processes), a decode failure during
+load resolves joiners instead of hanging them, the coalesced flush drops
+the journal hold, plain containers become tracked automatically on
+set_data/load, the inbound RPC task pool is bounded, a sub-process death
+escalates to a main-runtime shutdown even when the callback fails, the
+Windows fd ceiling and the production inter_token separation are enforced
+at boot, and the hot-reload validator compares default POSITIONS, not
+counts. See `docs/plan.md` (master plan), `docs/hot-reload.md` (reload
+contract and known limits) and `docs/deployment.md` (trust model and
+platform limits before going public).

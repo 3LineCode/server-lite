@@ -16,6 +16,7 @@ the remaining handlers).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -225,8 +226,27 @@ class EventBus:
         name = getattr(handler, "__qualname__", repr(handler))
         try:
             result = handler(event)
-            if asyncio.iscoroutine(result):
+            # isawaitable, not iscoroutine (F-162): a handler returning a
+            # Task/Future/custom __await__ object used to have its result --
+            # and exception -- silently dropped.
+            if inspect.isawaitable(result):
                 await result
+        except asyncio.CancelledError:
+            # F-150: a handler that raises CancelledError on its own (a
+            # cancelled inner task awaited bare, a mis-coded timeout) used to
+            # escape the Exception clause below and truncate the dispatch --
+            # on a reverse-dispatch quit chain one such handler silently
+            # skipped the teardown of every handler behind it. Only a
+            # cancellation of THIS task (the await above was interrupted
+            # from outside) propagates; otherwise the handler is isolated
+            # like any other failure.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling() > 0:
+                raise
+            self._failure_counts[name] = self._failure_counts.get(name, 0) + 1
+            logger.exception(
+                "event handler %s raised CancelledError (event=%s)", name, type(event).__name__
+            )
         except Exception:
             self._failure_counts[name] = self._failure_counts.get(name, 0) + 1
             logger.exception("event handler %s failed (event=%s)", name, type(event).__name__)

@@ -120,11 +120,11 @@ class MessageRouter:
         bounds loops that re-enter the router (a registry disagreement used
         to reset the counter to 0 at every ProxyClient hop).
 
-        ``raise_on_drop`` propagates through the bus legs (raise_on_drop on
-        ``ZmqBus.send``): a refused enqueue surfaces as ``BusOverflowError``
-        here instead of a silent drop -- callers awaiting a result fail fast
-        instead of timing out. The proxy legs already raise on send failure
-        (ConnectionClosedError / NoProxyAvailableError)."""
+        ``raise_on_drop`` propagates through every leg: a refused bus enqueue
+        surfaces as ``BusOverflowError``, and a proxy leg with no reachable
+        proxy surfaces as ``NoProxyAvailableError`` (F-145) -- callers
+        awaiting a result fail fast instead of timing out. Proxy send
+        failures themselves always raise (ConnectionClosedError)."""
         if target_service_no == self._ctx.service_no:
             origin = self._ctx.service_no if from_service is None else from_service
             self._gateway.dispatch(flag, payload, origin)
@@ -158,6 +158,10 @@ class MessageRouter:
             return
         if self._proxy_client is None:
             logger.error("cross-server send to %d dropped: no proxy client", target_service_no)
+            if raise_on_drop:
+                raise NoProxyAvailableError(
+                    f"no proxy client configured for cross-server send to {target_service_no}"
+                )
             return
         try:
             self._proxy_client.send_to_service(
@@ -165,6 +169,12 @@ class MessageRouter:
             )
         except NoProxyAvailableError:
             logger.error("cross-server send to %d dropped: no proxy connected", target_service_no)
+            # F-145: a caller awaiting a result (raise_on_drop, an RPC CALL)
+            # must fail fast here -- swallowing the error used to burn the
+            # caller's full rpc timeout on a message that never left, exactly
+            # the failure mode F-14 removed for the bus legs.
+            if raise_on_drop:
+                raise
 
     def _relay_via_main(
         self,

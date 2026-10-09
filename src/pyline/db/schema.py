@@ -26,7 +26,7 @@ import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from pyline.config.models import TableDef
 from pyline.db.mysql import MySQLPool
@@ -304,6 +304,13 @@ def _split_statements(sql_text: str) -> list[str]:
             newline = sql_text.find("\n", i)
             i = n if newline == -1 else newline
             continue
+        if ch == "#":
+            # MySQL's other line-comment opener -- unlike ``--`` it needs no
+            # following whitespace, and a ``;`` inside it must not split the
+            # statement.
+            newline = sql_text.find("\n", i)
+            i = n if newline == -1 else newline
+            continue
         if ch == "/" and sql_text.startswith("/*", i):
             end = sql_text.find("*/", i + 2)
             i = n if end == -1 else end + 2
@@ -332,6 +339,40 @@ def _parse_server_version(version: str) -> tuple[int, int, int]:
     if match is None:
         return (0, 0, 0)
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+class TableProvider(Protocol):
+    """What :class:`~pyline.db.orm.DataSaver` needs from a schema source:
+    spec lookup by table name. ``SchemaManager`` satisfies this structurally;
+    so does the pool-less :class:`TableCatalog`."""
+
+    def table(self, name: str) -> TableSpec: ...
+
+
+class TableCatalog:
+    """Config-only :class:`TableSpec` registry (F-156).
+
+    A business process in a ``sub_process`` topology owns no MySQL pool, so
+    ``SchemaManager`` (whose ``ensure_all`` runs DDL) was never constructed
+    there and ``api.orm.make_saver`` raised ``ApiServiceUnavailableError`` in
+    exactly the processes where business code runs. The catalog parses the
+    same ``tables.json5`` the DB process manages DDL against, which is all a
+    saver needs to validate ``(table, column)`` and generate SQL; every
+    statement still executes through ``DatabaseAccess`` -> RPC -> the DB
+    process. Upserts from remote processes keep the legacy ``VALUES()``
+    ODKU form -- it executes on every supported server (see
+    ``SchemaManager._select_odku_syntax``); only the pool-owning process can
+    afford the version probe.
+    """
+
+    def __init__(self, tables: dict[str, TableDef]) -> None:
+        self._tables = {name: TableSpec.from_def(name, tdef) for name, tdef in tables.items()}
+
+    def table(self, name: str) -> TableSpec:
+        try:
+            return self._tables[name]
+        except KeyError:
+            raise SchemaError(f"table {name!r} not defined in tables config") from None
 
 
 class SchemaManager:
@@ -590,7 +631,9 @@ class SchemaManager:
             raise SchemaError(f"table {name!r} not defined in tables config") from None
 
     async def row_exists(self, table: str, key: Any) -> bool:
-        spec = self.table(table)
+        spec = self.table(table)  # validates: only registered names reach SQL
         pk = spec.primary_column().name
-        rows = await self._pool.query(f"SELECT 1 FROM `{table}` WHERE `{pk}` = %s LIMIT 1", (key,))
+        rows = await self._pool.query(
+            f"SELECT 1 FROM `{spec.name}` WHERE `{pk}` = %s LIMIT 1", (key,)
+        )
         return bool(rows)

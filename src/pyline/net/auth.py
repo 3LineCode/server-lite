@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import logging
 
+from pyline.config.errors import ConfigError
 from pyline.core.context import Context
 
 logger = logging.getLogger(__name__)
@@ -24,18 +25,31 @@ _inter_token_warned = False
 def inter_token(ctx: Context) -> str:
     """Server-to-server token; falls back to the client token (F-16).
 
-    The fallback keeps single-token deployments working but widens the blast
-    radius of a client-token leak to the inter-server plane -- warn so ops
-    can see it in the log instead of discovering it during an incident.
+    The fallback keeps single-token DEVELOPMENT deployments working but
+    widens the blast radius of a client-token leak to the inter-server
+    plane -- in production that fallback is the vulnerability, not the
+    convenience: every game client would hold a credential that fully
+    impersonates servers (bus + proxy + the full-SQL RPC surface), so
+    ``srv_type=production`` refuses to boot without an explicit
+    ``socket.inter_token`` (F-163). Develop mode keeps the once-per-process
+    warning (F-73).
 
-    F-73: the warning is emitted once per process. ``inter_token`` is called
-    on every reconnect (and every server-side accept), so a flapping proxy
-    link used to re-log the same configuration fact on every attempt --
-    once is informative, every second is log spam that buries real events.
+    F-73 lineage: the warning is emitted once per process. ``inter_token``
+    is called on every reconnect (and every server-side accept), so a
+    flapping proxy link used to re-log the same configuration fact on every
+    attempt -- once is informative, every second is log spam that buries
+    real events.
     """
     s = ctx.settings.socket
     global _inter_token_warned
     if s.inter_token is None:
+        if ctx.settings.srv_type == "production":
+            raise ConfigError(
+                "socket.inter_token is required when srv_type=production: "
+                "without it every game client holds a token that fully "
+                "impersonates servers on the inter-server plane "
+                "(bus, proxy, full SQL passthrough)"
+            )
         if not _inter_token_warned:
             _inter_token_warned = True
             logger.warning(

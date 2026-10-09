@@ -23,6 +23,9 @@ def config_dir(tmp_path: Path) -> Path:
         "token": "$plain:unit-test-token",
         "client_port": 11520,
         "server_port": 12520,
+        // F-161: the Windows selector-loop fd budget is enforced at bind
+        // time; the 4096 default would (correctly) fail boot there.
+        "max_connections": 32,
     },
     "mysql": {
         "user": "root",

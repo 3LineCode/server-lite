@@ -598,6 +598,21 @@ def main(argv: list[str] | None = None) -> None:
                 return
             await main_runtime.shutdown(f"sub-process {process_type} died ({exitcode})")
 
+        async def on_unhandled_death(process_type: str, exitcode: int | None) -> None:
+            # F-160: the no-callback / callback-failed fail-fast branch.
+            # Terminating the siblings alone left the main runtime running
+            # with its db/proxy process gone -- the escalation keeps the
+            # whole server one fail-fast unit.
+            target = main_runtime
+            if target is None:
+                logger.critical(
+                    "sub-process %s died unhandled (%s) before the main runtime was ready",
+                    process_type,
+                    exitcode,
+                )
+                return
+            await target.shutdown(f"sub-process {process_type} died unhandled ({exitcode})")
+
         async def main_proc() -> None:
             nonlocal main_runtime
             runtime: ServerRuntime | None = None
@@ -615,7 +630,7 @@ def main(argv: list[str] | None = None) -> None:
                 # Watch only after the runtime exists: a child that died while the
                 # main process was still setting up must find a runtime to tear
                 # down, otherwise the main process would run on without it.
-                supervisor.start_child_watch(on_child_died)
+                supervisor.start_child_watch(on_child_died, on_unhandled_death=on_unhandled_death)
                 boot_task = asyncio.get_running_loop().create_task(runtime.boot())
                 try:
                     await boot_task

@@ -83,6 +83,14 @@ BUS_AUTH2 = "@busauth2"  # DEALER -> ROUTER: HMAC(server)
 _AUTH_PENDING_TTL = 10.0
 _MAX_PENDING_AUTH = 64
 
+# F-143: DEALER-side re-authentication cadence. A periodic AUTH0 from an
+# identity the ROUTER already authenticated is an ignored no-op, but a ROUTER
+# that lost our entry (it restarted) answers it with a fresh challenge -- so
+# a missed monitor event still self-heals within one interval.
+_REAUTH_INTERVAL = 30.0
+# F-143: backoff cap between re-handshake attempts after a reconnect.
+_REAUTH_RETRY_CAP = 30.0
+
 # F-49: how long a destination must stay silent (with an empty queue) before
 # its slot is reclaimable when the table is under pressure.
 _PEER_IDLE_TTL = 300.0
@@ -197,6 +205,19 @@ class ZmqBus:
         self._auth_pending: dict[bytes, tuple[bytes, bytes, float]] = {}
         self._client_nonce: bytes | None = None
         self._authed_event = asyncio.Event()
+        # F-143: DEALER-side handshake/reconnect state. ``_auth_ok`` is our
+        # belief that the ROUTER knows us; ``_ever_authed`` gates the monitor
+        # so the INITIAL connect (handled by start()) never double-fires a
+        # handshake. A ZMQ-level reconnect delivers a fresh EVENT_CONNECTED,
+        # which re-runs the whole challenge-response -- without it a restarted
+        # main-process ROUTER silently dropped every frame from every running
+        # sub-process forever (its ``_authed`` set starts empty).
+        self._auth_ok = False
+        self._ever_authed = False
+        self._auth_lock = asyncio.Lock()
+        self._monitor_socket: zmq.asyncio.Socket | None = None
+        self._monitor_task: asyncio.Task[None] | None = None
+        self._reauth_task: asyncio.Task[None] | None = None
         # F-74: peers whose writer is between queue.get() and the completion
         # of send_multipart. Cancelling a writer inside send_multipart can
         # tear a multipart message in half on the socket, after which the
@@ -255,6 +276,14 @@ class ZmqBus:
                 self._settings.bind_host if sys.platform == "win32" else self._settings.bind_file
             )
             self._socket.connect(endpoint)
+            # F-143: watch ZMQ connect/disconnect events so a transport-level
+            # reconnect (the main-process ROUTER restarted) re-runs the
+            # handshake -- ZMQ reconnects transparently, but the fresh ROUTER
+            # has never authenticated us.
+            self._monitor_socket = self._socket.get_monitor_socket(
+                zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED
+            )
+            self._monitor_task = asyncio.get_running_loop().create_task(self._monitor_loop())
             logger.info("zmq DEALER connected to %s (identity=%d)", endpoint, self._ctx.service_no)
         self._recv_task = asyncio.get_running_loop().create_task(self._recv_loop())
         if not self.is_router:
@@ -262,16 +291,7 @@ class ZmqBus:
             # first frame the ROUTER sees from this identity -- data sent
             # after start() follows it in FIFO order and cannot be dropped
             # for arriving pre-authentication.
-            self._client_nonce = secrets.token_bytes(NONCE_LEN)
-            self._enqueue(
-                _ROUTER_PEER,
-                [
-                    service_no_bytes(_BUS_CONTROL_TARGET),
-                    service_no_bytes(self._ctx.service_no),
-                    BUS_AUTH0.encode("utf-8"),
-                    self._client_nonce,
-                ],
-            )
+            self._send_auth0()
             try:
                 await asyncio.wait_for(
                     self._authed_event.wait(), timeout=self._settings.auth_timeout
@@ -282,7 +302,24 @@ class ZmqBus:
                     f"{self._settings.auth_timeout:.0f}s (wrong inter_token, or the "
                     "main-process ROUTER never came up)"
                 ) from exc
+            self._auth_ok = True
+            self._ever_authed = True
+            # F-143: periodic re-offer -- see _reauth_keepalive.
+            self._reauth_task = asyncio.get_running_loop().create_task(self._reauth_keepalive())
             logger.info("zmq bus handshake complete (identity=%d)", self._ctx.service_no)
+
+    def _send_auth0(self) -> None:
+        """DEALER: open (or re-open) the handshake with a fresh nonce."""
+        self._client_nonce = secrets.token_bytes(NONCE_LEN)
+        self._enqueue(
+            _ROUTER_PEER,
+            [
+                service_no_bytes(_BUS_CONTROL_TARGET),
+                service_no_bytes(self._ctx.service_no),
+                BUS_AUTH0.encode("utf-8"),
+                self._client_nonce,
+            ],
+        )
 
     @property
     def is_router(self) -> bool:
@@ -399,6 +436,15 @@ class ZmqBus:
         self._peer_queue_bytes[peer] = self._peer_queue_bytes.get(peer, 0) + size
         return True
 
+    def _peer_authenticated(self, peer: int) -> bool:
+        """ROUTER: whether this destination identity completed the handshake.
+
+        Always False on a DEALER (its single ``_ROUTER_PEER`` destination is
+        exempt from eviction regardless), so the check is ROUTER-only in
+        effect.
+        """
+        return service_no_bytes(peer) in self._authed
+
     def _evict_idle_peers(self) -> bool:
         """F-49: drop queue+writer of destinations that are silent past the
         idle ttl with nothing queued. Returns True when at least one slot was
@@ -409,7 +455,13 @@ class ZmqBus:
         NOT reclaimable -- cancelling it mid-send can strand half a multipart
         message on the shared socket, after which the peer misframes every
         subsequent message. Such a slot becomes reclaimable again once the
-        send completes or errors."""
+        send completes or errors.
+
+        F-144: slots of identities that never completed the handshake are
+        evicted WITHOUT the idle-ttl wait -- they only ever carried auth
+        control frames, so junk identities from local AUTH0 spam (each reply
+        allocating a queue + writer) can no longer pin the table and starve
+        a legitimate new DEALER out of it for the whole idle ttl."""
         now = time.monotonic()
         evicted = False
         for peer in list(self._peer_queues):
@@ -419,7 +471,10 @@ class ZmqBus:
                 continue  # F-74: mid-send writer; see docstring
             if not self._peer_queues[peer].empty():
                 continue
-            if now - self._peer_last_used.get(peer, 0.0) < self._peer_idle_ttl:
+            if not self._peer_authenticated(peer):
+                # F-144: pre-auth slot -- worthless, reclaim immediately.
+                pass
+            elif now - self._peer_last_used.get(peer, 0.0) < self._peer_idle_ttl:
                 continue
             del self._peer_queues[peer]
             self._peer_last_used.pop(peer, None)
@@ -652,9 +707,97 @@ class ZmqBus:
                 hmac_digest(self._token, server_nonce),
             ],
         )
+        self._auth_ok = True  # F-143: the ROUTER-side add happens on AUTH2
+        self._ever_authed = True
         self._authed_event.set()
 
+    # ------------------------ reconnect re-auth (F-143) --------------------- #
+
+    async def _monitor_loop(self) -> None:
+        """DEALER: watch ZMQ connect events; re-authenticate on reconnect."""
+        monitor = self._monitor_socket
+        assert monitor is not None
+        while True:
+            try:
+                parts = await monitor.recv_multipart()
+            except asyncio.CancelledError:
+                raise
+            except zmq.ZMQError:
+                return  # socket/context torn down by close()
+            if not parts:
+                continue
+            # libzmq monitor frame layout differs across versions (2 or 3
+            # frames), but the event id is always the first 2 bytes of
+            # frame 0, little-endian.
+            event = int.from_bytes(parts[0][:2], "little")
+            if event == zmq.EVENT_DISCONNECTED:
+                self._auth_ok = False
+                continue
+            if event == zmq.EVENT_CONNECTED and self._ever_authed:
+                # Not the initial connect (start() owns that one -- it had
+                # not completed a handshake yet). This is a REconnect: the
+                # endpoint behind the address is a fresh ROUTER whose
+                # ``_authed`` set does not contain us.
+                await self._rehandshake()
+
+    async def _rehandshake(self) -> None:
+        """Re-run the full challenge-response after a reconnect, retrying
+        with capped backoff until it completes (or close() cancels us)."""
+        async with self._auth_lock:
+            self._auth_ok = False
+            self._authed_event.clear()
+            attempt = 0
+            while True:
+                attempt += 1
+                self._send_auth0()
+                try:
+                    await asyncio.wait_for(
+                        self._authed_event.wait(), timeout=self._settings.auth_timeout
+                    )
+                except TimeoutError:
+                    delay = min(_REAUTH_RETRY_CAP, 2.0 ** min(attempt, 5))
+                    logger.error(
+                        "zmq bus re-handshake after reconnect: no reply on attempt %d; "
+                        "retrying in %.0fs (is the main-process ROUTER up, token correct?)",
+                        attempt,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                self._auth_ok = True
+                logger.info(
+                    "zmq bus re-authenticated after reconnect (identity=%d)",
+                    self._ctx.service_no,
+                )
+                return
+
+    async def _reauth_keepalive(self) -> None:
+        """F-143 belt-and-suspenders: periodically re-offer the handshake.
+
+        A ROUTER that knows this identity ignores AUTH0 (idempotent no-op),
+        so the steady-state cost is one tiny frame per interval. A ROUTER
+        that lost our entry -- restarted without the disconnect event ever
+        reaching this DEALER -- answers it with a fresh challenge and the
+        mesh heals within one interval instead of black-holing forever.
+        """
+        while True:
+            await asyncio.sleep(_REAUTH_INTERVAL)
+            if self._auth_ok:
+                self._send_auth0()
+
     async def close(self) -> None:
+        # F-143: stop the reconnect machinery first -- a monitor-triggered
+        # re-handshake racing the socket teardown would log spurious errors.
+        for task in (self._reauth_task, self._monitor_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self._reauth_task = None
+        self._monitor_task = None
+        if self._monitor_socket is not None:
+            self._monitor_socket.close(0)
+            self._monitor_socket = None
         if self._recv_task is not None:
             self._recv_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

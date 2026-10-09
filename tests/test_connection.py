@@ -14,6 +14,9 @@ KW = {
     "idle_timeout": 30.0,
     "send_queue_limit": 64,
 }
+# Server-side twin of KW: serve() additionally needs an accept cap that
+# fits the Windows fd budget (F-161).
+SERVER_KW = {**KW, "max_connections": 16}
 
 
 async def start_echo_server(got: dict) -> tuple[asyncio.AbstractServer, int]:
@@ -25,7 +28,7 @@ async def start_echo_server(got: dict) -> tuple[asyncio.AbstractServer, int]:
         connection.send_message("welcome", b"hi")
 
     server = await conn_mod.serve(
-        "127.0.0.1", 0, token=TOKEN, on_message=on_message, on_connected=on_connected, **KW
+        "127.0.0.1", 0, token=TOKEN, on_message=on_message, on_connected=on_connected, **SERVER_KW
     )
     return server, server.sockets[0].getsockname()[1]
 
@@ -114,9 +117,14 @@ class TestSendQueueBytesF21:
                 done = False
                 for frame in frames:
                     if frame.flag == "@auth":
+                        # F-147: digest || client nonce
+                        assert len(frame.payload) == 32 + 16
                         expected = hmac_mod.new(TOKEN.encode(), nonce, hashlib.sha256).digest()
-                        assert hmac_mod.compare_digest(frame.payload, expected)
-                        writer.write(b"".join(encode_message("@welcome", b"")))
+                        assert hmac_mod.compare_digest(frame.payload[:32], expected)
+                        proof = hmac_mod.new(
+                            TOKEN.encode(), frame.payload[32:], hashlib.sha256
+                        ).digest()
+                        writer.write(b"".join(encode_message("@welcome", proof)))
                         await writer.drain()
                         done = True
                         break
@@ -372,7 +380,7 @@ class TestDispatchIsolationF13:
             token=TOKEN,
             on_message=on_message,
             on_connected=lambda c: None,
-            **KW,
+            **SERVER_KW,
         )
         port = server.sockets[0].getsockname()[1]
         client = await conn_mod.open_connection(
@@ -398,7 +406,7 @@ class TestDispatchIsolationF13:
             token=TOKEN,
             on_message=lambda f, p: got.setdefault(f, []).append(p),
             on_connected=lambda c: None,
-            **KW,
+            **SERVER_KW,
         )
         port = server.sockets[0].getsockname()[1]
         client = await conn_mod.open_connection(
@@ -426,7 +434,7 @@ class TestLifecycleF17:
             token=TOKEN,
             on_message=lambda f, p: got.setdefault(f, []).append(p),
             on_connected=lambda c: None,
-            **KW,
+            **SERVER_KW,
         )
         port = server.sockets[0].getsockname()[1]
         client = await conn_mod.open_connection(
@@ -479,11 +487,17 @@ class TestLifecycleF17:
                     return
                 for frame in decoder.feed(data):
                     if frame.flag == "@challenge":
-                        # challenge-response: answer HMAC(token, nonce)
+                        # challenge-response: HMAC(token, nonce) plus our own
+                        # nonce so the server's @welcome can prove itself
+                        # (F-147); a raw client may ignore the proof.
+                        import secrets as secrets_mod
+
                         digest = hmac_mod.new(
                             TOKEN.encode(), frame.payload, hashlib.sha256
                         ).digest()
-                        writer.write(b"".join(encode_message("@auth", digest)))
+                        writer.write(
+                            b"".join(encode_message("@auth", digest + secrets_mod.token_bytes(16)))
+                        )
                         await writer.drain()
                     elif frame.flag == "@ping":
                         got_pings += 1
@@ -498,6 +512,7 @@ class TestLifecycleF17:
             handshake_timeout=1.0,
             idle_timeout=3.0,  # probes at max(3/3,1)=1s once the link goes quiet
             send_queue_limit=64,
+            max_connections=16,
         )
         port = server.sockets[0].getsockname()[1]
         raw = await asyncio.open_connection("127.0.0.1", port)
@@ -538,7 +553,12 @@ class TestChallengeResponseF123:
                 for frame in decoder.feed(data):
                     captured.setdefault(frame.flag, []).append(frame.payload)
                     if frame.flag == "@auth":
-                        writer.write(b"".join(encode_message("@welcome", b"")))
+                        # F-147: answer with the server proof over the
+                        # client's nonce so the handshake completes.
+                        proof = hmac_mod.new(
+                            TOKEN.encode(), frame.payload[32:], hashlib.sha256
+                        ).digest()
+                        writer.write(b"".join(encode_message("@welcome", proof)))
                         await writer.drain()
                         return
 
@@ -551,11 +571,94 @@ class TestChallengeResponseF123:
             assert client.verified
             digests = captured.get("@auth", [])
             assert len(digests) == 1
+            # F-147: the auth payload is digest(32) || client nonce(16)
+            assert len(digests[0]) == 48
             assert digests[0] != TOKEN.encode(), "plaintext token crossed the wire"
             assert digests[0] != TOKEN.encode() * 4
             expected = hmac_mod.new(TOKEN.encode(), nonce_holder["nonce"], hashlib.sha256).digest()
-            assert hmac_mod.compare_digest(digests[0], expected)
+            assert hmac_mod.compare_digest(digests[0][:32], expected)
             await client.close("done")
+        finally:
+            server.close()
+
+    async def test_client_rejects_server_without_valid_proof(self) -> None:
+        """F-147: a server that cannot prove it holds the token (an impostor
+        endpoint or a wrong-token proxy) is rejected by the CLIENT -- the
+        handshake is mutual, so the old accept-any-@welcome behavior is gone."""
+        import hashlib
+        import hmac as hmac_mod
+
+        async def impostor(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            import secrets as secrets_mod
+
+            from pyline.net.protocol import FrameDecoder, encode_message
+
+            nonce = secrets_mod.token_bytes(16)
+            writer.write(b"".join(encode_message("@challenge", nonce)))
+            await writer.drain()
+            decoder = FrameDecoder()
+            while True:
+                data = await reader.read(4096)
+                if not data:
+                    return
+                for frame in decoder.feed(data):
+                    if frame.flag == "@auth":
+                        # proof computed under the WRONG key (impostor)
+                        proof = hmac_mod.new(
+                            b"attacker-key", frame.payload[32:], hashlib.sha256
+                        ).digest()
+                        writer.write(b"".join(encode_message("@welcome", proof)))
+                        await writer.drain()
+                        # stay open so the client's rejection close wins the
+                        # reason race against a plain EOF
+                        while await reader.read(4096):
+                            pass
+                        return
+
+        server = await asyncio.start_server(impostor, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            with pytest.raises(conn_mod.ConnectionClosedError, match="handshake rejected"):
+                await conn_mod.open_connection(
+                    "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
+                )
+        finally:
+            server.close()
+
+    async def test_client_rejects_legacy_empty_welcome(self) -> None:
+        """F-147: the empty-payload @welcome of the old one-directional
+        handshake no longer verifies the client."""
+
+        async def legacy_server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            import secrets as secrets_mod
+
+            from pyline.net.protocol import FrameDecoder, encode_message
+
+            nonce = secrets_mod.token_bytes(16)
+            writer.write(b"".join(encode_message("@challenge", nonce)))
+            await writer.drain()
+            decoder = FrameDecoder()
+            while True:
+                data = await reader.read(4096)
+                if not data:
+                    return
+                for frame in decoder.feed(data):
+                    if frame.flag == "@auth":
+                        writer.write(b"".join(encode_message("@welcome", b"")))
+                        await writer.drain()
+                        # stay open so the client's rejection close wins the
+                        # reason race against a plain EOF
+                        while await reader.read(4096):
+                            pass
+                        return
+
+        server = await asyncio.start_server(legacy_server, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            with pytest.raises(conn_mod.ConnectionClosedError, match="handshake rejected"):
+                await conn_mod.open_connection(
+                    "127.0.0.1", port, token=TOKEN, on_message=lambda f, p: None, **KW
+                )
         finally:
             server.close()
 

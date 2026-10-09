@@ -40,7 +40,7 @@ from pyline.db.autosave import SaveScheduler
 from pyline.db.mysql import MySQLPool
 from pyline.db.orm import DataSaver
 from pyline.db.redis import RedisClient
-from pyline.db.schema import SchemaManager
+from pyline.db.schema import SchemaManager, TableCatalog, TableProvider
 from pyline.db.service import (
     DatabaseAccess,
     DatabaseService,
@@ -111,10 +111,21 @@ class ClockEventEmitter:
         )
 
     def _on_boundary(self) -> None:
-        self.emit_missed_boundaries()
+        # F-164: the boundary chain is one coroutine the scheduler awaits.
+        # Per-event fire-and-forget spawns started in creation order but
+        # interleaved at the first await -- an async NewHour handler could
+        # run AFTER the NewDay/NewWeek handlers behind it, while the serial
+        # bus contract promises NewHour -> NewDay -> NewMonth -> NewYear ->
+        # NewWeek. Awaiting the chain also serializes catch-up boundaries
+        # against each other (a skipped-boundary drain used to spawn one
+        # interleaving task per boundary).
+        self._spawn(self._on_boundary_async())
+
+    async def _on_boundary_async(self) -> None:
+        await self.emit_missed_boundaries()
         self._schedule_next()
 
-    def emit_missed_boundaries(self) -> None:
+    async def emit_missed_boundaries(self) -> None:
         """Fire every :00/:30 boundary since the last one emitted.
 
         More than 96 missed boundaries (two days of downtime) cannot be
@@ -128,7 +139,7 @@ class ClockEventEmitter:
             boundary = self._clock.next_halfhour_after(cursor)
             if boundary > now_ts:
                 break
-            self._fire_boundary_events(boundary)
+            await self._fire_boundary_events(boundary)
             cursor = boundary
         # Arithmetic, not one iteration per boundary: a multi-year clock jump
         # (debug push_time) used to iterate ~48 times per jumped day, each
@@ -156,7 +167,7 @@ class ClockEventEmitter:
         # above still sees the true cursor and is unaffected.
         self._last_boundary = max(self._last_boundary, now_ts)
 
-    def _fire_boundary_events(self, ts: float) -> None:
+    async def _fire_boundary_events(self, ts: float) -> None:
         local = self._clock.local(ts)
         events: list[object] = []
         if local.minute == 0:
@@ -173,7 +184,13 @@ class ClockEventEmitter:
             events.append(HalfHourEvent(hour=local.hour))
         for event in events:
             self._channel.info("event: %s", type(event).__name__)
-            self._spawn(self._bus.emit(event))
+            # F-164: awaited in order, NOT one spawn per event -- spawned
+            # tasks start in creation order but interleave at the first
+            # await, so an async NewHour handler could run after the
+            # NewDay/NewWeek handlers behind it while the serial bus
+            # contract promises NewHour -> NewDay -> NewMonth -> NewYear
+            # -> NewWeek (midnight-reset logic depends on it).
+            await self._bus.emit(event)
 
 
 class DbLayer:
@@ -181,7 +198,12 @@ class DbLayer:
 
     A process owns the pools when it is the DB process (or the server has no
     sub-process split); everyone else gets an RPC-backed
-    :class:`DatabaseAccess` to the DB process.
+    :class:`DatabaseAccess` to the DB process. Savers work in BOTH topologies
+    (F-156): the owning process validates them against its ``SchemaManager``,
+    remote business processes against a pool-less :class:`TableCatalog` built
+    from the same tables config -- the DB process skips business init, so
+    before F-156 the saver factory existed only in the one process that runs
+    no business code.
     """
 
     def __init__(self, ctx: Context, alarms: AlarmHub) -> None:
@@ -190,6 +212,9 @@ class DbLayer:
         self.mysql: MySQLPool | None = None
         self.redis: RedisClient | None = None
         self.db_service: DatabaseService | None = None
+        # F-156: spec source for saver construction -- the full SchemaManager
+        # where this process owns the pools, a TableCatalog otherwise.
+        self._specs: TableProvider | None = None
 
     async def connect(self, rpc: RpcManager) -> DatabaseAccess:
         entry = self._ctx.entry
@@ -197,6 +222,12 @@ class DbLayer:
             return self._remote_access(rpc)
         owns_db = self._ctx.is_db_process or not entry.sub_process
         if not owns_db:
+            # F-156: a business process with no local pool still gets savers:
+            # the catalog validates (table, column) against the same tables
+            # config the DB process runs DDL from, and every statement rides
+            # DatabaseAccess -> RPC -> the DB process.
+            if entry.use_mysql:
+                self._specs = TableCatalog(self._ctx.tables)
             return self._remote_access(rpc)
         await self._connect_local(rpc)
         assert self.db_service is not None
@@ -240,6 +271,7 @@ class DbLayer:
             )
             await schema.ensure_all()
             self._ctx.services["schema"] = schema
+            self._specs = schema
         if self._ctx.entry.use_redis:
             self.redis = RedisClient(s.redis)
             await self.redis.connect()
@@ -256,9 +288,10 @@ class DbLayer:
         self, access: DatabaseAccess, scheduler: SaveScheduler
     ) -> Callable[..., DataSaver] | None:
         """Configured DataSaver factory for business code, or None when this
-        process has no local schema to validate savers against."""
-        schema = self._ctx.services.get("schema")
-        if not isinstance(schema, SchemaManager):
+        process has no MySQL spec source at all (mysql disabled on a server
+        with no db topology)."""
+        specs = self._specs
+        if specs is None:
             return None
 
         def make_saver(
@@ -270,7 +303,7 @@ class DbLayer:
         ) -> DataSaver:
             return DataSaver(
                 access,
-                schema,
+                specs,
                 table,
                 column,
                 key,

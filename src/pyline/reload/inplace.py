@@ -158,7 +158,13 @@ class _FnSpec:
     # caller now TypeErrors. Kind may only loosen (posonly -> pos-or-kw),
     # never tighten.
     posonly: frozenset[str] = frozenset()
-    pos_default_count: int = 0
+    # WHICH positional parameters have defaults, by name (F-155). A mere
+    # count cannot see the breakage class ``def f(a, b=1)`` ->
+    # ``def f(a, b, c=1)``: the count matches (1 == 1) and the shared
+    # prefix [a, b] matches, yet every old ``f(1)`` caller now TypeErrors
+    # because ``b`` -- defaulted before -- lost its default. Positions are
+    # what callers depend on.
+    pos_defaults: frozenset[str] = frozenset()
     kwonly: list[str] = field(default_factory=list)
     kwonly_defaults: set[str] = field(default_factory=set)
     star_args: bool = False
@@ -173,6 +179,12 @@ class _ClassInfo:
     # to the legacy bare-name comparison for that base only).
     base_keys: list[str | None] = field(default_factory=list)
     functions: dict[str, _FnSpec] = field(default_factory=dict)
+    # F-149: methods declared ``async def`` in the new source. Swapping a
+    # sync function's code for a coroutine's (or vice versa) passes every
+    # signature check yet TypeErrors every existing ``await f()`` (or bare
+    # ``f()``) caller -- the exact caller-breakage class this validator
+    # exists to prevent.
+    async_functions: set[str] = field(default_factory=set)
     has_slots: bool = False
     slot_names: frozenset[str] = frozenset()
     slots_unresolved: bool = False
@@ -281,8 +293,10 @@ def _slots_names(value: ast.expr) -> tuple[frozenset[str], bool]:
 
 def _spec_from_arguments(args: ast.arguments) -> _FnSpec:
     positional = [a.arg for a in args.posonlyargs] + [a.arg for a in args.args]
-    # ast defaults apply to the trailing N positional parameters
-    pos_default_count = len(args.defaults)
+    # ast defaults apply to the trailing N positional parameters -- so the
+    # defaulted names are the last N of ``positional`` (F-155: by name, not
+    # by count).
+    defaulted = positional[len(positional) - len(args.defaults) :] if args.defaults else []
     kwonly = [a.arg for a in args.kwonlyargs]
     kwonly_defaults = {
         a.arg for a, d in zip(args.kwonlyargs, args.kw_defaults, strict=False) if d is not None
@@ -290,7 +304,7 @@ def _spec_from_arguments(args: ast.arguments) -> _FnSpec:
     return _FnSpec(
         positional=positional,
         posonly=frozenset(a.arg for a in args.posonlyargs),
-        pos_default_count=pos_default_count,
+        pos_defaults=frozenset(defaulted),
         kwonly=kwonly,
         kwonly_defaults=kwonly_defaults,
         star_args=args.vararg is not None,
@@ -307,7 +321,7 @@ def _spec_from_function(fn: types.FunctionType) -> _FnSpec:
             if kind is inspect.Parameter.POSITIONAL_ONLY:
                 spec.posonly = spec.posonly | {param.name}
             if param.default is not inspect.Parameter.empty:
-                spec.pos_default_count += 1
+                spec.pos_defaults = spec.pos_defaults | {param.name}
         elif kind is inspect.Parameter.KEYWORD_ONLY:
             spec.kwonly.append(param.name)
             if param.default is not inspect.Parameter.empty:
@@ -336,6 +350,8 @@ def _class_info(
     for stmt in node.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             info.functions[stmt.name] = _fn_node_spec(stmt)
+            if isinstance(stmt, ast.AsyncFunctionDef):
+                info.async_functions.add(stmt.name)  # F-149
             if stmt.name in _IDENTITY_DUNDERS:
                 info.identity_dunders = info.identity_dunders | {stmt.name}
         elif isinstance(stmt, ast.Assign):
@@ -350,18 +366,27 @@ def _class_info(
     return info
 
 
+def _is_coroutine_func(fn: types.FunctionType) -> bool:
+    """Whether ``fn`` was declared ``async def`` (F-149)."""
+    return bool(fn.__code__.co_flags & inspect.CO_COROUTINE)
+
+
 def _ast_summary(
     tree: ast.Module, imports: dict[str, str], module: types.ModuleType
 ) -> dict[str, tuple[str, object]]:
-    """name -> ("function", _FnSpec) | ("class", _ClassInfo) | ("value", None).
+    """name -> ("function"|"asyncfunction", _FnSpec) | ("class", _ClassInfo)
+    | ("value", None).
 
     Assignments are reported as plain values: their runtime kind is unknown
     statically (e.g. ``scaled = factory()`` yields a closure function).
+    F-149: coroutine functions get their own kind so a sync<->async swap is
+    rejectable -- the signature compatibility alone cannot see it.
     """
     summary: dict[str, tuple[str, object]] = {}
     for stmt in tree.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            summary[stmt.name] = ("function", _fn_node_spec(stmt))
+            kind = "asyncfunction" if isinstance(stmt, ast.AsyncFunctionDef) else "function"
+            summary[stmt.name] = (kind, _fn_node_spec(stmt))
         elif isinstance(stmt, ast.ClassDef):
             summary[stmt.name] = ("class", _class_info(stmt, imports, module))
         elif isinstance(stmt, ast.Assign):
@@ -389,9 +414,18 @@ def _validate_structure(old: types.ModuleType, tree: ast.Module) -> None:
             continue  # deleted in the new source: allowed
         kind, info = entry
         if isinstance(old_obj, types.FunctionType):
-            if kind == "function" and isinstance(info, _FnSpec):
+            # F-149: an async<->sync swap passes every signature check but
+            # breaks every caller's await (or bare call) -- reject it with
+            # the other kind changes.
+            if kind == "asyncfunction" and not _is_coroutine_func(old_obj):
+                problems.append(f"{name}: kind changed function -> coroutine function")
+                continue
+            if kind == "function" and _is_coroutine_func(old_obj):
+                problems.append(f"{name}: kind changed coroutine function -> function")
+                continue
+            if kind in ("function", "asyncfunction") and isinstance(info, _FnSpec):
                 _check_signature_compatible(name, _spec_from_function(old_obj), info, problems)
-            # function -> assignment/class handled below (class is a problem)
+            # function -> class handled below (class is a problem)
             if kind == "class":
                 problems.append(f"{name}: kind changed function -> class")
         elif isinstance(old_obj, type):
@@ -499,6 +533,13 @@ def _check_class(name: str, old: type, info: _ClassInfo, problems: list[str]) ->
         new_spec = info.functions.get(attr_name)
         if new_spec is None:
             continue  # method deleted: allowed (same as before)
+        # F-149: method-level twin of the module-level async<->sync check.
+        if _is_coroutine_func(old_fn) != (attr_name in info.async_functions):
+            problems.append(
+                f"{name}.{attr_name}: kind changed "
+                f"{'coroutine function -> function' if _is_coroutine_func(old_fn) else 'function -> coroutine function'}"
+            )
+            continue
         _check_signature_compatible(
             f"{name}.{attr_name}", _spec_from_function(old_fn), new_spec, problems
         )
@@ -506,7 +547,10 @@ def _check_class(name: str, old: type, info: _ClassInfo, problems: list[str]) ->
 
 def _check_signature_compatible(name: str, old: _FnSpec, new: _FnSpec, problems: list[str]) -> None:
     """Old callers must keep working: same positional prefix; extra positionals
-    only with defaults; no removed keyword-only; no keyword-only that gains
+    only with defaults; no shared positional parameter may LOSE its default
+    (F-155: the old count-only comparison missed ``def f(a, b=1)`` ->
+    ``def f(a, b, c=1)`` -- counts match, prefix matches, yet every ``f(1)``
+    caller breaks); no removed keyword-only; no keyword-only that gains
     "required" status (added without default, or its default removed); same
     *args/**kwargs shape; and no parameter kind tightening -- a
     positional-or-keyword parameter becoming positional-only keeps the merged
@@ -528,14 +572,18 @@ def _check_signature_compatible(name: str, old: _FnSpec, new: _FnSpec, problems:
             f"{name}: positional-or-keyword parameters {tightened} became "
             "positional-only (keyword callers would break)"
         )
-    extras = new.positional[n:]
-    if extras and new.pos_default_count < len(extras):
+    extras_missing = [p for p in new.positional[n:] if p not in new.pos_defaults]
+    if extras_missing:
         problems.append(
-            f"{name}: new parameters {extras} must have defaults "
+            f"{name}: new parameters {extras_missing} must have defaults "
             "(existing callers pass fewer arguments)"
         )
-    if new.pos_default_count < old.pos_default_count:
-        problems.append(f"{name}: a positional default was removed")
+    lost_defaults = sorted(old.pos_defaults - new.pos_defaults)
+    if lost_defaults:
+        problems.append(
+            f"{name}: parameters {lost_defaults} lost their defaults "
+            "(existing callers pass fewer arguments)"
+        )
     old_kw = set(old.kwonly)
     new_kw = set(new.kwonly)
     if old_kw - new_kw:
@@ -590,7 +638,12 @@ def _update_module(module: types.ModuleType, cache: ModCache) -> int:
             _update_generic(old_obj, new_obj)
             setattr(module, name, old_obj)
         elif isinstance(old_obj, (types.FunctionType, type)):
-            continue  # definition became plain state: validation rejects this earlier
+            # Definition became plain state. class -> value was rejected by
+            # validation above; function -> value is deliberately allowed
+            # (the ``x = factory()`` closure pattern reports as a value), so
+            # the NEW value wins the module attribute while pre-existing
+            # ``from module import x`` holders keep the old function object.
+            continue
         else:
             # Plain module-level values are runtime state: a reload never
             # clobbers live state. (The prototype needed a manual
@@ -641,6 +694,15 @@ def _update_function(old_func: types.FunctionType, new_func: types.FunctionType)
             f"closure layout of {old_func.__qualname__} changed "
             f"{old_func.__code__.co_freevars} -> {new_func.__code__.co_freevars}"
         )
+    if _is_coroutine_func(old_func) != _is_coroutine_func(new_func):
+        # F-149 runtime net (AST validation catches the direct case): a
+        # code object swap between coroutine and plain functions keeps every
+        # signature identical while flipping how every caller must invoke it.
+        raise ReloadRejected(
+            f"{old_func.__qualname__}: async/sync kind changed "
+            f"({'coroutine -> plain' if _is_coroutine_func(old_func) else 'plain -> coroutine'}); "
+            "restart required"
+        )
     for attr in _FUNC_ATTRS:
         with contextlib.suppress(AttributeError, TypeError):
             setattr(old_func, attr, getattr(new_func, attr))
@@ -667,7 +729,11 @@ def _update_class(old_cls: type, new_cls: type) -> None:
             f"{type(old_cls).__module__}.{type(old_cls).__qualname__} -> "
             f"{type(new_cls).__module__}.{type(new_cls).__qualname__} (restart required)"
         )
-    raw_keep = getattr(old_cls, "__reloadkeep__", ())
+    # F-155: only the class's OWN marker applies. getattr() walked the MRO,
+    # so a base's ``__reloadkeep__`` silently pinned attribute names in
+    # every subclass diff too -- surprising inheritance semantics for what
+    # is documented as a per-class contract.
+    raw_keep = old_cls.__dict__.get("__reloadkeep__", ())
     # tuple/list form lists kept attribute names; a bare True (value-level
     # marker) is also legal on classes that happen to be reload targets.
     reload_keep: set[str] = (

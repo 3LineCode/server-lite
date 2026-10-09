@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import itertools
 import logging
 import math
@@ -88,9 +89,10 @@ class Scheduler:
         self._closed = False
         # F-23: short-path loop timers are tracked so close() can cancel them
         # (they used to keep firing -- and erroring -- after shutdown), and
-        # coroutine callbacks keep a strong ref + done-callback.
+        # coroutine callbacks keep a strong ref + done-callback. Futures (a
+        # callback may hand back a Task/Future, F-162) not just Tasks.
         self._short_timers: set[asyncio.TimerHandle] = set()
-        self._async_tasks: set[asyncio.Task[object]] = set()
+        self._async_tasks: set[asyncio.Future[object]] = set()
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         if self._loop is not None and self._loop is not loop:
@@ -146,7 +148,10 @@ class Scheduler:
                 func(*args)
             except Exception:
                 logger.exception("repeating timer %r failed", label or func)
-            if stopped:
+            if stopped or self._closed:
+                # F-153: re-arming through call_after on a closed scheduler
+                # raised RuntimeError, which _fire logged as a full traceback
+                # per still-armed repeating timer on every shutdown.
                 return
             next_deadline += interval
             now = time.monotonic()
@@ -235,16 +240,20 @@ class Scheduler:
     def _fire(self, func: Callable[..., object], args: tuple[object, ...], label: str) -> None:
         try:
             result = func(*args)
-            if asyncio.iscoroutine(result):
+            # isawaitable + ensure_future, not iscoroutine + create_task
+            # (F-162): a callback returning a Task/Future/custom __await__
+            # object used to have its result -- and exception -- silently
+            # dropped; create_task would also reject a non-coroutine.
+            if inspect.isawaitable(result):
+                task = asyncio.ensure_future(result)
                 # F-23: hold the reference and observe the outcome (a bare
                 # create_task died with "exception was never retrieved").
-                task = self.loop.create_task(result)
                 self._async_tasks.add(task)
                 task.add_done_callback(self._async_task_done)
         except Exception:
             logger.exception("timer %r failed", label or func)
 
-    def _async_task_done(self, task: asyncio.Task[object]) -> None:
+    def _async_task_done(self, task: asyncio.Future[object]) -> None:
         self._async_tasks.discard(task)
         if not task.cancelled() and task.exception() is not None:
             logger.error("timer coroutine failed: %r", task)

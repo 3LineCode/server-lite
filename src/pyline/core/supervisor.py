@@ -78,11 +78,24 @@ class ProcessSupervisor:
             logger.info("spawned sub-process %s (index=%d, pid=%d)", process_type, index, child.pid)
 
     def start_child_watch(
-        self, on_child_died: Callable[[str, int | None], Awaitable[None]] | None = None
+        self,
+        on_child_died: Callable[[str, int | None], Awaitable[None]] | None = None,
+        *,
+        on_unhandled_death: Callable[[str, int | None], Awaitable[None]] | None = None,
     ) -> None:
-        """Watch children; on death, notify ``on_child_died`` (type, exitcode)."""
+        """Watch children; on death, notify ``on_child_died`` (type, exitcode).
+
+        ``on_unhandled_death`` (F-160) is the escalation hook for the paths
+        the callback cannot cover: no callback registered at all, or the
+        callback itself failed. Terminating the siblings used to be the end
+        of the fail-fast path -- the ChildDiedError only reached the watch
+        task's done-callback log, and the main runtime kept running with its
+        db/proxy process gone. The hook (in production: runtime shutdown) is
+        invoked BEFORE the raise so the host still gets the failure even
+        when the raise dies in this fire-and-forget task.
+        """
         self._watch_task = asyncio.get_running_loop().create_task(
-            self._watch_children(on_child_died)
+            self._watch_children(on_child_died, on_unhandled_death)
         )
         # F-82: the watch task is fire-and-forget. Without this done-callback
         # any exception it raises died unretrieved (only the GC-time
@@ -92,17 +105,26 @@ class ProcessSupervisor:
         self._watch_task.add_done_callback(_log_watch_death)
 
     async def _watch_children(
-        self, on_child_died: Callable[[str, int | None], Awaitable[None]] | None
+        self,
+        on_child_died: Callable[[str, int | None], Awaitable[None]] | None,
+        on_unhandled_death: Callable[[str, int | None], Awaitable[None]] | None = None,
     ) -> None:
         while self._children:
             for process_type, child in list(self._children.items()):
                 if not child.is_alive():
                     code = child.exitcode
-                    logger.fatal("sub-process %s died (exitcode=%s)", process_type, code)
+                    clean = code == 0
+                    # F-153: exit 0 during a planned shutdown is the normal
+                    # path -- the old logger.fatal (a deprecated alias) made
+                    # every clean teardown read like a crash in the logs.
+                    if clean:
+                        logger.info("sub-process %s exited cleanly", process_type)
+                    else:
+                        logger.critical("sub-process %s died (exitcode=%s)", process_type, code)
                     # Observable exit: 0 = clean (shutdown path), anything
                     # else = crash; the gauge keeps the live count honest.
                     self._metrics.child_exits.labels(
-                        process_type=process_type, reason="clean" if code == 0 else "crash"
+                        process_type=process_type, reason="clean" if clean else "crash"
                     ).inc()
                     self._children.pop(process_type, None)
                     self._metrics.children_alive.set(len(self._children))
@@ -116,7 +138,7 @@ class ProcessSupervisor:
                             # when it fails we cannot trust it to have torn
                             # anything down, so we fall through to the same
                             # fail-fast path as the no-callback branch
-                            # (terminate siblings, raise) instead of
+                            # (escalate, terminate siblings, raise) instead of
                             # continuing without supervision.
                             logger.critical(
                                 "on_child_died callback failed after sub-process %s "
@@ -125,27 +147,54 @@ class ProcessSupervisor:
                                 code,
                                 exc_info=True,
                             )
-                            await self._fail_fast(process_type, code)
+                            await self._fail_fast(process_type, code, escalate=on_unhandled_death)
+                            return
+                        if clean:
+                            # F-153: a clean exit inside a planned shutdown
+                            # (the callback requested/observed the teardown)
+                            # keeps watching -- the siblings exit cleanly too
+                            # and each deserves its own log/metric line
+                            # instead of one line and silence.
+                            continue
+                        # The callback owns shutdown for this death.
                         return
-                    await self._fail_fast(process_type, code)
+                    await self._fail_fast(process_type, code, escalate=on_unhandled_death)
                     return
             await asyncio.sleep(1.0)
 
-    async def _fail_fast(self, process_type: str, code: int | None) -> None:
-        """No-callback death handling (F-82): stop the siblings, then raise.
+    async def _fail_fast(
+        self,
+        process_type: str,
+        code: int | None,
+        *,
+        escalate: Callable[[str, int | None], Awaitable[None]] | None = None,
+    ) -> None:
+        """No-callback / callback-failed death handling (F-82, F-160): stop
+        the siblings, escalate to the host, then raise.
 
         There is no runtime object to hand the failure to in this branch, so
-        the supervisor does the one thing it can still guarantee: no child
-        outlives a dead sibling (the whole server is one fail-fast unit).
-        The ChildDiedError propagates to the caller that awaited
-        ``_watch_children`` directly (tests, alternative hosts); via
-        ``start_child_watch`` it is retrieved and logged by
-        ``_log_watch_death`` instead of dying silently in a fire-and-forget
-        task.
+        the supervisor guarantees what it can: no child outlives a dead
+        sibling (the whole server is one fail-fast unit), and -- F-160 -- the
+        escalation hook runs BEFORE the raise, because via ``start_child_watch``
+        the ChildDiedError is only retrieved and logged by
+        ``_log_watch_death``; without the hook the main runtime used to keep
+        running with a dead db/proxy process. It propagates to callers that
+        awaited ``_watch_children`` directly (tests, alternative hosts).
         """
         for other in self._children.values():
             if other.is_alive():
                 other.terminate()
+        if escalate is not None:
+            try:
+                await escalate(process_type, code)
+            except Exception:
+                logger.critical(
+                    "escalation hook failed after sub-process %s died "
+                    "(exitcode=%s); the main process may still be running",
+                    process_type,
+                    code,
+                    exc_info=True,
+                )
         raise ChildDiedError(process_type, code)
 
     async def terminate_children(self, *, grace: float = 10.0) -> None:
@@ -219,7 +268,11 @@ def _pid_alive(pid: int) -> bool:
             kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
+    except PermissionError:
+        # F-160: the process EXISTS but is owned by another user; treating
+        # this as "dead" made a child suicide on a false negative.
+        return True
+    except (ProcessLookupError, OSError):
         return False
     return True
 

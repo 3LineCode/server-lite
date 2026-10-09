@@ -110,10 +110,22 @@ class _TxRecord:
         self.last_active = time.monotonic()
 
     async def dispose(self, *, rollback: bool) -> None:
-        if rollback:
-            with contextlib.suppress(Exception):
-                await self.session.rollback()
-        await self.session.close()
+        """Roll back (optionally) and close the session.
+
+        F-142: takes the lock itself. The reaper and close() call this while
+        statements may still be in flight on the session (the TTL bounds idle
+        time, and two queued 30s-read-timeout statements can outlive it from
+        the first touch()); disposing without the lock used to race an
+        in-flight statement on the same asyncmy connection -- exactly the
+        protocol-stream corruption the lock exists to prevent. Commit paths
+        that already hold the lock must not call this (deadlock: the lock is
+        not reentrant).
+        """
+        async with self.lock:
+            if rollback:
+                with contextlib.suppress(Exception):
+                    await self.session.rollback()
+            await self.session.close()
 
 
 class DatabaseService:
@@ -248,16 +260,20 @@ class DatabaseService:
         # record is already popped, so the caller's rollback remedy would
         # only see TransactionGoneError and the session would stay open.
         try:
-            async with record.lock:  # let any in-flight statement finish first
-                await record.session.commit()
+            # F-142: the lock spans commit AND close -- the record is popped,
+            # but a statement that already looked the record up can still be
+            # queued on the lock; closing outside it raced that statement.
+            async with record.lock:
+                try:
+                    await record.session.commit()
+                finally:
+                    await record.session.close()
         except BaseException:
             # F-61: a failed COMMIT leaves the server-side outcome genuinely
             # unknown (the connection may have died mid-commit), never
             # "committed".
             self._record_outcome(tx_id, "unknown")
             raise
-        finally:
-            await record.session.close()
         self._record_outcome(tx_id, "committed")
 
     async def rpc_tx_rollback(self, tx_id: str) -> None:
@@ -267,8 +283,9 @@ class DatabaseService:
         # F-61: recorded before the dispose so the outcome is visible even if
         # the rollback itself then hangs or fails.
         self._record_outcome(tx_id, "rolled_back")
-        async with record.lock:  # let any in-flight statement finish first
-            await record.dispose(rollback=True)
+        # F-142: dispose takes the lock itself (serializes with in-flight
+        # statements), so it must not be called under it.
+        await record.dispose(rollback=True)
 
     async def rpc_tx_status(self, tx_id: str) -> str:
         """F-61: ``'committed' | 'rolled_back' | 'unknown'`` for a transaction.

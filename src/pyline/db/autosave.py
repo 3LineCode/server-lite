@@ -129,6 +129,17 @@ class SaveScheduler:
     def queue_depth(self) -> int:
         return len(self._dirty)
 
+    def forget(self, saver: DataSaver) -> None:
+        """F-151: dequeue ``saver`` -- an explicit :meth:`DataSaver.flush`
+        that succeeded has already persisted what the queued entry would
+        redundantly re-upsert on the next round. The caller (DataSaver)
+        guards this with its dirty-generation counter so a mark that landed
+        *during* the flush keeps the saver queued.
+        """
+        if self._dirty.pop(saver, None) is not None:
+            self._deferred.pop(saver, None)
+            self._sync_metrics()
+
     def start(self) -> None:
         if self._task is None:
             self._task = asyncio.get_running_loop().create_task(self._run())
@@ -181,6 +192,13 @@ class SaveScheduler:
 
     def _next_due(self, now: float) -> DataSaver | None:
         for saver in self._dirty:
+            if saver in self._inflight:
+                # F-151: a saver re-marked while its flush is still running
+                # is NOT re-pickable -- the running flush owns its lock, so
+                # picking it merely blocked on begin_flush_row. It stays
+                # queued here (the re-mark re-added it) and is picked next
+                # round once the in-flight flush releases.
+                continue
             if saver.held_by_journal is not None:
                 # F-63: an open transaction owns this saver's writes;
                 # flushing it here would autocommit outside the unit.  Leave
@@ -336,7 +354,10 @@ class SaveScheduler:
                     self.saved_total += 1
                     self._metrics.save_flushed.inc()
                     if journal is not None:
-                        journal.note_flush(saver)
+                        # F-158: mark_journal_flushed (not a bare note_flush)
+                        # -- the saver's F-63 deferral hold must drop with it,
+                        # or held_by_journal skips this saver forever.
+                        saver.mark_journal_flushed(journal)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -432,7 +453,7 @@ class SaveScheduler:
                     return False
                 await asyncio.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
             else:
-                self._dirty.pop(saver)
+                self._dirty.pop(saver, None)  # F-151: forget() may have removed it
                 self.saved_total += 1
                 self._metrics.save_flushed.inc()
         self._sync_metrics()

@@ -52,7 +52,13 @@ def _write_config(
         # null keeps the boot test free of the shared default metrics port
         "metrics_port": metrics_port,
         "zeromq": {"bind_host": "tcp://127.0.0.1:29417"},
-        "socket": {"token": "$plain:unit-test-token", "client_port": 11520, "server_port": 12520},
+        "socket": {
+            "token": "$plain:unit-test-token",
+            "inter_token": "$plain:unit-test-inter",
+            "client_port": 11520,
+            "server_port": 12520,
+            "max_connections": 32,
+        },
         "mysql": {"user": "root", "password": "$plain:test", "db_name": "pyline_test"},
         "redis": {"password": "$plain:test"},
         "clock": {"tz": clock_tz},
@@ -435,15 +441,15 @@ class TestClockSetbackF98:
         emitter._last_boundary = t0
 
         clock.set_time(t0 + 3700)  # jump past one hourly boundary
-        emitter.emit_missed_boundaries()
+        await emitter.emit_missed_boundaries()
         await asyncio.sleep(0.01)
         fired_after_jump = len(seen)
         assert fired_after_jump >= 1  # sanity: the boundary did fire
 
         clock.set_time(t0 + 3700 - 7200)  # SetTime two hours BACK
-        emitter.emit_missed_boundaries()
+        await emitter.emit_missed_boundaries()
         clock.set_time(t0 + 3700)  # restore the debug offset
-        emitter.emit_missed_boundaries()
+        await emitter.emit_missed_boundaries()
         await asyncio.sleep(0.01)
         assert len(seen) == fired_after_jump  # no boundary fired twice
 
@@ -477,7 +483,7 @@ class TestClockJumpCatchUpBound:
 
         started = time.monotonic()
         clock.set_time(t0 + 400 * 86400)  # ~400 days: ~19200 boundaries
-        emitter.emit_missed_boundaries()
+        await emitter.emit_missed_boundaries()
         elapsed = time.monotonic() - started
         await asyncio.sleep(0.01)
 
@@ -674,7 +680,13 @@ class TestMainProcSpawnWindowF135:
             "project": "spawn-test",
             "srv_type": "production",
             "metrics_port": None,
-            "socket": {"token": "$plain:t", "client_port": 11530, "server_port": 12530},
+            "socket": {
+                "token": "$plain:t",
+                "inter_token": "$plain:unit-test-inter",
+                "client_port": 11530,
+                "server_port": 12530,
+                "max_connections": 32,
+            },
             "mysql": {"user": "root", "password": "$plain:test", "db_name": "db"},
             "redis": {"password": "$plain:test"},
         }

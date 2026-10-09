@@ -128,7 +128,7 @@ class TestClockCatchupCapF52:
         now_ts = clock.now()
         # simulate three days of downtime: 144 missed half-hour boundaries
         emitter._last_boundary = now_ts - 3 * 86400
-        emitter.emit_missed_boundaries()
+        await emitter.emit_missed_boundaries()
         # 96 boundaries fired (the cap), the remaining 48 skipped with an alarm
         skipped = [p for k, p in alarm_log if k == "clock_boundaries_skipped"]
         assert skipped and skipped[0]["skipped"] == 48
@@ -159,7 +159,7 @@ class TestClockCatchupCapF52:
         )
         now_ts = clock.now()
         emitter._last_boundary = now_ts - 5400  # 1.5 hours: three boundaries
-        emitter.emit_missed_boundaries()
+        await emitter.emit_missed_boundaries()
         assert alarm_log == []  # within the cap: nothing skipped
         await asyncio.sleep(0.01)  # spawned emit tasks run
         assert len(seen) >= 1  # caught-up boundaries fired

@@ -123,10 +123,14 @@ class ClockEventEmitter:
                 break
             self._fire_boundary_events(boundary)
             cursor = boundary
-        skipped = 0
-        while self._clock.next_halfhour_after(cursor) <= now_ts:
-            cursor = self._clock.next_halfhour_after(cursor)
-            skipped += 1
+        # Arithmetic, not one iteration per boundary: a multi-year clock jump
+        # (debug push_time) used to iterate ~48 times per jumped day, each
+        # call enumerating ~50 wall-grid candidates -- a synchronous scheduler
+        # callback stalled for hundreds of milliseconds. The estimate can
+        # drift by a boundary per DST transition inside the window; it feeds
+        # an operator alarm, not persisted state.
+        last = self._clock.next_halfhour_after(now_ts - 1800)
+        skipped = max(1, round((last - cursor) / 1800)) if last > cursor else 0
         if skipped:
             logger.error(
                 "clock catch-up cap exceeded: %d half-hour boundary events skipped "
@@ -379,7 +383,12 @@ def start_metrics_endpoint(bind: str, port: int, token: str | None) -> object:
         def do_GET(self) -> None:
             if token is not None:
                 supplied = self.headers.get("Authorization", "")
-                if not hmac.compare_digest(supplied, f"Bearer {token}"):
+                # Bytes, not str: hmac.compare_digest raises TypeError on
+                # non-ASCII str operands, so a non-ASCII token (or header)
+                # used to 500 every scrape instead of answering 401.
+                supplied_b = supplied.encode("utf-8")
+                expected_b = f"Bearer {token}".encode()
+                if not hmac.compare_digest(supplied_b, expected_b):
                     self.send_response(401)
                     self.end_headers()
                     return

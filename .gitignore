@@ -24,6 +24,11 @@ htmlcov/
 # Secrets never belong in the repo
 *.secret
 .env
+# Resolved secrets file loaded by $file: references (config/secrets.py).
+# secrets.example.json is the committed placeholder; the real secrets.json
+# that sits next to a config dir must never enter the repo.
+secrets.json
+secrets.*.json
 
 # Editors / OS
 .vscode/

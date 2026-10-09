@@ -146,7 +146,12 @@ class EventBus:
         # (event_type, layer) -> [handlers]
         self._handlers: dict[tuple[type, int], list[EventHandler]] = {}
         self._failure_counts: dict[str, int] = {}
-        self._mro_cache: dict[type, tuple[tuple[type, int], ...]] = {}
+        # full-MRO tuple -> subscription keys. Keyed by the MRO, not the
+        # type: re-pointing a class's __bases__ (rejected by the reload
+        # validator, but the bus cannot assume that) changes the answer
+        # while the type object stays identical -- an MRO-keyed cache
+        # recomputes instead of serving stale keys.
+        self._mro_cache: dict[tuple[type, ...], tuple[tuple[type, int], ...]] = {}
 
     def subscribe(
         self,
@@ -175,7 +180,8 @@ class EventBus:
 
     def _subscription_keys(self, event_type: type) -> tuple[tuple[type, int], ...]:
         """Subscribed keys whose type is event_type or a base of it."""
-        cached = self._mro_cache.get(event_type)
+        mro = tuple(event_type.__mro__)
+        cached = self._mro_cache.get(mro)
         if cached is not None:
             return cached
         keys = [
@@ -185,8 +191,9 @@ class EventBus:
             for layer in _VALID_LAYERS
             if (klass, layer) in self._handlers
         ]
-        self._mro_cache[event_type] = tuple(keys)
-        return self._mro_cache[event_type]
+        result = tuple(keys)
+        self._mro_cache[mro] = result
+        return result
 
     async def emit(self, event: Any, *, reverse: bool = False) -> None:
         """Dispatch ``event`` to all layers, in layer order (or reverse).

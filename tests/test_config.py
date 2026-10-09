@@ -191,6 +191,31 @@ class TestProcessPortF84:
         assert high.process_port(1) == 35200  # +10000 per index above 10000
 
 
+class TestClientListenPortF84Twin:
+    def test_missing_client_port_raises_with_guidance(self) -> None:
+        """F-84 twin: ``client_port or 0`` used to return 0/1000/... for
+        entries without a client_port; the main process bound a port no
+        client could dial (the listener is bound unconditionally)."""
+        from pyline.config.models import ServerEntry
+
+        entry = ServerEntry(server_no=1, name="game", advertise_ip="10.0.0.1", server_port=2520)
+        with pytest.raises(ConfigError, match="client_port"):
+            entry.client_listen_port(0)
+
+    def test_configured_client_ports_keep_offset_scheme(self) -> None:
+        from pyline.config.models import ServerEntry
+
+        low = ServerEntry(
+            server_no=1, name="a", advertise_ip="10.0.0.1", server_port=2520, client_port=1520
+        )
+        assert low.client_listen_port(0) == 1520
+        assert low.client_listen_port(2) == 3520  # +1000 per index at low bases
+        high = ServerEntry(
+            server_no=2, name="b", advertise_ip="10.0.0.2", server_port=25200, client_port=15200
+        )
+        assert high.client_listen_port(1) == 25200  # +10000 per index above 10000
+
+
 class TestMySQLPoolBoundsF90d:
     def test_min_conn_above_max_conn_rejected(self) -> None:
         from pyline.config.models import MySQLSettings

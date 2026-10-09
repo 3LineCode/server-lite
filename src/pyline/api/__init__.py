@@ -22,7 +22,7 @@ from __future__ import annotations
 from types import ModuleType
 from typing import TYPE_CHECKING
 
-from pyline.core.context import Context
+from pyline.core.context import Context, ServiceNotAvailableError
 
 if TYPE_CHECKING:
     # Static knowledge only: mypy keeps ``api.db.query`` style attribute
@@ -51,9 +51,13 @@ class ApiUnboundError(RuntimeError):
         )
 
 
-class ApiServiceUnavailableError(RuntimeError):
+class ApiServiceUnavailableError(ServiceNotAvailableError):
     """A service name is not registered in the bound context (wrong process,
-    or called before the boot step that registers it)."""
+    or called before the boot step that registers it).
+
+    Subclasses :class:`ServiceNotAvailableError` so callers can catch ONE
+    root type for "service missing" regardless of which entry path raised
+    (``api.service(name)`` vs ``ctx().service(name, cls)``)."""
 
 
 def bind(ctx: Context) -> None:

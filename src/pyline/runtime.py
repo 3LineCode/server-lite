@@ -382,8 +382,11 @@ class ServerRuntime:
            cap (F-95) and simply gets the remaining total budget.
         5. monitor + metrics endpoint -- read-only observability; keep them
            up through the flush so the final scrape sees the drain.
-        6. zmq bus, redis, mysql -- the DB path closes only after the flush
-           that uses it (mysql.close still always runs: F-20).
+        6. zmq bus, db-service, redis, mysql -- the DB path closes only
+           after the flush that uses it (mysql.close still always runs:
+           F-20). db-service rolls back the remote-transaction sessions on
+           their out-of-pool connections (F-101), which the pool close
+           cannot reach.
         7. scheduler last -- mirrors boot (loop bound first, released last);
            business timers were the caller's responsibility to cancel at
            func-quit (step 1)."""
@@ -415,6 +418,13 @@ class ServerRuntime:
             plan.add("metrics-server", self.devtools.stop_metrics)
         if self.bus_zmq is not None:
             plan.add("zmq-bus", self.bus_zmq.close)
+        if self.db_layer.db_service is not None:
+            # F-101 wiring: the db process's remote-transaction sessions live
+            # on out-of-pool dedicated connections, so mysql.close() cannot
+            # reach them -- without this step the graceful rollback F-101
+            # wrote only ever ran in tests, and live sessions were dropped
+            # for the OS to notice the dead socket.
+            plan.add("db-service", self.db_layer.db_service.close)
         if self.db_layer.redis is not None:
             plan.add("redis", self.db_layer.redis.close)
         if self.db_layer.mysql is not None:

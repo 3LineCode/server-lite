@@ -231,7 +231,22 @@ class ServerEntry(_StrictModel):
         return base + process_index * 1_000
 
     def client_listen_port(self, process_index: int) -> int:
-        base = self.client_port or 0
+        """Client listener port for the process with this index.
+
+        F-84 twin: ``self.client_port or 0`` used to return 0/1000/... for
+        entries that configured no ``client_port`` -- the main process bound
+        an OS-assigned (or plainly wrong) port no client could dial.  The
+        client listener is bound unconditionally for every main process, so
+        a missing ``client_port`` is a configuration error the moment the
+        port is needed: raise loudly instead of returning a bogus value.
+        """
+        base = self.client_port
+        if base is None:
+            raise ConfigError(
+                f"server {self.server_no} ({self.name!r}) has no client_port; "
+                "entries whose main process accepts client connections must "
+                "declare client_port in servers.json5"
+            )
         if base > 10_000:
             return base + process_index * 10_000
         return base + process_index * 1_000

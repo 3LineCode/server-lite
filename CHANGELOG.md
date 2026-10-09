@@ -1,5 +1,107 @@
 # Changelog
 
+## Unreleased: sixth review pass (F-106..F-122) -- external assessment fixes
+
+Every finding of the full external repository assessment, each with a
+regression test; ruff format+check and mypy --strict clean.
+
+### Security & configuration
+- F-106: `secrets.json` is now covered by `.gitignore` -- three places in
+  the repo claimed the file was git-ignored while the patterns (`*.secret`,
+  `.env`) matched nothing a user following the template would create;
+  following `secrets.example.json`'s "copy to secrets.json" instruction
+  committed real credentials.
+
+### Data safety
+- F-107: `DatabaseService.close()` (F-101's graceful rollback of the
+  remote-transaction sessions) is wired into the production teardown plan
+  as a `db-service` step before the pools close -- it previously had no
+  production caller, and those sessions live on out-of-pool connections
+  the pool close cannot reach.
+- F-111: a transaction ending inside the shutdown drain window re-queued
+  its savers through `SaveScheduler.mark`, which refuses new marks once
+  quitting; the journal swallowed the OSError and the saver was dropped
+  while `flush_all` reported a clean drain. Framework recovery paths
+  (`requeue_deferred`, rollback re-marks) now use `requeue`, which
+  bypasses the quitting guard (never-drop beats atomicity); business
+  `mark_dirty` still fails loudly post-quit.
+
+### Hot reload
+- F-109: class `__reload__` hooks bind through the descriptor protocol --
+  the documented classmethod form was silently skipped on 3.12 (a raw
+  classmethod object is not callable, so the `callable()` guard dropped it
+  without a log). staticmethod/zero-arg plain forms verified; an
+  instance-method form now fails loudly instead of silently.
+- F-110: the signature guard rejects positional-or-keyword parameters
+  becoming positional-only (`def f(a, b)` -> `def f(a, /, b)` kept the
+  merged positional prefix identical but broke every keyword caller);
+  the loosening direction stays allowed.
+- F-120: the write-only `ReloadedClass` old->new map is removed (built,
+  exported, never read); `reload_module` logging counts classes directly.
+
+### Network & mesh
+- F-115: the metrics bearer-token comparison runs on bytes --
+  `hmac.compare_digest` raises TypeError on non-ASCII str, so a non-ASCII
+  token 500'd every scrape instead of answering 401.
+- F-116: the `@fwd` hop count accumulates through the router, `@relay`
+  and `ProxyClient.send_to_service` paths -- it was reset to 0 at every
+  client hop, so a registry-disagreement forwarding loop never reached
+  MAX_HOPS (the documented loop bound only worked along ProxyServer
+  forwards).
+- F-118: plain `Network` inbound handler concurrency is capped
+  (`max_inflight`, default 256; drop-and-count like the ZMQ destination
+  overflow, plus a `handler_overflow` metric) -- a token-holding client
+  could stack unbounded handler tasks; blocking the read loop instead
+  would deadlock handlers that await an RPC answered on the same
+  connection.
+
+### Kernel & runtime
+- F-108: `client_listen_port` raises on entries without `client_port`
+  (F-84 twin) -- it returned 0/1000/... and the unconditionally-bound
+  listener sat on a port no client could dial.
+- F-112: `Scheduler.close()` joins the coroutine tasks it cancels --
+  cancel only requests delivery, so a callback could still run after
+  close() returned, one iteration from touching a handle the next
+  teardown step closes.
+- F-113: every boot-failure exit (stuck watchdog, step timeout, hook
+  exception) cancels the startup watchdog -- it only self-exits at
+  FINISHED/QUIT, so a host catching the boot error leaked a 20 Hz task.
+- F-117: the clock catch-up skip count is arithmetic -- a multi-year
+  debug clock jump iterated once per 30-minute boundary (each enumerating
+  ~50 wall-grid candidates) inside the synchronous scheduler callback.
+- F-122: the EventBus subscription-key cache is keyed by the full MRO
+  tuple -- re-pointed `__bases__` served stale keys because the type
+  object (the old cache key) stayed identical.
+
+### Schema, facade & template
+- F-114: table-level COMMENTs pass through `check_comment` like the
+  column-level path (F-37) -- the table path doubled quotes without
+  rejecting backslashes, and a trailing `\` shifted the rest of the
+  CREATE TABLE DDL.
+- F-121: facade cleanup -- `api.db.redis_set` is typed `value: str` to
+  match the service (a non-str used to pass the facade and fail deeper);
+  `redis_delete(*keys)` absorbs `redis_delete_many`; and
+  `ApiServiceUnavailableError` subclasses `ServiceNotAvailableError` so
+  both "service missing" entry paths share one catchable root type.
+- F-119: the template's `TimeFormat`/`TimeFormatCN` derive through the
+  game clock (host-zone `fromtimestamp` contradicted the module's own
+  tz contract), and `_clock()` demonstrates the typed
+  `ctx().service("clock", GameClock)` accessor.
+
+### Docs
+- docs/hot-reload.md: three code-vs-doc drifts fixed (closure mismatch is
+  swap-time + rollback, not "before any swap"; bases compare
+  module-qualified per F-100, not bare-name; the new posonly guard is in
+  the forbidden list) and the `__reload__` hook forms are documented
+  precisely.
+- docs/deployment.md: new Windows section naming the loopback TCP bus
+  endpoint's exposure (no OS enforcement, no protocol auth -- the
+  deployment assumption is a single-user host).
+- Test infra: `_rewire` in the reload suite drops the directory's
+  FileFinder cache before re-import -- sibling modules written after
+  fixture setup were invisible until the Windows directory-mtime tick
+  (a 5-in-8 flake).
+
 ## Unreleased: fifth review pass (F-58..F-105)
 
 Full-assessment fix pass (one P0, every P1/P2/P3 finding); every fix carries

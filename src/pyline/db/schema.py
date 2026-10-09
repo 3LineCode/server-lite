@@ -188,7 +188,10 @@ class TableSpec:
     def create_sql(self) -> str:
         check_identifier(self.name)
         parts = ",\n  ".join(col.ddl() for col in self.columns.values())
-        comment = self.comment.replace(chr(39), chr(39) * 2) if self.comment else ""
+        # Through check_comment like the column-level path (F-37): the old
+        # table-level escaping doubled quotes but did not reject backslashes,
+        # so a trailing ``\`` shifted the rest of the CREATE TABLE DDL.
+        comment = check_comment(self.comment) if self.comment else ""
         return f"CREATE TABLE `{self.name}` (\n  {parts}\n) COMMENT '{comment}'"
 
     def query_sql(self, column: str) -> str:

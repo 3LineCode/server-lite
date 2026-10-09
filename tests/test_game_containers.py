@@ -53,6 +53,18 @@ class TestComTime:
         assert com_time.TimeString(com_time.TIME_DAY + 3661) == "1天1小时1分1秒"
         assert "2024-01-01" in com_time.TimeFormat(ts)
 
+    def test_timeformat_follows_clock_tz(self, game_layer) -> None:
+        """TimeFormat/TimeFormatCN used datetime.fromtimestamp (HOST zone),
+        contradicting the module's own "all wall-clock derivations go through
+        the game clock" contract: with a pinned clock.tz the rendered date
+        disagreed with the clock's day/week numbers."""
+        com_time, _ = game_layer
+        api.ctx().services["clock"] = GameClock(tz="UTC")
+        ts = 1704069000  # 2024-01-01 00:30:00 UTC
+        assert com_time.TimeFormat(ts) == "2024-01-01 00:30:00"
+        assert "2024年01月01日" in com_time.TimeFormatCN(ts)
+        assert com_time.GetDayNo(ts) == 1  # the rendering and the number agree
+
     def test_debug_time_offset(self, game_layer) -> None:
         com_time, _ = game_layer
         real = com_time.TrueTime()

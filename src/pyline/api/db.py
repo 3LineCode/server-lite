@@ -23,7 +23,6 @@ __all__ = [
     "execute",
     "query",
     "redis_delete",
-    "redis_delete_many",
     "redis_get",
     "redis_set",
     "transaction",
@@ -64,7 +63,9 @@ async def query(sql: str, *args: Any) -> list[tuple[Any, ...]]:
     return await _db().query(sql, args)
 
 
-async def redis_set(key: str, value: Any) -> None:
+async def redis_set(key: str, value: str) -> None:
+    """Set a string value. The underlying service is string-only (same as
+    the prototype's redis wrapper) -- encode richer types before calling."""
     await _db().redis_set(key, value)
 
 
@@ -74,11 +75,6 @@ async def redis_get(key: str, default: str | None = None) -> str | None:
 
 
 async def redis_delete(*keys: str) -> int:
+    """Delete one or many keys (absorbs the prototype's RedisMultiDel --
+    ``redis_delete(*keys)`` covers both spellings)."""
     return await _db().redis_del(*keys)
-
-
-async def redis_delete_many(keys: list[str]) -> int:
-    """Old RedisMultiDel."""
-    if not keys:
-        return 0
-    return int(await _db().redis_del(*keys))

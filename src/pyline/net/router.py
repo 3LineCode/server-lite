@@ -106,12 +106,18 @@ class MessageRouter:
         payload: bytes,
         target_service_no: int,
         from_service: int | None = None,
+        hops: int = 0,
     ) -> None:
         """Route one message toward ``target_service_no``.
 
         ``from_service`` is the validated ORIGINAL sender when relaying a
         message that arrived from elsewhere (proxy ``@fwd`` delivery);
         ``None`` means this process is the sender (F-39).
+
+        ``hops`` is the number of proxy hops already traversed when relaying
+        an ``@fwd``; every onward proxy send stamps ``hops + 1`` so MAX_HOPS
+        bounds loops that re-enter the router (a registry disagreement used
+        to reset the counter to 0 at every ProxyClient hop).
         """
         if target_service_no == self._ctx.service_no:
             origin = self._ctx.service_no if from_service is None else from_service
@@ -128,12 +134,12 @@ class MessageRouter:
         if self._ctx.is_sub_process:
             # F-70: sub-processes have no proxy links; hand the message to the
             # local main process inside an @relay envelope (see below).
-            self._relay_via_main(target_service_no, from_service, flag, payload)
+            self._relay_via_main(target_service_no, from_service, flag, payload, hops)
             return
         # On a proxy machine, deliver directly from the local node table first.
         origin = self._ctx.service_no if from_service is None else from_service
         if self._proxy_server is not None and self._proxy_server.forward(
-            target_service_no, origin, flag, payload
+            target_service_no, origin, flag, payload, hops
         ):
             return
         if self._proxy_client is None:
@@ -141,23 +147,32 @@ class MessageRouter:
             return
         try:
             self._proxy_client.send_to_service(
-                target_service_no, flag, payload, from_service=origin
+                target_service_no, flag, payload, from_service=origin, hops=hops
             )
         except NoProxyAvailableError:
             logger.error("cross-server send to %d dropped: no proxy connected", target_service_no)
 
     def _relay_via_main(
-        self, target_service_no: int, from_service: int | None, flag: str, payload: bytes
+        self,
+        target_service_no: int,
+        from_service: int | None,
+        flag: str,
+        payload: bytes,
+        hops: int = 0,
     ) -> None:
         """F-70: send a cross-server message through the local main process.
 
         The envelope keeps the original sender as its origin; the bus frames
         themselves carry the sub-process's own identity (F-39 requires
         identity == from on the wire), which is exactly what the main-side
-        handler needs to authenticate the relay request.
+        handler needs to authenticate the relay request.  The hop count
+        rides along unchanged -- relaying via the local main is not a proxy
+        hop, and the main's onward send keeps accumulating it.
         """
         origin = self._ctx.service_no if from_service is None else from_service
-        envelope = msgpack.packb([target_service_no, origin, flag, payload, 0], use_bin_type=True)
+        envelope = msgpack.packb(
+            [target_service_no, origin, flag, payload, hops], use_bin_type=True
+        )
         self._bus.send(self._ctx.main_service_no, RELAY_FLAG, envelope)
 
     def _on_relay(self, payload: bytes, from_service: int) -> None:
@@ -198,4 +213,4 @@ class MessageRouter:
             )
             return
         self.relayed_messages += 1
-        self.route(inner_flag, inner_payload, target, from_service=origin)
+        self.route(inner_flag, inner_payload, target, from_service=origin, hops=_hops)

@@ -260,7 +260,9 @@ class ProxyServer(_CloseSpawner):
                 )
                 return
         if main_service_no(target) == self._ctx.main_service_no:
-            self._router.route(inner_flag, inner_payload, target, from_service=from_service)
+            self._router.route(
+                inner_flag, inner_payload, target, from_service=from_service, hops=hops
+            )
             return
         if hops >= MAX_HOPS:
             logger.error("@fwd exceeded max hops (%d); dropping message to %d", hops, target)
@@ -275,12 +277,18 @@ class ProxyServer(_CloseSpawner):
             FWD_FLAG, build_forward(target, from_service, inner_flag, inner_payload, hops + 1)
         )
 
-    def forward(self, target: int, from_service: int, flag: str, payload: bytes) -> bool:
-        """Direct forwarding via this proxy's node table (local machine only)."""
+    def forward(
+        self, target: int, from_service: int, flag: str, payload: bytes, hops: int = 0
+    ) -> bool:
+        """Direct forwarding via this proxy's node table (local machine only).
+
+        ``hops`` is the number of proxy hops the message has already
+        traversed; the outbound envelope carries ``hops + 1`` so MAX_HOPS
+        still bounds loops that bounce through the router."""
         node = self._nodes.get(main_service_no(target))
         if node is None:
             return False
-        node.send_message(FWD_FLAG, build_forward(target, from_service, flag, payload, 1))
+        node.send_message(FWD_FLAG, build_forward(target, from_service, flag, payload, hops + 1))
         return True
 
     async def close(self) -> None:
@@ -385,10 +393,16 @@ class ProxyClient(_CloseSpawner):
             self.malformed_fwd += 1
             logger.warning("malformed @fwd payload (total=%d)", self.malformed_fwd)
             return
-        self._router.route(inner_flag, inner_payload, target, from_service=from_service)
+        self._router.route(inner_flag, inner_payload, target, from_service=from_service, hops=_hops)
 
     def send_to_service(
-        self, target: int, flag: str, payload: bytes, *, from_service: int | None = None
+        self,
+        target: int,
+        flag: str,
+        payload: bytes,
+        *,
+        from_service: int | None = None,
+        hops: int = 0,
     ) -> None:
         """Send cross-server via any connected proxy; raises if none.
 
@@ -397,7 +411,13 @@ class ProxyClient(_CloseSpawner):
         an ``@fwd`` received here); ``None`` keeps the historical behaviour
         of stamping this process. The receiving proxy binds the claimed
         origin to the sending connection's machine (F-48), so the origin
-        must always belong to this machine when relaying."""
+        must always belong to this machine when relaying.
+
+        ``hops`` is the number of proxy hops already traversed; stamping 0
+        here (as before) meant a registry disagreement bouncing a message
+        through the router never accumulated toward MAX_HOPS -- the
+        documented loop bound only worked along ProxyServer forwards.
+        """
         if not self._proxies:
             self._failed_sends += 1
             raise NoProxyAvailableError(
@@ -408,7 +428,7 @@ class ProxyClient(_CloseSpawner):
         if proxy is None:
             proxy = next(iter(self._proxies.values()))
         origin = self._ctx.service_no if from_service is None else from_service
-        proxy.send_message(FWD_FLAG, build_forward(target, origin, flag, payload, 0))
+        proxy.send_message(FWD_FLAG, build_forward(target, origin, flag, payload, hops + 1))
 
     async def close(self) -> None:
         """Shut down the client: stop the maintain loops AND close every

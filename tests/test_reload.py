@@ -104,6 +104,64 @@ def test_reloadkeep_preserves_state(hotmod, tmp_path: Path) -> None:
     assert hotmod.Holder.state["open"] is False  # kept, not reinitialized
 
 
+class TestClassReloadHookForms:
+    """The documented classmethod-style ``__reload__`` used to be silently
+    skipped: ``cls.__dict__["__reload__"]`` is a raw classmethod object,
+    which is NOT callable on 3.12, so the ``callable()`` guard dropped it
+    without a log line. The hook must be bound through the descriptor
+    protocol so every documented form runs."""
+
+    @staticmethod
+    def _v2_with_hook(hook_src: str) -> str:
+        return (
+            V1.replace('return "v1"', 'return "v2"')
+            .replace('COUNTER = {"n": 0}', 'COUNTER = {"n": 0}\nHOOK_CALLS = []')
+            .replace(
+                "class Greeter:\n    keep_me",
+                "class Greeter:\n" + hook_src + "\n    keep_me",
+            )
+        )
+
+    def test_classmethod_form_runs_with_cls_bound(self, hotmod, tmp_path: Path) -> None:
+        v2 = self._v2_with_hook(
+            "    @classmethod\n    def __reload__(cls):\n        HOOK_CALLS.append(cls.__name__)"
+        )
+        write_module(tmp_path, v2)
+        reload_module("hotmod")
+        assert hotmod.HOOK_CALLS == ["Greeter"]
+        assert hotmod.Greeter().greet() == "v2"
+
+    def test_staticmethod_form_runs(self, hotmod, tmp_path: Path) -> None:
+        v2 = self._v2_with_hook(
+            "    @staticmethod\n    def __reload__():\n        HOOK_CALLS.append('sm')"
+        )
+        write_module(tmp_path, v2)
+        reload_module("hotmod")
+        assert hotmod.HOOK_CALLS == ["sm"]
+
+    def test_zero_arg_plain_form_runs(self, hotmod, tmp_path: Path) -> None:
+        v2 = self._v2_with_hook("    def __reload__():\n        HOOK_CALLS.append('plain')")
+        write_module(tmp_path, v2)
+        reload_module("hotmod")
+        assert hotmod.HOOK_CALLS == ["plain"]
+
+    def test_instance_form_fails_loudly_not_silently(
+        self, hotmod, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``def __reload__(self)`` has no instance to bind at reload time;
+        the TypeError must be logged (a silent skip would hide a hook that
+        business code believes ran)."""
+        import logging
+
+        v2 = self._v2_with_hook("    def __reload__(self):\n        HOOK_CALLS.append('never')")
+        write_module(tmp_path, v2)
+        with caplog.at_level(logging.ERROR, logger="pyline.reload.inplace"):
+            reload_module("hotmod")
+        assert hotmod.HOOK_CALLS == []
+        assert any("__reload__ hook" in rec.message for rec in caplog.records)
+        assert hotmod.Greeter().greet() == "v2"  # reload itself still succeeded
+
+
 def test_module_globals_survive(hotmod, tmp_path: Path) -> None:
     hotmod.COUNTER["n"] = 42
     reload_module("hotmod")  # unchanged source reload
@@ -261,6 +319,13 @@ def _rewire(tmp_path: Path, source: str):
     """Replace the fixture module with a custom first version and reimport."""
     sys.modules.pop("hotmod", None)
     write_module(tmp_path, source)
+    # Windows flake: the FileFinder for tmp_path cached its directory
+    # listing when the fixture imported hotmod; sibling modules written
+    # since (other1.py, ...) stay invisible to `import` until the
+    # directory mtime ticks, which is coarse on Windows -- observed as a
+    # 5-in-8 ModuleNotFoundError flake. Drop the finder so the reimport
+    # re-lists the directory.
+    sys.path_importer_cache.pop(str(tmp_path), None)
     import hotmod
 
     return hotmod
@@ -288,6 +353,34 @@ class TestKwonlyGuard:
         write_module(tmp_path, "def f(a, *, b=7):\n    return (a, b)\n")
         reload_module("hotmod")
         assert sys.modules["hotmod"].f(1) == (1, 7)  # type: ignore[attr-defined]
+
+
+class TestPosonlyKindGuard:
+    def test_rejects_pos_or_kw_becoming_positional_only(self, hotmod, tmp_path: Path) -> None:
+        """``def f(a, b)`` -> ``def f(a, /, b)`` keeps the merged positional
+        prefix identical, so it passed validation while every ``f(b=...)``
+        keyword caller TypeErrors at swap time."""
+        mod = _rewire(tmp_path, "def f(a, b):\n    return (a, b)\n")
+        write_module(tmp_path, "def f(a, /, b):\n    return (a, b)\n")
+        with pytest.raises(ReloadRejected, match="positional-only"):
+            reload_module("hotmod")
+        assert mod.f(1, 2) == (1, 2)
+        assert mod.f(1, b=2) == (1, 2)  # the old keyword form still works
+
+    def test_posonly_to_pos_or_kw_loosening_allowed(self, hotmod, tmp_path: Path) -> None:
+        """Kind may only loosen: positional-only -> positional-or-keyword
+        adds a passing mode, no old caller can break."""
+        mod = _rewire(tmp_path, "def f(a, /, b):\n    return (a, b)\n")
+        write_module(tmp_path, "def f(a, b):\n    return (a, b)\n")
+        reload_module("hotmod")
+        assert mod.f(1, 2) == (1, 2)
+        assert mod.f(1, b=2) == (1, 2)  # newly legal keyword call
+
+    def test_kept_posonly_boundary_unchanged_passes(self, hotmod, tmp_path: Path) -> None:
+        mod = _rewire(tmp_path, "def f(a, /, b):\n    return (a, b)\n")
+        write_module(tmp_path, "def f(a, /, b):\n    return (b, a)\n")
+        reload_module("hotmod")
+        assert mod.f(1, 2) == (2, 1)
 
 
 class TestSlotsGuard:

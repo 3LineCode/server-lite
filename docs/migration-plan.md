@@ -492,7 +492,7 @@ redis-py 官方参数：`socket_timeout`、`socket_connect_timeout`、`health_ch
 3. **单次读源（消灭 TOCTOU）**：读一次源码 bytes → `compile` 得 code object → 沙箱 AST 检查与真实更新**共用同一份字节码**（自实现 `reload_from_code(module, code)`：`exec(code, module.__dict__)` 替代 `importlib.reload` 的二次文件读）；
 4. **真回滚**：`ModCache` 快照扩展为"模块 dict + 每个受影响类的 `__dict__` 浅拷贝 + 每个函数的旧属性"，异常时逐对象恢复；
 5. **dunder 守卫**：`__eq__/__hash__/__slots__/__init__ 签名` 变更默认拒绝（`allow_dunder` 显式豁免清单）——`__hash__` 变更会让已存于 dict/set 的实例查找错乱；
-6. **实例迁移辅助**：`ReloadedClass` 映射返回给调用方 + 新增类属性自动以 `__reload_default__`（类可声明的默认值字典）回填旧实例——替代旧仓"全靠业务 `__reload__` 手工补"；
+6. **实例迁移辅助**：reload 返回 old->new 类映射（后实现时按需重建；一度实现的 `ReloadedClass` 表只写不读，已在第五轮清理中移除）+ 新增类属性自动以 `__reload_default__`（类可声明的默认值字典）回填旧实例——替代旧仓"全靠业务 `__reload__` 手工补"；
 7. **属性级 `__reloadkeep__`**：值对象自带 `__reloadkeep__` 标记也保留（旧仓 reload.py:145-146 两形态之一，新仓缺）；
 8. **热更提交仍同步**（compile+exec 在 loop 内）但记录耗时指标；超阈值告警（大模块拆分提示）；
 9. 禁忌清单成文 `docs/hot-reload.rst`（从旧仓 reload.py:5-33 头注释迁移扩充：继承/super/闭包结构/元类/C 扩展/__slots__/签名不兼容/dunder）。

@@ -75,6 +75,15 @@ class TestFacade:
             api.service("rpc")
 
 
+class TestServiceErrorUnification:
+    async def test_api_service_error_is_catchable_as_root_type(self, bound_ctx) -> None:
+        """api.service(name) and ctx().service(name, cls) used to raise two
+        unrelated types for the identical failure -- callers could not catch
+        one root exception."""
+        with pytest.raises(ServiceNotAvailableError, match="nope"):
+            api.service("nope")
+
+
 class TestTypedServiceBagF87:
     async def test_returns_narrowed_instance(self, bound_ctx) -> None:
         clock = bound_ctx.service("clock", GameClock)

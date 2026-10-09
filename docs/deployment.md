@@ -106,6 +106,24 @@ before `select()` raises. Options when a deployment outgrows it:
    selector loop and the client listener on proactor -- a kernel change,
    not a config change; needs its own review.
 
+## Windows: the ZMQ bus endpoint is unauthenticated TCP
+
+There is no `ipc://` transport on Windows, so the bus defaults to
+`tcp://127.0.0.1:<port>` (`zeromq.bind_host`, `config/models.py`). Unlike
+POSIX -- where the `ipc://` socket file is chmod 0600'd right after bind
+(F-75) -- a loopback TCP endpoint has **no OS-enforced access control and
+the bus protocol has no authentication of its own**: the F-39 identity
+binding only checks that a claimed `from` matches the sender's *self-chosen*
+socket identity. Any process running as the same user (or root) on a
+Windows host can connect, claim any service number, and inject RPC
+results/cancels into live calls. The generic mesh trust rule ("do not
+bridge the mesh onto a network you do not fully control") therefore
+includes *the loopback interface* on Windows: the assumption a deployment
+actually relies on is **single-user host**. Multi-user Windows hosts (or
+any host where unrelated services run as the same account) need the
+CURVE+ZAP transport-security pass from the trust-model section above
+before the bus endpoint is safe.
+
 ## Sub-process metrics are not scrapeable
 
 Only the main process exports Prometheus. The endpoint binds `127.0.0.1` by

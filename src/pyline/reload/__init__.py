@@ -31,7 +31,6 @@ field notes):
 
 from pyline.reload.inplace import (
     ModCache,
-    ReloadedClass,
     ReloadError,
     ReloadRejected,
     reload_module,
@@ -41,6 +40,5 @@ __all__ = [
     "ModCache",
     "ReloadError",
     "ReloadRejected",
-    "ReloadedClass",
     "reload_module",
 ]

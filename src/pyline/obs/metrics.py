@@ -62,6 +62,10 @@ class Metrics:
             "RPC messages dropped: result/call origin failed validation",
             ("reason",),
         )
+        self.handler_overflow = Counter(
+            f"{namespace}_handler_overflow_total",
+            "Plain-network inbound messages dropped: handler concurrency cap reached",
+        )
         self.save_queue = Gauge(f"{namespace}_save_queue", "Pending auto-save entries")
         self.save_flushed = Counter(f"{namespace}_save_flushed_total", "Flushed save entries")
         self.save_failures = Counter(f"{namespace}_save_failures_total", "Failed save flushes")

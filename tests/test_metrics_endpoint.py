@@ -41,6 +41,19 @@ class TestMetricsEndpointF54:
             server.shutdown()
             server.server_close()
 
+    def test_non_ascii_token_answered_401_not_500(self) -> None:
+        """hmac.compare_digest raises TypeError when either str operand is
+        non-ASCII: a non-ASCII token used to crash the handler (500/close)
+        on every scrape instead of answering 401."""
+        server = start_metrics_endpoint("127.0.0.1", 0, "métrics-tökén")
+        try:
+            port = server.server_address[1]
+            status, _ = scrape(f"http://127.0.0.1:{port}/metrics")  # ASCII-only header
+            assert status == 401
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_no_token_serves_openly(self) -> None:
         server = start_metrics_endpoint("127.0.0.1", 0, None)
         try:

@@ -259,6 +259,41 @@ class TestTeardownOrderF93:
         assert runtime.save_flush_ok is True
 
 
+class TestDbServiceTeardownWiring:
+    async def test_db_service_close_runs_before_the_pools(self, boot_env) -> None:
+        """F-101 wiring: DatabaseService.close() (graceful rollback of the
+        remote-transaction sessions on their out-of-pool connections) used
+        to have no production caller -- the teardown plan closed only the
+        pools, and live sessions were dropped for the OS to notice. It must
+        run, and before redis/mysql close."""
+        config_dir, _boot_events = boot_env
+        ctx = build_context(config_dir, BOOT_SERVER_NO, "main", 0, 0)
+        runtime = ServerRuntime(ctx)
+        order: list[str] = []
+
+        class FakeDbService:
+            async def close(self) -> None:
+                order.append("db-service")
+
+        class FakeRedis:
+            async def close(self) -> None:
+                order.append("redis")
+
+        class FakeMysql:
+            async def close(self) -> None:
+                order.append("mysql")
+
+        runtime.db_layer.db_service = FakeDbService()  # type: ignore[assignment]
+        runtime.db_layer.redis = FakeRedis()  # type: ignore[assignment]
+        runtime.db_layer.mysql = FakeMysql()  # type: ignore[assignment]
+
+        await runtime._shutdown_teardown()
+
+        assert "db-service" in order
+        assert order.index("db-service") < order.index("redis")
+        assert order.index("db-service") < order.index("mysql")
+
+
 # --------------------------------------------------------------------------- #
 # F-95: TeardownPlan per-step budget
 # --------------------------------------------------------------------------- #
@@ -410,6 +445,44 @@ class TestClockSetbackF98:
         emitter.emit_missed_boundaries()
         await asyncio.sleep(0.01)
         assert len(seen) == fired_after_jump  # no boundary fired twice
+
+
+class TestClockJumpCatchUpBound:
+    async def test_multi_year_jump_skips_arithmetically_and_alarms(self) -> None:
+        """A multi-year debug clock jump used to walk one loop iteration per
+        30-minute boundary (~48 per jumped day, each enumerating ~50 wall-grid
+        candidates) inside the synchronous scheduler callback -- a loop stall
+        proportional to the jump. The skip count is arithmetic now, bounded,
+        and still alarms."""
+        import time
+
+        from pyline.core.clock import GameClock
+        from pyline.obs.metrics import AlarmHub
+
+        clock = GameClock(epoch=dt.datetime(2024, 1, 1), tz="UTC")
+        alarms = AlarmHub()
+        seen: list[tuple[str, dict]] = []
+        alarms.register_all(lambda kind, payload: seen.append((kind, payload)))
+        emitter = ClockEventEmitter(
+            clock,
+            Scheduler(),
+            EventBus(),
+            log_dir=Path("."),
+            spawn=lambda coro: asyncio.get_running_loop().create_task(coro),
+            alarms=alarms,
+        )
+        t0 = clock.now()
+        emitter._last_boundary = t0
+
+        started = time.monotonic()
+        clock.set_time(t0 + 400 * 86400)  # ~400 days: ~19200 boundaries
+        emitter.emit_missed_boundaries()
+        elapsed = time.monotonic() - started
+        await asyncio.sleep(0.01)
+
+        skips = [p for kind, p in seen if kind == "clock_boundaries_skipped"]
+        assert skips and skips[0]["skipped"] > 19_000  # arithmetic count, not 0
+        assert elapsed < 1.0  # no per-boundary iteration over 400 days
 
 
 # --------------------------------------------------------------------------- #

@@ -55,7 +55,9 @@ __all__ = [
 def _clock() -> GameClock:
     # The runtime registers the clock service before the first boot step
     # (F-94), so every helper here is usable from BaseInitEvent handlers on.
-    return api.service("clock")  # type: ignore[no-any-return]
+    # Typed accessor (the untyped api.service("clock") bypasses the
+    # presence+type check at the facade boundary).
+    return api.ctx().service("clock", GameClock)
 
 
 def _local(i_time: int):
@@ -77,11 +79,14 @@ def GetTime() -> int:
 
 
 def TimeFormat(iTime: int = 0) -> str:
-    return datetime.fromtimestamp(iTime or GetTime()).strftime("%Y-%m-%d %H:%M:%S")
+    # Through the game clock like every other wall-clock derivation here
+    # (F-100): datetime.fromtimestamp would use the HOST zone and disagree
+    # with the clock's day/week numbers whenever clock.tz is pinned.
+    return _clock().local(iTime or GetTime()).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def TimeFormatCN(iTime: int = 0) -> str:
-    return datetime.fromtimestamp(iTime or GetTime()).strftime("%Y年%m月%d日 %H时%M分%S秒")
+    return _clock().local(iTime or GetTime()).strftime("%Y年%m月%d日 %H时%M分%S秒")
 
 
 def TimeString(iTime: int) -> str:

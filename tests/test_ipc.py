@@ -26,6 +26,38 @@ class _CaptureNet(Network):
         self.box["event"].set()
 
 
+class TestNetworkInflightCap:
+    async def test_overflow_drops_and_counts(self) -> None:
+        """A plain network used to spawn one task per inbound frame with no
+        bound -- a token-holding client could stack unlimited handler tasks
+        (F-19 bounded only the RPC face). The cap drops and counts; it must
+        never block the dispatch path."""
+        gw = ProtocolGateway()
+
+        class SlowNet(Network):
+            flag = "slow"
+
+            def __init__(self, gateway) -> None:
+                super().__init__(gateway, max_inflight=2)
+                self.started = asyncio.Event()
+                self.ran = 0
+                self.subscribe(1, self.on_slow)
+
+            async def on_slow(self) -> None:
+                self.ran += 1
+                await self.started.wait()
+
+        net = SlowNet(gw)
+        for _ in range(4):
+            net.handle_message("slow", pack_call(1), from_service=7)
+        await asyncio.sleep(0.01)  # let the two admitted tasks start
+        assert net.ran == 2  # the cap admitted two handlers
+        assert net._overflowed == 2  # the rest were dropped and counted
+        net.started.set()
+        await asyncio.sleep(0.01)
+        assert net.ran == 2  # the dropped ones never ran
+
+
 def free_tcp_port() -> int:
     import socket
 

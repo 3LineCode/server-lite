@@ -68,10 +68,6 @@ class ReloadRejected(ReloadError):
     """Forbidden structural change detected by static validation."""
 
 
-class ReloadedClass(dict[type, type]):
-    """Map of old-class -> new-class produced by a reload."""
-
-
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
@@ -103,11 +99,11 @@ def reload_module(module_name: str) -> types.ModuleType:
     try:
         before_digest = hashlib.sha256(source).hexdigest()
         exec(code, module.__dict__)  # module dict now holds NEW objects
-        class_map = _update_module(module, cache)
+        updated_classes = _update_module(module, cache)
         logger.info(
             "reloaded %s (classes=%d, checksum %s)",
             module_name,
-            len(class_map),
+            updated_classes,
             before_digest[:10],
         )
         _run_module_hook(module, "__reload__")
@@ -156,6 +152,12 @@ def _run_module_hook(module: types.ModuleType, hook_name: str) -> None:
 @dataclass(slots=True)
 class _FnSpec:
     positional: list[str] = field(default_factory=list)
+    # Names among ``positional`` that are POSITIONAL_ONLY (``def f(a, /)``).
+    # The merged ``positional`` list alone cannot see ``def f(a, b)`` ->
+    # ``def f(a, /, b)`` -- same merged list, but every ``f(b=...)`` keyword
+    # caller now TypeErrors. Kind may only loosen (posonly -> pos-or-kw),
+    # never tighten.
+    posonly: frozenset[str] = frozenset()
     pos_default_count: int = 0
     kwonly: list[str] = field(default_factory=list)
     kwonly_defaults: set[str] = field(default_factory=set)
@@ -287,6 +289,7 @@ def _spec_from_arguments(args: ast.arguments) -> _FnSpec:
     }
     return _FnSpec(
         positional=positional,
+        posonly=frozenset(a.arg for a in args.posonlyargs),
         pos_default_count=pos_default_count,
         kwonly=kwonly,
         kwonly_defaults=kwonly_defaults,
@@ -301,6 +304,8 @@ def _spec_from_function(fn: types.FunctionType) -> _FnSpec:
         kind = param.kind
         if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
             spec.positional.append(param.name)
+            if kind is inspect.Parameter.POSITIONAL_ONLY:
+                spec.posonly = spec.posonly | {param.name}
             if param.default is not inspect.Parameter.empty:
                 spec.pos_default_count += 1
         elif kind is inspect.Parameter.KEYWORD_ONLY:
@@ -503,13 +508,26 @@ def _check_signature_compatible(name: str, old: _FnSpec, new: _FnSpec, problems:
     """Old callers must keep working: same positional prefix; extra positionals
     only with defaults; no removed keyword-only; no keyword-only that gains
     "required" status (added without default, or its default removed); same
-    *args/**kwargs shape."""
+    *args/**kwargs shape; and no parameter kind tightening -- a
+    positional-or-keyword parameter becoming positional-only keeps the merged
+    positional prefix identical but breaks every ``f(x=...)`` keyword caller."""
     n = len(old.positional)
     if new.positional[:n] != old.positional:
         problems.append(
             f"{name}: positional parameters changed {old.positional} -> {new.positional}"
         )
         return
+    tightened = sorted(
+        param
+        for param in old.positional
+        if param not in old.posonly  # keyword callers exist for these
+        and param in new.posonly
+    )
+    if tightened:
+        problems.append(
+            f"{name}: positional-or-keyword parameters {tightened} became "
+            "positional-only (keyword callers would break)"
+        )
     extras = new.positional[n:]
     if extras and new.pos_default_count < len(extras):
         problems.append(
@@ -538,15 +556,18 @@ def _check_signature_compatible(name: str, old: _FnSpec, new: _FnSpec, problems:
 # --------------------------------------------------------------------------- #
 
 
-def _update_module(module: types.ModuleType, cache: ModCache) -> ReloadedClass:
+def _update_module(module: types.ModuleType, cache: ModCache) -> int:
     """Fold freshly reloaded objects into the OLD identities.
 
     ``cache`` holds the pre-reload dict; ``module.__dict__`` holds the new
     objects. For every module-owned name present in both, the old object is
     updated in place (code swap / class-dict diff) and restored into the
     module dict so external ``from module import x`` references stay valid.
+
+    Returns the number of classes updated (log line only -- the old
+    old->new class map this used to build was never read by anything).
     """
-    class_map = ReloadedClass()
+    updated_classes = 0
     for name, old_obj in cache.snapshot().items():
         if name.startswith("__") and name.endswith("__") and len(name) > 4:
             # Real dunders (__name__, __loader__, __all__, __getattr__...)
@@ -564,7 +585,9 @@ def _update_module(module: types.ModuleType, cache: ModCache) -> ReloadedClass:
             if not cache.owned(old_obj):
                 # Was plain state, is now a definition -- accept the new one.
                 continue
-            _update_generic(old_obj, new_obj, class_map)
+            if isinstance(old_obj, type):
+                updated_classes += 1
+            _update_generic(old_obj, new_obj)
             setattr(module, name, old_obj)
         elif isinstance(old_obj, (types.FunctionType, type)):
             continue  # definition became plain state: validation rejects this earlier
@@ -573,12 +596,12 @@ def _update_module(module: types.ModuleType, cache: ModCache) -> ReloadedClass:
             # clobbers live state. (The prototype needed a manual
             # "if not g_X in globals()" guard for this; here it is default.)
             setattr(module, name, old_obj)
-    return class_map
+    return updated_classes
 
 
-def _update_generic(old_obj: object, new_obj: object, class_map: ReloadedClass) -> object:
+def _update_generic(old_obj: object, new_obj: object) -> object:
     if isinstance(old_obj, type) and isinstance(new_obj, type):
-        _update_class(old_obj, new_obj, class_map)
+        _update_class(old_obj, new_obj)
         return old_obj
     if isinstance(old_obj, types.FunctionType) and isinstance(new_obj, types.FunctionType):
         _update_function(old_obj, new_obj)
@@ -631,7 +654,7 @@ def _update_function(old_func: types.FunctionType, new_func: types.FunctionType)
         old_func.__dict__.setdefault(key, value)
 
 
-def _update_class(old_cls: type, new_cls: type, class_map: ReloadedClass) -> None:
+def _update_class(old_cls: type, new_cls: type) -> None:
     if type(old_cls) is not type(new_cls):
         # F-100: metaclass changes were silently ignored -- the class-dict
         # diff below never touches ``__class__``, so the live class kept its
@@ -644,7 +667,6 @@ def _update_class(old_cls: type, new_cls: type, class_map: ReloadedClass) -> Non
             f"{type(old_cls).__module__}.{type(old_cls).__qualname__} -> "
             f"{type(new_cls).__module__}.{type(new_cls).__qualname__} (restart required)"
         )
-    class_map[old_cls] = new_cls
     raw_keep = getattr(old_cls, "__reloadkeep__", ())
     # tuple/list form lists kept attribute names; a bare True (value-level
     # marker) is also legal on classes that happen to be reload targets.
@@ -673,7 +695,7 @@ def _update_class(old_cls: type, new_cls: type, class_map: ReloadedClass) -> Non
             # normal class-level lookup -- no instance migration needed.
             setattr(old_cls, key, new_val)
             continue
-        updated = _update_generic(old_val, new_val, class_map)
+        updated = _update_generic(old_val, new_val)
         if updated is old_val:
             # Keep the identity of in-place-updated members.
             setattr(old_cls, key, old_val)
@@ -684,11 +706,23 @@ def _update_class(old_cls: type, new_cls: type, class_map: ReloadedClass) -> Non
 
 def _run_class_hook(cls: type) -> None:
     hook = cls.__dict__.get("__reload__")
-    if hook is not None and callable(hook):
-        try:
-            hook()
-        except Exception:
-            logger.exception("class __reload__ hook of %s failed", cls.__qualname__)
+    if hook is None:
+        return
+    # Bind through the descriptor protocol: a raw ``classmethod`` object is
+    # not callable at all on 3.12 (the old ``callable(hook)`` guard silently
+    # skipped the documented classmethod form), and calling descriptor
+    # objects bare would drop the cls binding. ``__get__(None, cls)`` binds
+    # classmethods to their class, unwraps staticmethods, and passes plain
+    # functions through -- so a plain ``def __reload__(self)`` (no instance
+    # exists at reload time) still fails loudly in the except below.
+    with contextlib.suppress(AttributeError):
+        hook = hook.__get__(None, cls)
+    if not callable(hook):
+        return
+    try:
+        hook()
+    except Exception:
+        logger.exception("class __reload__ hook of %s failed", cls.__qualname__)
 
 
 # --------------------------------------------------------------------------- #

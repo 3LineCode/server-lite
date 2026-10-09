@@ -18,6 +18,7 @@ Improvements over the prototype:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import logging
 import time
@@ -121,6 +122,20 @@ class LifecycleManager:
         if self._watchdog_task is None:
             self._watchdog_task = asyncio.get_running_loop().create_task(self._watchdog())
 
+    async def _cancel_watchdog(self) -> None:
+        """Stop the watchdog on a boot-failure exit.
+
+        The old failure paths nulled the reference without cancelling: the
+        watchdog only exits on FINISHED/QUIT, so a host that catches
+        ``StartupStuckError`` and keeps its loop alive (tests, embedding)
+        leaked a task spinning at 20 Hz forever."""
+        task = self._watchdog_task
+        self._watchdog_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     async def _watchdog(self) -> None:
         while self.state != LifecycleState.FINISHED and self.state != LifecycleState.QUIT:
             await asyncio.sleep(0.05)
@@ -140,6 +155,22 @@ class LifecycleManager:
     async def run_boot(self) -> None:
         """Drive the sequence through all boot steps, honouring gates."""
         self.start_watchdog()
+        try:
+            completed = await self._run_boot_steps()
+        except BaseException:
+            # Any failure exit (stuck watchdog, step timeout, hook exception)
+            # must stop the watchdog: it only self-exits at FINISHED/QUIT, so
+            # a host that catches the error and keeps its loop alive (tests,
+            # embedding) would otherwise leak a task spinning at 20 Hz.
+            await self._cancel_watchdog()
+            raise
+        if self.stuck_error is not None:
+            await self._cancel_watchdog()
+            raise self.stuck_error
+        if completed:
+            logger.info("startup finished: %s", self.state.name)
+
+    async def _run_boot_steps(self) -> bool:
         for state in BOOT_STEPS:
             if self.in_quit():
                 # Same F-19 semantics, covering the window where the shutdown
@@ -149,11 +180,10 @@ class LifecycleManager:
                 # tearing down. in_quit() rather than a bare comparison --
                 # another task may flip the state at any await point.
                 logger.warning("boot aborted by shutdown request before %s", state.name)
-                return
+                return False
             await self._enter(state)
             while True:
                 if self.stuck_error is not None:
-                    self._watchdog_task = None
                     raise self.stuck_error
                 if self.state == LifecycleState.QUIT:
                     # F-19: shutdown requested mid-boot -- stop gating, cancel
@@ -163,14 +193,11 @@ class LifecycleManager:
                         task.cancel()
                     self._pending_waits.clear()
                     logger.warning("boot aborted by shutdown request in %s", state.name)
-                    return
+                    return False
                 if not self._pending_waits and not self._start_tasks:
                     break
                 await asyncio.sleep(0.05)
-        if self.stuck_error is not None:
-            self._watchdog_task = None
-            raise self.stuck_error
-        logger.info("startup finished: %s", self.state.name)
+        return True
 
     async def _enter(self, state: LifecycleState) -> None:
         if self.state is LifecycleState.QUIT:

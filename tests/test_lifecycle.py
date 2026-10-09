@@ -62,6 +62,31 @@ async def test_watchdog_names_pending_flag() -> None:
         await manager.run_boot()
 
 
+async def test_watchdog_cancelled_when_boot_fails() -> None:
+    """The old failure exits nulled the watchdog reference without cancelling
+    it; the watchdog only self-exits at FINISHED/QUIT, so a host that catches
+    the boot error and keeps its loop alive leaked a 20 Hz spinning task."""
+    manager = LifecycleManager()
+    captured: list[asyncio.Task[None]] = []
+    orig_start = manager.start_watchdog
+
+    def capture() -> None:
+        orig_start()
+        captured.append(manager._watchdog_task)  # type: ignore[arg-type]
+
+    manager.start_watchdog = capture  # type: ignore[method-assign]
+
+    async def boom() -> None:
+        raise RuntimeError("hook died")
+
+    manager.on_step(LifecycleState.LOOP_INIT, boom)
+    with pytest.raises(RuntimeError, match="hook died"):
+        await manager.run_boot()
+    await asyncio.sleep(0.08)  # two watchdog ticks would have fired by now
+    assert captured and captured[0].done()
+    assert manager._watchdog_task is None
+
+
 async def test_illegal_transition_rejected() -> None:
     manager = LifecycleManager()
     with pytest.raises(RuntimeError, match="illegal lifecycle transition"):

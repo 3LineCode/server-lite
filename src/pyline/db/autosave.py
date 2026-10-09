@@ -110,6 +110,22 @@ class SaveScheduler:
         self._dirty.setdefault(saver, 0)
         self._sync_metrics()
 
+    def requeue(self, saver: DataSaver) -> None:
+        """Queue a saver without the quitting guard -- framework recovery
+        paths only (journal release when a transaction ends, rollback
+        re-marks).
+
+        ``mark`` deliberately refuses new dirty marks once the shutdown
+        drain has started, but a journal requeue carries data that already
+        exists in memory: dropping it let ``flush_all`` report a clean
+        drain while a saver's data was lost (the journal paths only logged
+        the OSError).  ``flush_all`` iterates ``_dirty`` until it is empty,
+        so a requeue landing inside the drain window is still flushed --
+        never-drop beats atomicity when the process is going down.
+        """
+        self._dirty.setdefault(saver, 0)
+        self._sync_metrics()
+
     def queue_depth(self) -> int:
         return len(self._dirty)
 

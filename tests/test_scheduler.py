@@ -135,6 +135,29 @@ async def test_close_cancels_running_coroutine_callbacks() -> None:
     await asyncio.wait_for(cancelled.wait(), 1.0)
 
 
+async def test_close_delivers_cancellation_before_returning() -> None:
+    # regression: close() used to request cancellation but never join the
+    # tasks, so a callback could still be one loop iteration from touching
+    # a handle the next teardown step closes.
+    sched = Scheduler(loop=asyncio.get_running_loop())
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def hang() -> None:
+        entered.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    sched.call_after(0.01, hang)
+    await asyncio.wait_for(entered.wait(), 1.0)
+    await sched.close()
+    # no sleep, no yield: the cancellation must already have been delivered
+    assert cancelled.is_set()
+
+
 async def test_exception_isolated() -> None:
     sched = Scheduler(loop=asyncio.get_running_loop())
 

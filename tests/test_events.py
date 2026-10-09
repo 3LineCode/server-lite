@@ -99,3 +99,32 @@ class TestPolymorphicDispatchF24:
         bus.subscribe(StartupContextEvent, on_startup)
         await bus.emit(MyStartup(context="ctx"))
         assert len(seen) == 1
+
+
+class TestMroCacheSelfInvalidation:
+    async def test_repointed_bases_recompute_subscription_keys(self) -> None:
+        """The cache was keyed by the type alone: re-pointing ``__bases__``
+        (rejected by the reload validator, but the bus cannot assume that)
+        changed the answer while the type object stayed identical, so the
+        cache served stale subscription keys. Keyed by the full MRO tuple,
+        it self-invalidates."""
+        from pyline.core.events import EventBus
+
+        class Base1:
+            pass
+
+        class Base2:
+            pass
+
+        class Ev(Base1):
+            pass
+
+        bus = EventBus()
+        got: list[str] = []
+        bus.subscribe(Base2, lambda _event: got.append("b2"))
+        await bus.emit(Ev())
+        assert got == []  # Base2 not in Ev's MRO yet
+
+        Ev.__bases__ = (Base2,)
+        await bus.emit(Ev())
+        assert got == ["b2"]  # recomputed, not served stale

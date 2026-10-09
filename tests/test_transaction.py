@@ -390,6 +390,55 @@ class TestCommitFailureRemarksDirtyF60:
         assert scheduler.queue_depth() == 1  # re-marked after the failed COMMIT
 
 
+class TestJournalRequeueDuringShutdownDrain:
+    """A transaction ending inside the shutdown drain window used to hit
+    ``SaveScheduler.mark``'s quitting guard: the journal caught the OSError,
+    logged it, and dropped the saver -- ``flush_all`` then reported a clean
+    drain while the deferred/rolled-back data was lost. Framework requeues
+    bypass the guard (never-drop beats atomicity at shutdown)."""
+
+    async def test_deferred_requeue_during_drain_is_not_dropped(self) -> None:
+        access, _pool = local_access()
+        scheduler = SaveScheduler(interval=60.0)
+        saver = DataSaver(access, make_schema(), "tbl_player", "data", 1, scheduler=scheduler)
+        saver.set_data({"gold": 100})
+        async with access.transaction():
+            await scheduler.flush_batch()  # the unit takes the queued row
+            assert scheduler.queue_depth() == 0
+            saver.set_data({"gold": 200})  # new mutation defers into the journal
+            assert scheduler.queue_depth() == 0
+            scheduler._quitting = True  # the shutdown drain begins mid-unit
+        # the unit ended inside the drain window: the requeue must survive
+        assert scheduler.queue_depth() == 1
+        assert await scheduler.flush_all(timeout=1.0) is True
+
+    async def test_rollback_remark_during_drain_is_not_dropped(self) -> None:
+        access, _pool = local_access()
+        scheduler = SaveScheduler(interval=60.0)
+        saver = DataSaver(access, make_schema(), "tbl_player", "data", 1, scheduler=scheduler)
+        saver.set_data({"gold": 100})
+        with pytest.raises(RuntimeError, match="rollback me"):
+            async with access.transaction():
+                await saver.flush()
+                scheduler._quitting = True  # drain begins before the rollback
+                raise RuntimeError("rollback me")
+        assert scheduler.queue_depth() == 1
+        assert await scheduler.flush_all(timeout=1.0) is True
+
+    async def test_mark_still_refuses_after_quit_but_requeue_does_not(self) -> None:
+        """The loud guard on NEW business mutations stays: only the framework
+        recovery paths may bypass it."""
+        access, _pool = local_access()
+        scheduler = SaveScheduler(interval=60.0)
+        saver = DataSaver(access, make_schema(), "tbl_player", "data", 1, scheduler=scheduler)
+        saver.set_data({"gold": 100})
+        scheduler._quitting = True
+        with pytest.raises(OSError, match="quitting"):
+            saver.mark_dirty()
+        scheduler.requeue(saver)
+        assert scheduler.queue_depth() == 1
+
+
 class TestTxStatusF61:
     async def test_outcome_lifecycle(self) -> None:
         """F-61: the db process records how each remote transaction ended;

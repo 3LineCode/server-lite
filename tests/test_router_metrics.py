@@ -25,11 +25,19 @@ class FakeBus:
 class FakeProxyClient:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str, bytes, int]] = []
+        self.hops: list[int] = []
 
     def send_to_service(
-        self, target: int, flag: str, payload: bytes, *, from_service: int | None = None
+        self,
+        target: int,
+        flag: str,
+        payload: bytes,
+        *,
+        from_service: int | None = None,
+        hops: int = 0,
     ) -> None:
         self.sent.append((target, flag, payload, from_service if from_service is not None else -1))
+        self.hops.append(hops)
 
 
 @pytest.fixture()
@@ -154,6 +162,25 @@ class TestRelayOriginBindingF70:
         router._on_relay(msgpack.packb([remote_target, sub, "f", b"x", 0]), from_service=sub)
         assert router.relayed_messages == 1
         assert proxy.sent == [(remote_target, "f", b"x", sub)]
+
+    def test_relayed_hops_accumulate_across_the_router(self, router_ctx) -> None:
+        """A relayed @fwd that re-enters the router (registry disagreement,
+        the classic forwarding loop) used to reset its hop count to 0 at
+        every ProxyClient send, so MAX_HOPS never bounded the loop. The
+        envelope's hops must ride along and the onward send must add one."""
+        router, _bus = _relay_router(router_ctx)
+        proxy = FakeProxyClient()
+        router.attach_proxy_client(proxy)  # type: ignore[arg-type]
+        sub = 1 * 100_000 + router_ctx.server_no
+        remote_target = 5 * 100_000 + 7
+        router._on_relay(msgpack.packb([remote_target, sub, "f", b"x", 6]), from_service=sub)
+        assert proxy.hops == [6]  # +1 is stamped by send_to_service's envelope
+        envelope_hops = 7  # what build_forward wrote into the outbound frame
+        # and a second relay round keeps accumulating from the carried value
+        router._on_relay(
+            msgpack.packb([remote_target, sub, "f", b"x", envelope_hops]), from_service=sub
+        )
+        assert proxy.hops == [6, 7]
 
     def test_remote_origin_claim_dropped(self, router_ctx) -> None:
         """A sub-process stamping a DIFFERENT machine's service number on its

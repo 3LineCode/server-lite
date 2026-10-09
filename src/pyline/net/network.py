@@ -24,6 +24,7 @@ from typing import Any, ClassVar, cast
 import msgpack
 
 from pyline.net.gateway import ProtocolGateway
+from pyline.obs.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +49,22 @@ class Network:
 
     flag: ClassVar[str] = ""
 
-    def __init__(self, gateway: ProtocolGateway) -> None:
+    #: F-19 analogue for plain networks: how many handler tasks may run
+    #: concurrently before inbound messages are dropped and counted. The RPC
+    #: face has its own bounded semaphore with busy replies; a plain network
+    #: used to spawn one task per frame with no limit, so a token-holding
+    #: client could stack unbounded handler tasks. Blocking the read loop
+    #: instead would deadlock request/response handlers that await an RPC
+    #: whose RESULT arrives on the same connection, so overflow drops.
+    DEFAULT_MAX_INFLIGHT: ClassVar[int] = 256
+
+    def __init__(self, gateway: ProtocolGateway, *, max_inflight: int | None = None) -> None:
         self._gateway = gateway
         self._handlers: dict[int, Handler] = {}
         self._unknown_subs = 0
+        self._overflowed = 0
+        self._max_inflight = self.DEFAULT_MAX_INFLIGHT if max_inflight is None else max_inflight
+        self._metrics = get_metrics()
         # F-20: strong references to in-flight handler tasks. A bare
         # ``create_task`` result can be garbage-collected mid-run (a known
         # CPython pitfall) and its exception is then never observed; the set
@@ -104,6 +117,19 @@ class Network:
                 type(self).__qualname__,
                 sub,
                 self._unknown_subs,
+            )
+            return
+        if len(self._inbound) >= self._max_inflight:
+            # Drop-and-count, mirroring the ZMQ destination overflow (F-24):
+            # never block the read loop (see DEFAULT_MAX_INFLIGHT).
+            self._overflowed += 1
+            self._metrics.handler_overflow.inc()
+            logger.warning(
+                "%s: handler concurrency cap reached (%d); dropped sub %d (dropped total=%d)",
+                type(self).__qualname__,
+                self._max_inflight,
+                sub,
+                self._overflowed,
             )
             return
         task = asyncio.get_running_loop().create_task(self._run_handler(handler, sub, args))

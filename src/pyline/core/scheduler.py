@@ -192,9 +192,15 @@ class Scheduler:
         self._entries.clear()
         # A closed scheduler must not leave coroutine callbacks running
         # against services that teardown closes next (mysql/zmq handles).
-        for task in self._async_tasks:
-            task.cancel()
-        self._async_tasks.clear()
+        if self._async_tasks:
+            for task in self._async_tasks:
+                task.cancel()
+            # Cancel only requests delivery on the next loop tick; without
+            # this join a callback could still run after close() returned,
+            # one iteration from touching a handle the next teardown step
+            # closes -- the exact hazard the cancel exists for.
+            await asyncio.gather(*self._async_tasks, return_exceptions=True)
+            self._async_tasks.clear()
 
     # ------------------------------------------------------------------ #
     # Internals

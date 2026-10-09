@@ -14,14 +14,17 @@ executed for checking purposes, so import-time side effects run exactly once
 | Live instances follow new methods | class dict diff on the OLD class object |
 | Single source read | validation and application compile the SAME bytes (no TOCTOU) |
 | True rollback | deep snapshot (module dict + class dicts + function state) restored on any failure, including `BaseException`s like `SystemExit` raised by the re-executed top level (F-41) |
-| Runtime invariants | closure-layout mismatch aborts the reload before any swap |
+| Runtime invariants | closure-layout mismatch is detected at swap time and the deep rollback undoes every swap the reload had already made (the check compares the *executed* new code object's free variables, so it cannot run before the swap starts) |
 
 ## Forbidden (rejected with `ReloadRejected` -- restart required)
 
 * **Inheritance change** -- `__bases__` of a live class cannot be re-pointed
   safely (the prototype allowed a narrow special case; pyline rejects all).
-  Subscripted/dotted bases (`list[int]`, `module.Base`) compare by their bare
-  name and are not false-rejected.
+  Resolvable bases (including dotted `module.Base` and subscripted
+  `list[int]`) compare by their module-qualified key (F-100), so swapping
+  `from other1 import Base` for `from other2 import Base` is rejected;
+  a base that cannot be resolved statically falls back to bare-name
+  comparison for that base only.
 * **`__slots__` presence or layout change** -- the instance layout contract
   changes. Renaming a slot is rejected even though presence is unchanged:
   existing instances keep the old layout and their data would be orphaned.
@@ -33,7 +36,11 @@ executed for checking purposes, so import-time side effects run exactly once
 * **Call-incompatible signature change** -- removed/renamed positional
   parameters, new parameters without defaults, removed keyword-only
   parameters, keyword-only parameters that become required (added without a
-  default, or their default removed), `*args`/`**kwargs` shape change. The
+  default, or their default removed), a positional-or-keyword parameter
+  becoming positional-only (`def f(a, b)` -> `def f(a, /, b)`: the merged
+  positional prefix is unchanged but every `f(b=...)` keyword caller
+  breaks; the reverse loosening is allowed), `*args`/`**kwargs` shape
+  change. The
   check covers plain methods **and** the inner functions of
   `@staticmethod`/`@classmethod`/`@property`, **and** protocol dunders
   (`__exit__`, `__call__`, `__aiter__`, `__enter__`, ... -- F-41: they are
@@ -65,8 +72,13 @@ executed for checking purposes, so import-time side effects run exactly once
 
 ## Hooks
 
-* module-level `__reload__()` and classmethod-style `__reload__()` run after
+* module-level `__reload__()` and class `__reload__()` hooks run after
   a successful reload (only when defined in the reloaded module itself);
+  the class form binds through the descriptor protocol, so
+  `@classmethod` (receives `cls`), `@staticmethod`, and a zero-argument
+  plain `def __reload__()` all work; an instance-method form
+  (`def __reload__(self)` -- no instance exists at reload time) is logged
+  as a failed hook, never silently skipped;
 * `__reloadkeep__ = ("attr", ...)` on a class lists attributes that survive
   reloads untouched; an attribute carrying `__reloadkeep__ = True` is kept
   individually;

@@ -306,12 +306,15 @@ class DataSaver:
         """F-63: the transaction that deferred this saver has ended (committed
         or rolled back); the in-memory data is what must be persisted next,
         outside any unit.  The hold is cleared first so this cannot be
-        re-deferred into the dying journal's context."""
+        re-deferred into the dying journal's context.  Uses ``requeue`` (not
+        ``mark``): this may run inside the shutdown drain window, and data
+        that already exists in memory must not be dropped by the quitting
+        guard."""
         self._pending_journal = None
         if self.state == SaveState.DELETED:
             return
         if self._auto_save and self._scheduler is not None:
-            self._scheduler.mark(self)
+            self._scheduler.requeue(self)
 
     def _require_loaded(self, op: str) -> None:
         """F-102: flushing a never-loaded saver would encode ``None`` into a
@@ -355,7 +358,12 @@ class DataSaver:
                 self,
             )
             return
-        self.mark_dirty()
+        # mark_dirty semantics minus the live-journal deferral: the unit is
+        # known-dead here, so the saver goes straight back to the dirty queue
+        # through ``requeue`` -- never dropped by the shutdown quitting guard
+        # (a rollback can land inside the shutdown drain window).
+        self.state = SaveState.LOADED
+        self._scheduler.requeue(self)
 
     async def begin_flush_row(self) -> tuple[Any, bytes] | None:
         """Acquire the flush lock and encode this saver's row (F-59).
@@ -430,6 +438,8 @@ class DataSaver:
 
 class SaveSchedulerLike(Protocol):
     def mark(self, saver: DataSaver) -> None: ...
+
+    def requeue(self, saver: DataSaver) -> None: ...
 
 
 class TrackableModel:

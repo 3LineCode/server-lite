@@ -157,6 +157,16 @@ class TestDDLHardening:
         sql = spec.create_sql()
         assert "COMMENT 'player''s data'" in sql
 
+    def test_create_sql_rejects_table_comment_backslash(self) -> None:
+        """The table-level path used to double quotes without rejecting
+        backslashes (the column-level check_comment does); a trailing
+        backslash escaped the closing quote and shifted the rest of the
+        CREATE TABLE DDL."""
+        spec = TableSpec.from_def("tbl_player", make_def())
+        spec.comment = "trailing backslash\\"
+        with pytest.raises(SchemaError, match="backslashes are not allowed"):
+            spec.create_sql()
+
     def test_default_literal_whitelist(self) -> None:
         from pyline.db.schema import check_default_literal
 

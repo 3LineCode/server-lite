@@ -22,7 +22,15 @@ KW = {
 
 
 class _StubRouter:
-    def route(self, flag: str, payload: bytes, target_service_no: int) -> None:
+    def route(
+        self,
+        flag: str,
+        payload: bytes,
+        target_service_no: int,
+        *,
+        from_service: int | None = None,
+        hops: int = 0,
+    ) -> None:
         pass
 
 
@@ -31,7 +39,13 @@ class _RecordingRouter:
         self.routed: list[tuple[str, bytes, int, int]] = []
 
     def route(
-        self, flag: str, payload: bytes, target_service_no: int, *, from_service: int = 0
+        self,
+        flag: str,
+        payload: bytes,
+        target_service_no: int,
+        *,
+        from_service: int = 0,
+        hops: int = 0,
     ) -> None:
         self.routed.append((flag, payload, target_service_no, from_service))
 

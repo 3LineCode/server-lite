@@ -77,27 +77,30 @@ class TransactionJournal:
     auto-save marking is postponed until the unit ends, otherwise the 5 s
     background flush (which runs without this journal in its context) would
     autocommit them mid-transaction and survive a later rollback.
+
+    F-182: both are ``dict[int, saver]`` keyed by ``id(saver)`` -- insertion
+    ordered, O(1) membership and removal.  The original lists did an ``in``
+    identity scan per note (O(n) each, O(n**2) across a large unit) and
+    ``list.remove`` walks the bucket again; DataSaver defines no ``__eq__``,
+    so identity via ``id()`` is the same semantics without the scans.
     """
 
-    flushed: list[Any] = field(default_factory=list)
-    deferred: list[Any] = field(default_factory=list)
+    flushed: dict[int, Any] = field(default_factory=dict)
+    deferred: dict[int, Any] = field(default_factory=dict)
 
     def note_flush(self, saver: Any) -> None:
-        if saver not in self.flushed:  # identity semantics: DataSaver has no __eq__
-            self.flushed.append(saver)
+        self.flushed.setdefault(id(saver), saver)
         # F-63: an explicit flush() inside the unit supersedes an earlier
         # deferral -- the row is part of the unit now, and a rollback re-marks
         # it through ``flushed``.  The saver clears its own journal hold.
-        if saver in self.deferred:
-            self.deferred.remove(saver)
+        self.deferred.pop(id(saver), None)
 
     def note_deferred(self, saver: Any) -> None:
-        if saver not in self.deferred:
-            self.deferred.append(saver)
+        self.deferred.setdefault(id(saver), saver)
 
     def remark_rolled_back(self) -> None:
         while self.flushed:
-            saver = self.flushed.pop()
+            _id, saver = self.flushed.popitem()
             try:
                 saver.remark_dirty_after_rollback()
             except Exception:
@@ -109,7 +112,7 @@ class TransactionJournal:
         deferred savers.  Deferred rows were never written inside the unit, so
         their in-memory data must be persisted outside it either way."""
         while self.deferred:
-            saver = self.deferred.pop()
+            _id, saver = self.deferred.popitem()
             try:
                 saver.requeue_deferred()
             except Exception:

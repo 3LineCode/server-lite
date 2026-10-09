@@ -1,5 +1,106 @@
 # Changelog
 
+## v1.0.0-rc.2: tenth pass (F-165..F-189) -- every open finding of the repo assessment closed, transport security added
+
+Every risk and deficiency named by the full evaluation (two deep code
+reviews plus the horizontal audit), each with a regression test in
+`tests/test_review_pass10.py`; ruff format+check, mypy --strict (src) and
+mypy on tests clean.
+
+### Transport security (the trust-model gap)
+- F-187: TLS on the client listener (`socket.tls`): server certificate,
+  fail-fast context construction (`net/tls.py`), HMAC handshake unchanged
+  inside the tunnel.
+- F-188: TLS on the proxy plane (`socket.proxy_tls`), mutual mode via
+  `require_client_cert` + `ca_file` (each machine's cert is its identity);
+  dial paths verify the server certificate against `ca_file` always --
+  encrypt-without-verify is refused at construction.
+- F-189: CURVE + ZAP on the ZMQ bus (`zeromq.curve`): ROUTER is a CURVE
+  server, DEALERs dial with derived-or-pinned public keys, and a ZAP
+  responder allowlists client public keys -- a keypair the allowlist never
+  named cannot place frames on the bus even though CURVE itself accepts
+  unknown keys. The HMAC handshake still runs inside the tunnel.
+
+### Data safety
+- F-165: tracked containers wrap INSERTED values. `td["a"] = {"x": 1}`
+  followed by `td["a"]["x"] = 2` now marks the owner dirty -- only the
+  set_data/load path wrapped before, so every later insert of a plain
+  container re-opened the silent-data-loss hole the containers exist to
+  close (tracked.py `bind_tracking`, shared with orm).
+- F-166: hot reload refreshes FUNCTION-valued closure cells owned by the
+  reloaded module. A decorated function (`functools.wraps`-style wrapper)
+  kept executing the OLD inner after the swap -- the edit silently did
+  nothing, exactly the caller-breakage class the validator exists to
+  prevent. State cells (counters, configs) still keep the old value, and
+  rollback now snapshots cell-held inners too.
+- F-180: `rpc_tx_execute`/`rpc_tx_query` re-check session liveness UNDER
+  the per-session lock. The lookup used to run outside it, so a commit/reap
+  that popped the record while a statement waited on the lock executed SQL
+  on a session that commit had already closed.
+- F-185: encoded blobs over the MEDIUMBLOB limit (2^24-1) are refused at
+  encode time with a message naming the saver and size, before they can
+  poison a coalesced group or die inside MySQL/RPC framing.
+- F-186: dirty marks landing inside the shutdown drain are QUEUED and
+  flushed (never-drop), with a rate-limited warning -- they used to raise
+  OSError out of a plain container mutation AND lose the data (the
+  assignment had already landed in memory). `flush_all` now checks its
+  deadline on the success path too, so late arrivals cannot extend the
+  drain unboundedly.
+
+### Bus / network
+- F-169: the DEALER completes its handshake on the ROUTER's explicit AUTH3
+  confirmation instead of its own optimistic AUTH2 send; auth control
+  frames bypass the per-destination queue bounds (forced enqueue) so a
+  saturated data queue cannot starve the handshake.
+- F-170: `ZmqBus.close()` is idempotent (the second call used to re-term
+  the context); auth tables are cleared on close.
+- F-171: every peer-triggerable warning (unauthenticated bus frames,
+  unknown flags/subs, destination-table overflow, queue drops, auth
+  rejects, unroutable sends, pre-IDENT frames) goes through a windowed
+  rate limiter (`log/ratelimit.py`) that reports what it suppressed --
+  log-flood as a DoS vector is closed.
+- F-172: the proxy hop bound is enforced on EVERY send path
+  (ProxyServer.forward, ProxyClient.send_to_service), not only the receive
+  side -- a loop through mixed paths held only by topology accident.
+- F-173: the indirect relay pick is deterministic (lowest proxy number),
+  counted (`indirect_sends`), and logged -- `next(iter(...))` chose an
+  arbitrary proxy whose far-side drop was the common path in multi-proxy
+  deployments.
+- F-174: proxy frames arriving before IDENT (or on a refused connection)
+  are counted and logged instead of vanishing into a `lambda: None`.
+- F-175: the TCP dial is bounded by `socket.connect_timeout` (default
+  10 s); a dropped SYN used to park the connect on the OS timeout and the
+  proxy maintainer's backoff ladder never ran.
+- F-176: RPC results are serialized once -- the serializability probe
+  used to be packed again in `_send`, doubling CPU and peak memory on
+  large results.
+- F-177: a RESULT/CANCEL send whose route leg raises (closed proxy link)
+  is contained and counted (`result_send_failures`) instead of killing the
+  `_execute` task after the work already succeeded.
+- F-178: `Connection.close()` waits on a queue-drained event instead of a
+  10 ms busy-poll (up to 200 wakeup loops per close).
+- F-179: plain-network overflow drops surface through an optional
+  `set_overflow_hook(sub, total)` so a network can signal its peer instead
+  of a silent drop; drops stay counted and rate-limited-logged.
+
+### Performance / hygiene
+- F-181: auto-save batch selection is one ordered pass (was O(batch x
+  queue) re-scans per pick; during a long outage every round paid the full
+  scan per selected saver).
+- F-182: `TransactionJournal` tracks savers in id-keyed dicts (was O(n)
+  identity scans + O(n) list.remove per note); `_record_outcome` no longer
+  rebuilds the whole outcome table per finished transaction.
+- F-183: scheduler wheel buckets are seq-keyed dicts -- mass cancel was
+  O(entries^2) through `list.remove` on same-second deadline buckets.
+- F-184: module-level Prometheus counters come from
+  `obs.metrics.shared_counter` (get-or-create) -- re-importing a consumer
+  module can no longer die on "Duplicated timeseries".
+- F-167: hot-reload attribute swaps/diffs/rollback no longer suppress
+  failures silently -- every refused setattr/delattr is logged.
+- F-168: a reload that changes a module-level plain value now logs that
+  the LIVE value was kept ("edited the constant, reloaded, old value still
+  active" turns from a support ticket into a log lookup).
+
 ## v1.0.0-rc.2: ninth review pass (F-155..F-164) -- full-repo assessment round 4
 
 Every finding of a full-repo assessment (core/net/db/reload/devtools/tests/

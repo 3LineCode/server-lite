@@ -61,6 +61,14 @@ set_data/load, the inbound RPC task pool is bounded, a sub-process death
 escalates to a main-runtime shutdown even when the callback fails, the
 Windows fd ceiling and the production inter_token separation are enforced
 at boot, and the hot-reload validator compares default POSITIONS, not
-counts. See `docs/plan.md` (master plan), `docs/hot-reload.md` (reload
-contract and known limits) and `docs/deployment.md` (trust model and
-platform limits before going public).
+counts. The tenth pass (F-165..F-189) closed every remaining finding of
+the repo evaluation and added the transport-security layer the trust model
+was missing: TLS on the client listener and the proxy plane (mutual mode
+for server-to-server links) and CURVE+ZAP on the ZMQ bus, plus
+inserted-value tracking in the ORM containers, closure-aware hot reload
+for decorated functions, ROUTER-confirmed bus authentication, bounded
+dials, rate-limited hostile-traffic logging, and the data-layer
+race/performance fixes. See `docs/plan.md` (master plan),
+`docs/hot-reload.md` (reload contract and known limits) and
+`docs/deployment.md` (trust model and platform limits before going
+public).

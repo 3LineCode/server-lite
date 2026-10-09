@@ -130,6 +130,9 @@ class RpcManager(Network):
         # F-78: msgpack can also raise RecursionError (deeply nested payload)
         # -- counted, not just logged.
         self.malformed_messages = 0
+        # F-177: replies whose route() leg raised (closed proxy link, no
+        # proxy) -- counted instead of killing the _execute task.
+        self.result_send_failures = 0
         # F-159: bound on inbound CALL tasks (running + queued). The F-19
         # semaphore bounds EXECUTION, but every CALL used to still spawn a
         # task that could park up to ``inflight_wait`` in _acquire_slot --
@@ -476,10 +479,14 @@ class RpcManager(Network):
                     logger.warning("rpc %r raised on execution", func_path, exc_info=True)
                     return
                 if call_id:
-                    # F-14: an unserializable result must reach the caller as an
-                    # error, not as a silent swallow followed by a fake timeout.
+                    # F-14/F-176: an unserializable result must reach the
+                    # caller as an error, not as a silent swallow followed by
+                    # a fake timeout. The pack IS the send's pack -- _send
+                    # accepts pre-packed bytes, so a 16 MiB result is no
+                    # longer serialized twice (the probe-then-send used to
+                    # double both CPU and peak memory on large results).
                     try:
-                        msgpack.packb(result, use_bin_type=True)
+                        payload = msgpack.packb([MSG_RESULT, call_id, 1, result], use_bin_type=True)
                     except (TypeError, ValueError) as exc:
                         logger.error("rpc %r result not serializable: %s", func_path, exc)
                         self._send(
@@ -487,7 +494,7 @@ class RpcManager(Network):
                             [MSG_RESULT, call_id, 0, f"result not serializable: {exc}"],
                         )
                         return
-                    self._send(from_service, [MSG_RESULT, call_id, 1, result])
+                    self._send_packed(from_service, payload)
             finally:
                 self._inflight.release()
         finally:
@@ -551,12 +558,37 @@ class RpcManager(Network):
     # ------------------------------------------------------------------ #
 
     def _send(self, target: int, message: list[Any]) -> None:
+        """Best-effort send of one rpc control/result message.
+
+        F-177: transport failures are contained here. ``_send`` carries
+        RESULT/CANCEL/BUSY replies and notify calls -- none of them have a
+        caller awaiting *this* send (the RESULT's caller is remote and will
+        time out on its own), yet the route() leg can still raise (a closed
+        proxy link's ConnectionClosedError, NoProxyAvailableError). The
+        exception used to escape through _execute, killing its task after
+        the work had already succeeded -- leaving nothing but an
+        "_inbound_done" error line. Log, count, and return: the caller's
+        timeout is the documented signal for a lost reply.
+        """
         try:
             payload = msgpack.packb(message, use_bin_type=True)
         except (TypeError, ValueError) as exc:
             logger.error("rpc message not serializable: %s", exc)
             return
-        self._sender.route(RPC_FLAG, payload, target)
+        self._send_packed(target, payload)
+
+    def _send_packed(self, target: int, payload: bytes) -> None:
+        """F-176/F-177: send pre-packed bytes with contained transport errors."""
+        try:
+            self._sender.route(RPC_FLAG, payload, target)
+        except Exception:
+            self.result_send_failures += 1
+            logger.warning(
+                "rpc reply to service %d could not be sent; the caller will time out (failures=%d)",
+                target,
+                self.result_send_failures,
+                exc_info=True,
+            )
 
     def pending_count(self) -> int:
         return len(self._pending)

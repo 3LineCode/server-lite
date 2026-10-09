@@ -33,12 +33,11 @@ import hashlib
 import hmac
 import logging
 import secrets
+import ssl
 import sys
 import time
 from collections import deque
 from collections.abc import Callable
-
-from prometheus_client import Counter
 
 from pyline.config.errors import ConfigError
 from pyline.net.protocol import (
@@ -49,7 +48,7 @@ from pyline.net.protocol import (
     ProtocolError,
     encode_message,
 )
-from pyline.obs.metrics import get_metrics
+from pyline.obs.metrics import get_metrics, shared_counter
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +73,10 @@ MessageCallback = Callable[[str, bytes], None]
 DISPATCH_ERROR_LIMIT = 10
 DISPATCH_ERROR_WINDOW = 1.0
 
-# F-72: connection attempts refused by the accept-path caps. Declared here
-# rather than obs.metrics because this module must stay independently
-# importable; the pyline_* namespace is shared.
-_CONNECTIONS_REJECTED = Counter(
+# F-72: connection attempts refused by the accept-path caps. Created through
+# obs.metrics.shared_counter (F-184) so a re-import of this module cannot
+# collide with the process-global registry; the pyline_* namespace is shared.
+_CONNECTIONS_REJECTED = shared_counter(
     "pyline_connections_rejected_total",
     "Incoming connections refused by the global/per-IP accept caps",
     ("reason",),
@@ -177,6 +176,13 @@ class Connection:
         # Incremented on enqueue, decremented once the write loop handed the
         # frames to the transport (after drain returns).
         self._queued_bytes = 0
+        # F-178: set whenever the send queue holds nothing, cleared by every
+        # successful enqueue -- close() waits on it instead of the old 10 ms
+        # busy-poll (up to 200 loop wakeups per close for a queue that was
+        # already empty). The write loop re-sets it after each dequeue when
+        # the queue has drained.
+        self._queue_drained = asyncio.Event()
+        self._queue_drained.set()
         self._close_hooks: list[Callable[[Connection], None]] = []
         self._last_recv = time.monotonic()
         self._tasks: list[asyncio.Task[None]] = []
@@ -406,6 +412,11 @@ class Connection:
                 # peer that stopped reading, which is exactly the case the
                 # byte cap exists for.
                 self._queued_bytes -= sum(len(chunk) for chunk in frames)
+                # F-178: everything dequeued -- wake any close() waiting on
+                # the drain (the transport itself is flushed by
+                # StreamWriter.close() below).
+                if self._send_queue.empty():
+                    self._queue_drained.set()
         except asyncio.CancelledError:
             raise
         except ConnectionError:
@@ -486,6 +497,7 @@ class Connection:
             self._spawn_close("send queue overflow")
             raise ConnectionClosedError(f"send queue full for {self}; closing") from None
         self._queued_bytes += frame_bytes
+        self._queue_drained.clear()  # F-178: something to drain again
 
     # ------------------------------------------------------------------ #
     # Closing
@@ -512,9 +524,12 @@ class Connection:
         self._metrics.connections.dec()
         self.close_reason = reason
         if flush_timeout > 0 and not self._write_failed:
-            deadline = time.monotonic() + flush_timeout
-            while self._send_queue.qsize() and time.monotonic() < deadline:
-                await asyncio.sleep(0.01)
+            # F-178: event-driven drain wait (was a 10 ms poll loop). The
+            # event is set by the write loop once the queue is empty and by
+            # nothing else, so a closed/dead writer cannot stall close()
+            # past the bound: ``wait_for`` enforces it either way.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._queue_drained.wait(), timeout=flush_timeout)
         self.closed = True
         self._closed_event.set()
         try:
@@ -545,6 +560,8 @@ async def open_connection(
     *,
     token: str,
     on_message: MessageCallback,
+    connect_timeout: float = 10.0,
+    ssl_context: ssl.SSLContext | None = None,
     **kwargs: object,
 ) -> Connection:
     """Dial a server and return a started, VERIFIED client-side Connection.
@@ -552,8 +569,22 @@ async def open_connection(
     Blocks until the challenge-response handshake completes (or fails: a
     wrong token closes the link and surfaces as ConnectionClosedError), so
     callers may send immediately -- with the challenge-response flow the
-    first caller frame must not race the @challenge -> @auth exchange."""
-    reader, writer = await asyncio.open_connection(host, port)
+    first caller frame must not race the @challenge -> @auth exchange.
+
+    F-175: the TCP dial itself is bounded by ``connect_timeout``. A dropped
+    SYN used to park ``asyncio.open_connection`` on the OS timeout (roughly
+    21 s on Windows, ~2 min on Linux) -- the proxy maintainer's backoff
+    ladder never ran, and reconnect cadence was owned by the kernel. The
+    timeout raises TimeoutError, which the maintainer's except-all already
+    treats as a link error.
+
+    F-188: ``ssl_context`` (from :func:`pyline.net.tls.build_client_context`)
+    wraps the dial in TLS; the HMAC handshake then runs inside the tunnel,
+    unchanged.
+    """
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(host, port, ssl=ssl_context), timeout=connect_timeout
+    )
     conn = Connection(
         reader,
         writer,
@@ -614,6 +645,7 @@ async def serve(
     on_connected: Callable[[Connection], None],
     max_connections: int = DEFAULT_MAX_CONNECTIONS,
     max_connections_per_ip: int = DEFAULT_MAX_CONNECTIONS_PER_IP,
+    ssl_context: ssl.SSLContext | None = None,
     **kwargs: object,
 ) -> asyncio.AbstractServer:
     """Listen for verified connections; ``on_connected`` fires post-handshake.
@@ -621,7 +653,11 @@ async def serve(
     F-72: connections beyond ``max_connections`` (global) or
     ``max_connections_per_ip`` (same peer IP) are refused at accept time and
     counted in ``pyline_connections_rejected_total{reason}``. The defaults
-    mirror SocketSettings; the runtime forwards the configured values."""
+    mirror SocketSettings; the runtime forwards the configured values.
+
+    F-187/F-188: ``ssl_context`` (from
+    :func:`pyline.net.tls.build_server_context`) wraps the listener in TLS;
+    the challenge-response handshake runs inside the tunnel, unchanged."""
 
     # F-161: fail at bind time on Windows instead of crashing the selector
     # loop under load (both listeners -- client and proxy -- go through
@@ -668,7 +704,7 @@ async def serve(
         conn.add_close_hook(release_slot)
         await conn.start()
 
-    return await asyncio.start_server(handle, host, port)
+    return await asyncio.start_server(handle, host, port, ssl=ssl_context)
 
 
 async def close_server(server: asyncio.AbstractServer, *, timeout: float = 5.0) -> None:

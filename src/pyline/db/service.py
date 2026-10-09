@@ -173,6 +173,7 @@ class DatabaseService:
         while True:
             await asyncio.sleep(interval)
             self._reap_expired()
+            self._prune_outcomes()  # F-182: bound the outcome table without status rpcs
 
     def expose(self, rpc: RpcManager) -> None:
         rpc.register(RPC_QUERY, self.rpc_query)
@@ -242,6 +243,16 @@ class DatabaseService:
         record = self._live_tx(tx_id)
         record.touch()
         async with record.lock:
+            # F-180: the lookup above ran OUTSIDE the lock.  commit/rollback/
+            # TTL-reap pop the record and then take this same lock -- if one
+            # of them won the pop while we waited here, executing now would
+            # run a statement on a session that commit already closed (or a
+            # rollback is about to).  The dict-membership re-check under the
+            # lock closes that window: popped means finished, answer Gone.
+            if self._tx.get(tx_id) is not record:
+                raise TransactionGoneError(
+                    f"transaction {tx_id} finished while the statement waited; retry"
+                )
             return await record.session.execute(sql, tuple(args))
 
     async def rpc_tx_query(self, tx_id: str, sql: str, args: list[Any]) -> list[list[Any]]:
@@ -249,6 +260,10 @@ class DatabaseService:
         record = self._live_tx(tx_id)
         record.touch()
         async with record.lock:
+            if self._tx.get(tx_id) is not record:  # F-180: see rpc_tx_execute
+                raise TransactionGoneError(
+                    f"transaction {tx_id} finished while the query waited; retry"
+                )
             rows = await record.session.query(sql, tuple(args))
         return [list(row) for row in rows]
 
@@ -301,11 +316,14 @@ class DatabaseService:
         return "unknown"
 
     def _record_outcome(self, tx_id: str, outcome: str) -> None:
-        now = time.monotonic()
-        self._outcomes = {
-            tx: (o, ts) for tx, (o, ts) in self._outcomes.items() if now - ts <= self._outcome_ttl
-        }
-        self._outcomes[tx_id] = (outcome, now)
+        # F-182 companion: a plain assignment plus a size-triggered prune.
+        # The old version rebuilt the whole dict (TTL filter) on EVERY record
+        # -- O(n) per finished transaction and O(n**2) across a burst of
+        # commits; pruning only past a size threshold keeps recording O(1)
+        # amortized while the table stays bounded.
+        self._outcomes[tx_id] = (outcome, time.monotonic())
+        if len(self._outcomes) > 512:
+            self._prune_outcomes()
 
     def _prune_outcomes(self) -> None:
         now = time.monotonic()

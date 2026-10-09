@@ -425,18 +425,23 @@ class TestJournalRequeueDuringShutdownDrain:
         assert scheduler.queue_depth() == 1
         assert await scheduler.flush_all(timeout=1.0) is True
 
-    async def test_mark_still_refuses_after_quit_but_requeue_does_not(self) -> None:
-        """The loud guard on NEW business mutations stays: only the framework
-        recovery paths may bypass it."""
+    async def test_late_mark_during_drain_is_queued_and_drained(self) -> None:
+        """F-186: a NEW business mutation landing inside the shutdown drain
+        is queued (never-drop: the data is already in memory -- refusing the
+        mark meant losing it silently while raising OSError out of a plain
+        container mutation) and the drain flushes it; ``requeue`` (framework
+        recovery paths) queues quietly without the late-mark warning."""
         access, _pool = local_access()
         scheduler = SaveScheduler(interval=60.0)
         saver = DataSaver(access, make_schema(), "tbl_player", "data", 1, scheduler=scheduler)
         saver.set_data({"gold": 100})
         scheduler._quitting = True
-        with pytest.raises(OSError, match="quitting"):
-            saver.mark_dirty()
-        scheduler.requeue(saver)
+        saver.mark_dirty()  # no OSError: the mutation must not be dropped
         assert scheduler.queue_depth() == 1
+        assert scheduler._late_marks == 1
+        scheduler.requeue(saver)  # idempotent queueing, no warning bump
+        assert scheduler.queue_depth() == 1
+        assert await scheduler.flush_all(timeout=1.0) is True
 
 
 class TestTxStatusF61:

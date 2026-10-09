@@ -24,6 +24,7 @@ from typing import Any, ClassVar, cast
 
 import msgpack
 
+from pyline.log.ratelimit import WindowLogLimiter
 from pyline.net.gateway import ProtocolGateway
 from pyline.net.protocol import decode_payload
 from pyline.obs.metrics import get_metrics
@@ -67,12 +68,33 @@ class Network:
         self._overflowed = 0
         self._max_inflight = self.DEFAULT_MAX_INFLIGHT if max_inflight is None else max_inflight
         self._metrics = get_metrics()
+        # F-171: peer-triggerable noise (bad payloads, unknown subs) is
+        # rate-limited; F-179: overflow drops additionally surface through
+        # the optional on_overflow hook so a network can signal its peer
+        # (close, busy frame) instead of a silent drop.
+        self._noise_log = WindowLogLimiter()
+        self._overflow_log = WindowLogLimiter()
+        self._on_overflow: Callable[[int, int], None] | None = None
         # F-20: strong references to in-flight handler tasks. A bare
         # ``create_task`` result can be garbage-collected mid-run (a known
         # CPython pitfall) and its exception is then never observed; the set
         # plus done callback mirrors scheduler.py's ``_async_tasks`` pattern.
         self._inbound: set[asyncio.Task[None]] = set()
         gateway.register(self)
+
+    def set_overflow_hook(self, hook: Callable[[int, int], None] | None) -> None:
+        """F-179: observe every overflow drop with ``(sub, dropped_total)``.
+
+        The RPC face answers a refused CALL with BUSY (rpc.py); a plain
+        network used to drop-and-count silently -- for a request/response
+        sub-protocol that is indistinguishable from a lost reply until the
+        caller's own timeout fires. The hook lets the network decide the
+        signal: close the connection, reply an application-level busy frame,
+        or just alarm. Never called from the dispatch path's own stack in a
+        way that can block -- it runs inline where the drop decision is
+        made.
+        """
+        self._on_overflow = hook
 
     @property
     def gateway(self) -> ProtocolGateway:
@@ -109,30 +131,48 @@ class Network:
             # not a ValueError, so one such payload used to escape this
             # handler and tear down the dispatch path.
             self._unknown_subs += 1
-            logger.warning("bad payload for flag %r (total=%d)", flag, self._unknown_subs)
+            if self._noise_log.allow():
+                logger.warning(
+                    "bad payload for flag %r (total=%d, suppressed=%d)",
+                    flag,
+                    self._unknown_subs,
+                    self._noise_log.take_suppressed(),
+                )
             return
         handler = self._handlers.get(sub)
         if handler is None:
             self._unknown_subs += 1
-            logger.warning(
-                "%s: unregistered sub-protocol %d (total=%d)",
-                type(self).__qualname__,
-                sub,
-                self._unknown_subs,
-            )
+            if self._noise_log.allow():
+                logger.warning(
+                    "%s: unregistered sub-protocol %d (total=%d, suppressed=%d)",
+                    type(self).__qualname__,
+                    sub,
+                    self._unknown_subs,
+                    self._noise_log.take_suppressed(),
+                )
             return
         if len(self._inbound) >= self._max_inflight:
             # Drop-and-count, mirroring the ZMQ destination overflow (F-24):
             # never block the read loop (see DEFAULT_MAX_INFLIGHT).
             self._overflowed += 1
             self._metrics.handler_overflow.inc()
-            logger.warning(
-                "%s: handler concurrency cap reached (%d); dropped sub %d (dropped total=%d)",
-                type(self).__qualname__,
-                self._max_inflight,
-                sub,
-                self._overflowed,
-            )
+            if self._overflow_log.allow():
+                logger.warning(
+                    "%s: handler concurrency cap reached (%d); dropped sub %d "
+                    "(dropped total=%d, suppressed=%d)",
+                    type(self).__qualname__,
+                    self._max_inflight,
+                    sub,
+                    self._overflowed,
+                    self._overflow_log.take_suppressed(),
+                )
+            # F-179: give the network a chance to signal its peer.
+            hook = self._on_overflow
+            if hook is not None:
+                try:
+                    hook(sub, self._overflowed)
+                except Exception:
+                    logger.exception("overflow hook failed for %s", type(self).__qualname__)
             return
         task = asyncio.get_running_loop().create_task(self._run_handler(handler, sub, args))
         self._inbound.add(task)

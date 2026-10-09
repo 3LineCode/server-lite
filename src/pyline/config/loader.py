@@ -87,6 +87,25 @@ def load_project_settings(config_dir: Path) -> ProjectSettings:
                 )
             }
         )
+    # F-187/F-188: TLS material paths follow the same project-root convention
+    # as migrations_dir -- resolve once so every process (and the fail-fast
+    # existence checks in net.tls) agrees regardless of working directory.
+    for section in ("tls", "proxy_tls"):
+        tls = getattr(settings.socket, section)
+        if tls is not None:
+            updates: dict[str, str] = {}
+            for field in ("cert_file", "key_file", "ca_file"):
+                value = getattr(tls, field)
+                if value is not None and not Path(value).is_absolute():
+                    updates[field] = str((config_dir.parent / value).resolve())
+            if updates:
+                settings = settings.model_copy(
+                    update={
+                        "socket": settings.socket.model_copy(
+                            update={section: tls.model_copy(update=updates)}
+                        )
+                    }
+                )
     return settings
 
 

@@ -302,7 +302,7 @@ class TestCoalescedJournalFlushF158:
         # After the unit ends the saver must still be pickable: mark dirty
         # again and confirm the scheduler's due-selection finds it.
         s1.mark_dirty()
-        assert sched._next_due(time.monotonic()) is s1
+        assert [s for s, _f in sched._pick_batch(time.monotonic())] == [s1]
 
 
 # --------------------------------------------------------------------------- #

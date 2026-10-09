@@ -386,7 +386,7 @@ class TestExplicitFlushDequeuesF151:
         saver = DataSaver(db, make_schema(), "tbl_player", "data", 1, scheduler=scheduler)
         saver.set_data({"gold": 1})
         scheduler._inflight.add(saver)  # a flush is running on it
-        assert scheduler._next_due(time.monotonic() + 999) is None
+        assert scheduler._pick_batch(time.monotonic() + 999) == []
 
 
 # --------------------------------------------------------------------------- #

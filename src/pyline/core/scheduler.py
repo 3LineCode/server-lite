@@ -82,7 +82,12 @@ class TimerHandle:
 class Scheduler:
     def __init__(self, *, loop: asyncio.AbstractEventLoop | None = None) -> None:
         self._loop = loop
-        self._wheel: dict[int, list[_WheelEntry]] = {}
+        # F-183: buckets are ``{seq: entry}`` dicts, not lists.  A bucket can
+        # hold thousands of same-second deadlines; ``list.remove(entry)``
+        # walked it linearly per cancel, so a mass-cancel (a shutdown timer
+        # sweep, a cancelled broadcast wave) was O(entries**2) across the
+        # bucket.  Dict pop is O(1) and still iterates in insertion order.
+        self._wheel: dict[int, dict[int, _WheelEntry]] = {}
         self._entries: dict[int, _WheelEntry] = {}
         self._seq = itertools.count(1)
         self._tick_task: asyncio.Task[None] | None = None
@@ -278,15 +283,15 @@ class Scheduler:
             args=args,
             label=label,
         )
-        self._wheel.setdefault(bucket, []).append(entry)
+        self._wheel.setdefault(bucket, {})[entry.seq] = entry
         self._entries[entry.seq] = entry
         return TimerHandle(lambda: self._remove(entry), deadline)
 
     def _remove(self, entry: _WheelEntry) -> None:
         if self._entries.pop(entry.seq, None) is not None:
             entries = self._wheel.get(entry.bucket)
-            if entries and entry in entries:
-                entries.remove(entry)
+            if entries is not None:
+                entries.pop(entry.seq, None)
                 if not entries:
                     self._wheel.pop(entry.bucket, None)
 
@@ -297,8 +302,8 @@ class Scheduler:
         while not self._closed:
             now_bucket = math.floor(time.monotonic() / _TICK)
             for bucket in [b for b in self._wheel if b <= now_bucket]:
-                entries = self._wheel.pop(bucket, [])
-                for entry in entries:
+                entries = self._wheel.pop(bucket, {})
+                for entry in entries.values():
                     self._entries.pop(entry.seq, None)
                     self._fire(entry.func, entry.args, entry.label)
             # Sampled here rather than on every schedule/cancel: the tick runs

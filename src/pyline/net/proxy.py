@@ -23,16 +23,19 @@ import asyncio
 import contextlib
 import itertools
 import logging
+import ssl
 from typing import cast
 
 import msgpack
 
 import pyline.net.connection as conn_mod
 from pyline.core.context import Context
+from pyline.log.ratelimit import WindowLogLimiter
 from pyline.net.auth import inter_token as _inter_token_impl
 from pyline.net.ipc import main_service_no, service_no_bytes
 from pyline.net.protocol import decode_payload
 from pyline.net.router import MessageRouter, NoProxyAvailableError
+from pyline.net.tls import build_client_context, build_server_context
 from pyline.obs.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
@@ -125,6 +128,13 @@ class ProxyServer(_CloseSpawner):
         self._server: asyncio.AbstractServer | None = None
         # F-78: malformed @fwd payloads (bad shape or adversarial nesting).
         self.malformed_fwd = 0
+        # F-172: envelopes dropped by the send-side hop bound.
+        self._hop_drops = 0
+        # F-174: frames that arrived before this connection sent IDENT (or
+        # from a connection whose IDENT was refused) -- silently swallowed
+        # by a ``lambda: None`` before, invisible to both ends.
+        self.pre_ident_frames = 0
+        self._pre_ident_log = WindowLogLimiter()
         self._metrics = get_metrics()
 
     def _inter_token(self) -> str:
@@ -133,6 +143,9 @@ class ProxyServer(_CloseSpawner):
     async def start(self) -> None:
         entry = self._ctx.entry
         s = self._ctx.settings.socket
+        # F-188: mutual TLS on the proxy plane -- the server side of each
+        # machine's proxy listener.
+        ssl_context = build_server_context(s.proxy_tls) if s.proxy_tls is not None else None
         self._server = await conn_mod.serve(
             entry.bind_host(),
             entry.process_port(process_index=0),
@@ -145,10 +158,34 @@ class ProxyServer(_CloseSpawner):
             preauth_max_frame=s.preauth_max_frame,
             max_connections=s.max_connections,
             max_connections_per_ip=s.max_connections_per_ip,
-            on_message=lambda flag, payload: None,
+            ssl_context=ssl_context,
+            on_message=self._on_pre_ident_frame,
             on_connected=self._on_connected,
         )
-        logger.info("proxy server listening on %s:%d", entry.bind_host(), entry.process_port(0))
+        logger.info(
+            "proxy server listening on %s:%d (tls=%s)",
+            entry.bind_host(),
+            entry.process_port(0),
+            "on" if ssl_context is not None else "off",
+        )
+
+    def _on_pre_ident_frame(self, flag: str, payload: bytes) -> None:
+        """F-174: placeholder handler until ``_on_connected`` installs the
+        real one post-handshake.
+
+        Frames can only land here when the connection was closed for an
+        unconfigured IP before its handler swap (or the swap failed) -- the
+        old ``lambda: None`` swallowed them with no trace, so "message sent
+        before IDENT" was undebuggable from the proxy side. Count and log
+        (rate-limited: the frames are peer-triggerable)."""
+        self.pre_ident_frames += 1
+        if self._pre_ident_log.allow():
+            logger.warning(
+                "proxy frame %r arrived before IDENT/handler install (total=%d, suppressed=%d)",
+                flag,
+                self.pre_ident_frames,
+                self._pre_ident_log.take_suppressed(),
+            )
 
     def _on_connected(self, connection: conn_mod.Connection) -> None:
         peer_ip = connection.peer[0]
@@ -274,7 +311,23 @@ class ProxyServer(_CloseSpawner):
 
         ``hops`` is the number of proxy hops the message has already
         traversed; the outbound envelope carries ``hops + 1`` so MAX_HOPS
-        still bounds loops that bounce through the router."""
+        still bounds loops that bounce through the router.
+
+        F-172: the hop bound is checked HERE too. The check used to exist
+        only on the ProxyServer receive path -- a loop that re-entered the
+        router (route -> forward) kept incrementing the counter on send
+        while no receive side ever validated it, so the bound held by
+        topology accident; two proxies forwarding to each other through
+        mixed paths could pass an arbitrarily stamped envelope."""
+        if hops >= MAX_HOPS:
+            self._hop_drops += 1
+            logger.error(
+                "@fwd exceeded max hops (%d) at send; dropping message to %d (total=%d)",
+                hops,
+                target,
+                self._hop_drops,
+            )
+            return False
         node = self._nodes.get(main_service_no(target))
         if node is None:
             return False
@@ -301,11 +354,19 @@ class ProxyClient(_CloseSpawner):
         self._proxies: dict[int, conn_mod.Connection] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._failed_sends = 0
+        # F-188: client TLS context for proxy dials (built in start()).
+        self._ssl_context: ssl.SSLContext | None = None
+        # F-173: sends handed to a proxy that is NOT on the target machine.
+        self.indirect_sends = 0
         self._seq = itertools.count(1)
         # F-78: malformed inbound @fwd payloads.
         self.malformed_fwd = 0
 
     async def start(self) -> None:
+        # F-188: the client side of the proxy plane's mutual TLS. Built once
+        # here (fail fast on bad material) and reused by every maintain loop.
+        tls = self._ctx.settings.socket.proxy_tls
+        self._ssl_context = build_client_context(tls) if tls is not None else None
         for proxy_no in self._ctx.registry.proxy_list():
             if proxy_no == self._ctx.server_no:
                 continue
@@ -326,6 +387,8 @@ class ProxyClient(_CloseSpawner):
                     port,
                     token=inter_token(self._ctx),
                     handshake_timeout=s.handshake_timeout,
+                    connect_timeout=s.connect_timeout,
+                    ssl_context=self._ssl_context,
                     idle_timeout=s.idle_timeout,
                     send_queue_limit=s.send_queue_limit,
                     send_queue_bytes=s.send_queue_bytes,
@@ -416,10 +479,32 @@ class ProxyClient(_CloseSpawner):
             raise NoProxyAvailableError(
                 f"no proxy connected (dropped sends so far: {self._failed_sends})"
             )
+        if hops >= MAX_HOPS:
+            # F-172: the send-side twin of ProxyServer._on_forward's bound --
+            # every onward proxy path now validates before it stamps hops+1.
+            self._failed_sends += 1
+            raise NoProxyAvailableError(f"@fwd to {target} already at max hops ({hops}); dropping")
         # Prefer a proxy located on the target machine when available.
         proxy = self._proxies.get(main_service_no(target))
         if proxy is None:
-            proxy = next(iter(self._proxies.values()))
+            # F-173: no proxy on the target machine -- relay through another
+            # proxy. ``next(iter(...))`` picked an ARBITRARY one (dict order
+            # = config order, not reachability); a proxy without a route to
+            # the target then dropped the frame with a warning on the far
+            # machine, which in multi-proxy deployments was the common path,
+            # not a fallback. The pick is now deterministic (lowest proxy
+            # number first), counted as an indirect send, and logged at
+            # debug: reaching the target then still depends on the chosen
+            # proxy's node table, but at least every send names the SAME
+            # proxy in its failure trail.
+            proxy = self._proxies[min(self._proxies)]
+            self.indirect_sends += 1
+            logger.debug(
+                "no proxy on machine %d; relaying via proxy %d (indirect=%d)",
+                main_service_no(target),
+                min(self._proxies),
+                self.indirect_sends,
+            )
         origin = self._ctx.service_no if from_service is None else from_service
         proxy.send_message(FWD_FLAG, build_forward(target, origin, flag, payload, hops + 1))
 

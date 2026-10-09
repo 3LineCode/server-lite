@@ -30,10 +30,20 @@ from pyline.db.serialization import (
     loads_migrated,
     peek_version,
 )
-from pyline.db.tracked import TrackedDict, TrackedList
+from pyline.db.tracked import bind_tracking
 from pyline.db.transaction import TransactionJournal, current_flush_journal
 
 logger = logging.getLogger(__name__)
+
+#: Hard cap on one encoded blob (F-185). Blob columns are created as
+#: MEDIUMTEXT/MEDIUMBLOB (schema.py), whose storage limit is 2**24-1 bytes,
+#: and the RPC frame budget that carries remote flushes defaults to the same
+#: 16 MiB. A blob past the cap used to fail deep inside MySQL (or the RPC
+#: frame check) with an error naming neither the saver nor the size -- and on
+#: the coalesced path it poisoned the whole group. Refuse at encode time with
+#: a message that names the row; the saver then takes the documented
+#: poison-row path (quarantined with backoff) instead of a mystery failure.
+MAX_BLOB_BYTES = 2**24 - 1
 
 
 class SaveState(Enum):
@@ -141,28 +151,13 @@ def dataclass_codec(
 
 
 def _bind_tracking(value: Any, touch: Callable[[], None]) -> Any:
-    """F-162: wrap plain dicts/lists (recursively) in tracked containers.
+    """F-162/F-165: delegate to :func:`pyline.db.tracked.bind_tracking`.
 
-    A decoded blob comes back as plain ``dict``/``list``, and nothing re-bound
-    them -- attribute writes on a model went through ``TrackableModel``, but
-    in-place container mutation stayed invisible unless the developer
-    re-wrapped every field by hand after every load; forgetting ``touch()``
-    was silent data loss. Containers that are already tracked keep their
-    existing callback (no double wrap); every other object type (models
-    included) passes through untouched -- model attribute tracking is the
-    model's own ``__setattr__``.
+    Kept as this module's name for the existing callers (set_data, the load
+    path); the implementation lives next to the containers so their mutators
+    can reuse the exact same wrapping on insert.
     """
-    if isinstance(value, TrackedDict):
-        return value
-    if isinstance(value, TrackedList):
-        return value
-    if isinstance(value, dict):
-        wrapped = {k: _bind_tracking(v, touch) for k, v in value.items()}
-        return TrackedDict(wrapped, touch=touch)
-    if isinstance(value, list):
-        wrapped_items = [_bind_tracking(v, touch) for v in value]
-        return TrackedList(wrapped_items, touch=touch)
-    return value
+    return bind_tracking(value, touch)
 
 
 class DataSaver:
@@ -371,6 +366,17 @@ class DataSaver:
                 "call load() or set_data() first"
             )
 
+    def _encode_row(self) -> bytes:
+        """Encode ``_data`` with the F-185 size cap (see MAX_BLOB_BYTES)."""
+        blob = self._codec.encode(self._data)
+        if len(blob) > MAX_BLOB_BYTES:
+            raise ValueError(
+                f"saver {self._column}[{self.key!r}] encoded to {len(blob)} bytes, "
+                f"over the {MAX_BLOB_BYTES}-byte MEDIUMBLOB limit; refusing to "
+                "flush (shrink the data or split the row)"
+            )
+        return blob
+
     async def flush(self) -> None:
         """Encode and upsert immediately.
 
@@ -385,7 +391,7 @@ class DataSaver:
             if self.state == SaveState.DELETED:
                 return
             self._require_loaded("flushed")
-            blob = self._codec.encode(self._data)
+            blob = self._encode_row()
             # F-151: generation of the data snapshot carried by this upsert.
             seq = self._dirty_seq
             await self._db.execute(self._spec.upsert_sql(self._column), (self.key, blob))
@@ -452,7 +458,7 @@ class DataSaver:
             return None
         try:
             self._require_loaded("batch-flushed")
-            return (self.key, self._codec.encode(self._data))
+            return (self.key, self._encode_row())
         except BaseException:
             self._flush_lock.release()
             raise

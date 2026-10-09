@@ -64,6 +64,19 @@ executed for checking purposes, so import-time side effects run exactly once
   `factor = 3` inside a factory does **not** re-bind cells created before the
   reload (the closure attribute is read-only on functions; layout equality
   keeps old cells self-consistent with the swapped code).
+  **Exception (F-166)**: a cell whose OLD and NEW values are both functions
+  owned by the reloaded module is refreshed in place -- the old inner
+  function object receives the new inner's code (recursively). This is what
+  makes `@functools.wraps`-style decorated functions reload correctly: the
+  wrapper's cell holds the wrapped function, and before F-166 the swap kept
+  the old inner, so editing the decorated function's body silently did
+  nothing. Functions from OTHER modules are never touched (their reload is
+  their own module's business), and non-function cells keep the documented
+  state-preservation semantics. Rollback covers cell-held inners: the
+  pre-reload snapshot recurses into closure cells.
+  A changed module-level plain VALUE additionally logs that the live value
+  was kept (F-168) -- the old behaviour was silent, which made "I edited the
+  constant and reloaded" the most surprising documented semantics.
 
 ## Allowed but sharp
 

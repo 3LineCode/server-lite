@@ -74,22 +74,36 @@ not by encryption*:
 **Safe today**: a single-operator cluster on trusted hosts (dedicated LAN,
 cloud VPC, containers with a private network). This is the design target.
 
-**Not safe today**: multi-tenant hosts, untrusted LANs, or anything
-touching the public internet. Before crossing those lines the mesh needs
-transport security:
+**Also safe (since F-187..F-189) when transport security is configured**:
+links crossing networks you do not fully control, provided the mesh
+enables the crypto layers below. Without them the older limits apply.
 
-- ZMQ plane: CURVE + ZAP (`zap_domain`, per-peer public keys) -- libzmq
-  ships both, pyzmq exposes them (the F-126 HMAC handshake already removes
-  the plaintext-token and identity-forgery exposure; CURVE adds
-  confidentiality and per-peer keys instead of one shared secret);
-- TCP planes (client listener + proxy): TLS (server certs at minimum,
-  mutual for the proxy plane). The F-123 handshake already keeps the token
-  off the wire and blocks digest replay; TLS adds confidentiality and
-  server certificates.
+- **TCP planes** (`socket.tls` for the client listener, `socket.proxy_tls`
+  for the proxy mesh): TLS with server certificates; the proxy plane
+  supports and prescribes mutual TLS (`require_client_cert: true` +
+  `ca_file` -- every machine's CA-signed certificate is its identity, so
+  only your machines complete a handshake at all). Dial sides ALWAYS
+  verify the peer certificate against `ca_file`; an encrypt-without-verify
+  configuration is refused at context construction rather than offered.
+  The HMAC handshake continues to run inside the tunnel (defense in
+  depth: TLS authenticates the machines, the token handshake authenticates
+  the process). Certificate paths resolve against the project root like
+  `mysql.migrations_dir`.
+- **ZMQ bus** (`zeromq.curve`): CURVE encryption with a ZAP handler that
+  ALLOWLISTS DEALER public keys -- a keypair your config never named
+  cannot place frames on the bus, even though CURVE itself would accept
+  any key it has not seen. Only the two secrets are configured (public
+  keys are derived at boot; `extra_client_keys` covers per-process
+  keypairs). Generate with
+  `python -c "import zmq; print(zmq.curve_keypair())"`.
+- Both layers are per-plane opt-in (absent config = the previous
+  authenticated-but-plaintext behaviour), because key/cert distribution is
+  a deployment decision, not a library default.
 
-These are deliberate non-goals of the current milestone: they change the
-config surface (key distribution) and belong to a deployment-driven pass,
-not a code-quality pass.
+**Still not recommended**: putting the DB-proxy's full-SQL RPC face on an
+untrusted network even WITH transport security -- token separation
+(F-160) plus TLS/CURVE bounds who can reach it, but the surface stays
+"everyone inside the mesh"; keep the mesh on networks you control.
 
 ## Data-safety semantics (RPO and transactions)
 

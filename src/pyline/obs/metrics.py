@@ -14,9 +14,39 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 
 logger = logging.getLogger(__name__)
+
+# F-184: cache for shared counters (see shared_counter).
+_SHARED_COUNTERS: dict[str, Counter] = {}
+
+
+def shared_counter(name: str, documentation: str, labelnames: tuple[str, ...] = ()) -> Counter:
+    """Get-or-create a Counter in the default registry (F-184).
+
+    Modules that must stay independently importable (net.connection,
+    net.ipc) used to declare module-level ``Counter(...)`` objects -- an
+    import side effect that registers into the process-global registry, so
+    re-importing the module under a fresh identity (a hot reload of a
+    consumer, a sys.path duplicate) raised "Duplicated timeseries" and took
+    the importer down.  The factory caches by metric name; the cache lives in
+    this module (stable across consumer reloads), and a registry collision
+    beyond that (this module itself reloaded) falls back to the live
+    collector instead of failing the import.
+    """
+    cached = _SHARED_COUNTERS.get(name)
+    if cached is not None:
+        return cached
+    try:
+        counter = Counter(name, documentation, labelnames)
+    except ValueError:
+        collector = REGISTRY._names_to_collectors.get(name)
+        if not isinstance(collector, Counter):
+            raise
+        counter = collector
+    _SHARED_COUNTERS[name] = counter
+    return counter
 
 
 class Metrics:

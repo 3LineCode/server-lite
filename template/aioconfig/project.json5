@@ -23,12 +23,38 @@
         "send_queue_limit": 1024,
         "handshake_timeout": 5.0,
         "idle_timeout": 60.0,
+        // Bound on the TCP dial itself (proxy links); a dropped SYN used to
+        // park the connect on the OS timeout (~21s Windows / ~2min Linux).
+        "connect_timeout": 10.0,
+        // TLS on the client listener (F-187): server certificate for game
+        // clients. Paths resolve against the project root (this dir's
+        // parent). Omit for plaintext -- the HMAC handshake still runs.
+        // "tls": {
+        //     "cert_file": "certs/server.pem",
+        //     "key_file": "certs/server.key",
+        // },
+        // TLS on the proxy plane (F-188); require_client_cert = mutual TLS:
+        // every machine's CA-signed certificate is its identity.
+        // "proxy_tls": {
+        //     "cert_file": "certs/server.pem",
+        //     "key_file": "certs/server.key",
+        //     "ca_file": "certs/ca.pem",
+        //     "require_client_cert": true,
+        // },
     },
 
     "zeromq": {
         "bind_host": "tcp://127.0.0.1:2918",
         "bind_file": "/tmp/pyline.ipc",
         "hwm": 10000,
+        // CURVE transport security (F-189): only the two secrets are
+        // configured -- public keys are derived at boot, and the ROUTER's
+        // ZAP handler allowlists the (derived) client public key. Generate
+        // keypairs with: python -c "import zmq; print(zmq.curve_keypair())"
+        // "curve": {
+        //     "server_secret": "$env:PYLINE_BUS_SERVER_SECRET",
+        //     "client_secret": "$env:PYLINE_BUS_CLIENT_SECRET",
+        // },
     },
 
     "mysql": {

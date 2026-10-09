@@ -52,11 +52,97 @@ class SocketSettings(_StrictModel):
     rpc_inflight_wait: float = Field(default=5.0, gt=0)
     handshake_timeout: float = Field(default=5.0, gt=0)
     idle_timeout: float = Field(default=60.0, gt=0)
+    # F-175: bound on the TCP dial itself (proxy links). Without it a
+    # dropped SYN parks the connect on the OS timeout (~21 s Windows,
+    # ~2 min Linux) and the proxy maintainer's backoff ladder never runs.
+    connect_timeout: float = Field(default=10.0, gt=0)
     # Global and per-peer-IP connection caps: each pending handshake costs
     # tasks plus up to max_frame_size of decode buffer; unbounded accepts are
     # a cheap FD/task exhaustion attack.
     max_connections: int = Field(default=4096, ge=1)
     max_connections_per_ip: int = Field(default=256, ge=1)
+    # TLS on the CLIENT listener (F-187): server certificate for game
+    # clients. None = plaintext (the pre-F-187 default; HMAC auth still
+    # runs, but payloads are sniffable on the path).
+    tls: TlsSettings | None = None
+    # TLS on the PROXY plane (F-188): server-to-server links. None =
+    # plaintext. Set ``require_client_cert`` for the mutual mode the
+    # deployment doc prescribes for untrusted networks (each machine's cert
+    # is its identity; only CA-signed machines connect).
+    proxy_tls: TlsSettings | None = None
+
+
+class TlsSettings(_StrictModel):
+    """TLS for one TCP plane (F-187/F-188).
+
+    One certificate per machine is the intended model: the same cert/key is
+    the server certificate on the machine's listener and the client
+    certificate when it dials peers (classic mutual-TLS mesh). ``ca_file``
+    verifies the other side -- for the proxy plane set
+    ``require_client_cert`` so only machines holding a CA-signed certificate
+    connect at all. Paths are resolved against the config dir's parent (the
+    project root) at load time, exactly like ``mysql.migrations_dir``.
+    """
+
+    cert_file: str
+    key_file: str
+    # CA bundle verifying the peer. Required for client contexts and for
+    # ``require_client_cert``; without it the client context cannot be built
+    # (verification is the entire point -- an unverified TLS client is
+    # theater).
+    ca_file: str | None = None
+    require_client_cert: bool = False
+
+
+class CurveSettings(_StrictModel):
+    """CURVE transport security for the ZMQ bus (F-189).
+
+    All processes of a server read the same config, so only the two SECRETS
+    are needed: the ROUTER's long-term secret and the DEALER's. Public keys
+    are derived at boot (``zmq.curve_public``); an explicit
+    ``server_public``/``client_public`` may pin them (validated to match the
+    derived value). Values are z85 strings (40 chars) -- generate with
+    ``python -c "import zmq; print(zmq.curve_keypair())"``. Secrets are
+    secret references ($env:/$file:), never committed plaintext.
+
+    ``extra_client_keys``: additional DEALER public keys (z85) the ROUTER's
+    ZAP handler accepts -- for deployments giving every process its own
+    keypair instead of sharing one client secret. The allowlist always
+    includes the public key derived from ``client_secret``.
+    """
+
+    server_secret: SecretStr
+    client_secret: SecretStr
+    server_public: str | None = None
+    client_public: str | None = None
+    extra_client_keys: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _check_key_shapes(self) -> CurveSettings:
+        # z85 of a 32-byte key is exactly 40 characters; catching a typo'd
+        # or truncated key here fails boot with a fix-it message instead of
+        # a libzmc "invalid key" deep inside the bus start.
+        for name, value in (
+            ("server_secret", self.server_secret.get_secret_value()),
+            ("client_secret", self.client_secret.get_secret_value()),
+        ):
+            if len(value) != 40:
+                raise ConfigError(
+                    f"zeromq.curve.{name} must be a 40-char z85 key "
+                    f"(got {len(value)} chars; generate with "
+                    '"python -c \\"import zmq; print(zmq.curve_keypair())\'")'
+                )
+        optional_keys: list[tuple[str, str | None]] = [
+            ("server_public", self.server_public),
+            ("client_public", self.client_public),
+        ]
+        for key_name, key_value in optional_keys:
+            if key_value is not None and len(key_value) != 40:
+                raise ConfigError(f"zeromq.curve.{key_name} must be a 40-char z85 key")
+        for i, key in enumerate(self.extra_client_keys):
+            if len(key) != 40:
+                raise ConfigError(f"zeromq.curve.extra_client_keys[{i}] must be a 40-char z85 key")
+        return self
 
 
 class ZeroMQSettings(_StrictModel):
@@ -84,6 +170,10 @@ class ZeroMQSettings(_StrictModel):
     # Upper bound on simultaneously tracked destinations: the ROUTER must not
     # grow an unbounded queue+writer per arbitrary target value.
     max_destinations: int = Field(default=256, ge=1)
+    # CURVE transport security (F-189): encryption + per-key authentication
+    # for the bus. None = the HMAC-handshake-only plane (authenticated but
+    # sniffable by anything on the endpoint's network path).
+    curve: CurveSettings | None = None
 
 
 class MySQLSettings(_StrictModel):

@@ -18,6 +18,7 @@ from typing import Any
 
 from pyline.db.orm import DataSaver
 from pyline.db.transaction import current_flush_journal
+from pyline.log.ratelimit import WindowLogLimiter
 from pyline.obs.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,9 @@ class SaveScheduler:
         self._task: asyncio.Task[None] | None = None
         self._quitting = False
         self._queue_alarm_active = False
+        # F-186: visibility for dirty marks accepted during the drain window.
+        self._late_marks = 0
+        self._late_mark_log = WindowLogLimiter()
         # metrics / stats
         self.saved_total = 0
         self.failed_total = 0
@@ -105,23 +109,47 @@ class SaveScheduler:
     # ------------------------------ queue ------------------------------- #
 
     def mark(self, saver: DataSaver) -> None:
+        """F-186: during the shutdown drain a late dirty mark is ACCEPTED.
+
+        The old behaviour raised OSError from ``mark`` once ``_quitting`` was
+        set -- a business ``d[k] = v`` after the drain started therefore
+        raised out of a plain container mutation AND left the new data
+        unmarked (the assignment had already landed in memory), i.e. the
+        worst of both worlds: an exception the caller cannot handle at that
+        call site and silent data loss.  The mutation already exists in
+        memory; never-drop says the drain should try to flush it: the mark is
+        queued like any other, a warning makes the late mutation visible, and
+        ``flush_all``'s deadline (now also checked on the success path)
+        bounds how long late arrivals can extend the drain.
+        """
         if self._quitting:
-            raise OSError(f"cannot mark {saver!r} dirty while quitting")
+            self._dirty.setdefault(saver, 0)
+            if self._late_mark_log.allow():
+                logger.warning(
+                    "late dirty mark for %r during shutdown drain (queued; "
+                    "late marks=%d, suppressed=%d)",
+                    saver,
+                    self._late_marks,
+                    self._late_mark_log.take_suppressed(),
+                )
+            self._late_marks += 1
+            self._sync_metrics()
+            return
         self._dirty.setdefault(saver, 0)
         self._sync_metrics()
 
     def requeue(self, saver: DataSaver) -> None:
-        """Queue a saver without the quitting guard -- framework recovery
+        """Queue a saver without the late-mark warning -- framework recovery
         paths only (journal release when a transaction ends, rollback
         re-marks).
 
-        ``mark`` deliberately refuses new dirty marks once the shutdown
-        drain has started, but a journal requeue carries data that already
-        exists in memory: dropping it let ``flush_all`` report a clean
-        drain while a saver's data was lost (the journal paths only logged
-        the OSError).  ``flush_all`` iterates ``_dirty`` until it is empty,
-        so a requeue landing inside the drain window is still flushed --
-        never-drop beats atomicity when the process is going down.
+        Since F-186 ``mark`` also accepts late arrivals during the shutdown
+        drain (never-drop beats atomicity when the process is going down, and
+        the data is already in memory either way); the two paths differ only
+        in that ``requeue`` is expected during the drain and stays quiet, so
+        routine transaction endings do not spam the late-mark warning.
+        ``flush_all`` iterates ``_dirty`` until it is empty or its deadline,
+        so a requeue landing inside the drain window is still flushed.
         """
         self._dirty.setdefault(saver, 0)
         self._sync_metrics()
@@ -190,8 +218,21 @@ class SaveScheduler:
                 logger.critical("auto-save flush round failed; savers requeued", exc_info=True)
                 self._alarm("save_loop_error", {"queue_depth": self.queue_depth()})
 
-    def _next_due(self, now: float) -> DataSaver | None:
-        for saver in self._dirty:
+    def _pick_batch(self, now: float) -> list[tuple[DataSaver, int]]:
+        """Up to ``batch_size`` flushable ``(saver, failures)`` pairs (F-181).
+
+        One pass over ``_dirty`` in queue order.  The old helper re-scanned
+        the whole queue per pick (O(batch x queue)): during a long outage the
+        queue grows without bound while every round still paid the full scan
+        per selected saver.  Semantics are identical -- the per-pick loop
+        popped each selection before the next scan, and nothing can mutate
+        the queue between picks (no await inside), so a single ordered pass
+        yields the same savers.
+        """
+        batch: list[tuple[DataSaver, int]] = []
+        for saver, failures in self._dirty.items():
+            if len(batch) >= self._batch_size:
+                break
             if saver in self._inflight:
                 # F-151: a saver re-marked while its flush is still running
                 # is NOT re-pickable -- the running flush owns its lock, so
@@ -205,20 +246,17 @@ class SaveScheduler:
                 # it queued -- the journal re-marks it when the unit ends.
                 continue
             due = self._deferred.get(saver)
-            if due is None or due <= now:
-                return saver
-        return None
+            if due is not None and due > now:
+                continue
+            batch.append((saver, failures))
+        return batch
 
     async def flush_batch(self) -> None:
-        batch: list[tuple[DataSaver, int]] = []
-        for _ in range(self._batch_size):
-            saver = self._next_due(time.monotonic())
-            if saver is None:
-                break
-            failures = self._dirty.pop(saver)
+        batch = self._pick_batch(time.monotonic())
+        for saver, _failures in batch:
+            self._dirty.pop(saver, None)
             self._deferred.pop(saver, None)
             self._inflight.add(saver)
-            batch.append((saver, failures))
         if not batch:
             return
         # Savers whose outcome is not yet resolved; on cancellation they must
@@ -456,6 +494,12 @@ class SaveScheduler:
                 self._dirty.pop(saver, None)  # F-151: forget() may have removed it
                 self.saved_total += 1
                 self._metrics.save_flushed.inc()
+                # F-186: marks accepted during the drain (never-drop) can
+                # keep feeding the loop; the deadline bounds them too --
+                # without this check only the FAILURE path ever noticed it.
+                if self._dirty and time.monotonic() >= deadline:
+                    self._report_unflushed()
+                    return False
         self._sync_metrics()
         logger.info("all pending saves flushed (saved=%d)", self.saved_total)
         return True

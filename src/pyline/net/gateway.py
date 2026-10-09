@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from pyline.log.ratelimit import WindowLogLimiter
+
 if TYPE_CHECKING:
     from pyline.net.network import Network
 
@@ -15,6 +17,9 @@ class ProtocolGateway:
     def __init__(self) -> None:
         self._networks: dict[str, Network] = {}
         self.unknown_dispatches = 0
+        # F-171: unknown flags are peer-triggerable noise; one line per
+        # burst window instead of one per frame (log-flood DoS).
+        self._unknown_log = WindowLogLimiter()
 
     def register(self, network: Network) -> None:
         """Register a network under its ``flag``; duplicates are a config error."""
@@ -66,10 +71,12 @@ class ProtocolGateway:
         network = self._networks.get(flag)
         if network is None:
             self.unknown_dispatches += 1
-            logger.warning(
-                "no network registered for flag %r (dropped, total=%d)",
-                flag,
-                self.unknown_dispatches,
-            )
+            if self._unknown_log.allow():
+                logger.warning(
+                    "no network registered for flag %r (dropped, total=%d, suppressed=%d)",
+                    flag,
+                    self.unknown_dispatches,
+                    self._unknown_log.take_suppressed(),
+                )
             return
         network.handle_message(flag, payload, from_service)

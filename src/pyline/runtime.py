@@ -59,6 +59,7 @@ from pyline.net import (
     close_server,
     serve,
 )
+from pyline.net.tls import build_server_context
 from pyline.obs.metrics import AlarmHub
 from pyline.reload.inplace import reload_module
 from pyline.runtime_wiring import (
@@ -261,6 +262,10 @@ class ServerRuntime:
         if not self.ctx.is_main_process:
             return
         entry = self.ctx.entry
+        # F-187: TLS on the client listener (server certificate; game
+        # clients are authenticated by the in-tunnel HMAC handshake).
+        tls = self.ctx.settings.socket.tls
+        ssl_context = build_server_context(tls) if tls is not None else None
         self._client_server = await serve(
             entry.bind_host(),
             entry.client_listen_port(self.ctx.process_index),
@@ -273,13 +278,15 @@ class ServerRuntime:
             send_queue_bytes=self.ctx.settings.socket.send_queue_bytes,
             max_connections=self.ctx.settings.socket.max_connections,
             max_connections_per_ip=self.ctx.settings.socket.max_connections_per_ip,
+            ssl_context=ssl_context,
             on_message=self._on_client_frame,
             on_connected=self._on_client_connected,
         )
         logger.info(
-            "client listener on %s:%d",
+            "client listener on %s:%d (tls=%s)",
             entry.bind_host(),
             entry.client_listen_port(self.ctx.process_index),
+            "on" if ssl_context is not None else "off",
         )
 
     async def _reload_and_rebind(self, module_name: str) -> None:

@@ -37,11 +37,13 @@ logger = logging.getLogger(__name__)
 
 from pyline.obs.metrics import get_metrics  # noqa: E402
 
-# Swappable function state. ``__closure__`` is deliberately absent: it is a
-# read-only attribute (assignment silently fails), and closure-layout equality
-# is enforced separately at swap time, so old cells stay self-consistent with
-# the swapped code. Closure *captured values* are therefore preserved across
-# reloads, never updated (see docs/hot-reload.md).
+# Swappable function state. ``__closure__`` itself is never swapped (it is
+# a read-only attribute): closure-layout equality is enforced at swap time,
+# so old cells stay self-consistent with the swapped code.  FUNCTION-valued
+# cell CONTENTS that belong to the reloaded module are refreshed in place
+# (F-166, see _refresh_closure); every other captured value (state: counters,
+# configs, connections) keeps the old value -- the documented
+# state-preservation semantics.
 # ``__dict__`` is also absent: it is merged instead of swapped (see
 # _update_function, F-100) so runtime-attached function attributes survive.
 _FUNC_ATTRS = (
@@ -53,6 +55,17 @@ _FUNC_ATTRS = (
 )
 
 _RELOADING: set[str] = set()
+
+# F-166: the module currently being reloaded (module name, or None).  The
+# update phase is synchronous (single event loop), so a module-level flag is
+# race-free the same way _RELOADING is.  _refresh_closure consults it to
+# decide which closure-held functions belong to THIS reload.
+_ACTIVE_MODULE: str | None = None
+
+# F-166: functions whose cells were already refreshed in the current reload
+# (id-keyed): cycles out of self-referential closures and skips shared
+# inner functions a second wrapper also captures.
+_CELL_SEEN: set[int] = set()
 
 # Changing these on a live class breaks instances already inside dicts/sets.
 _IDENTITY_DUNDERS = frozenset(
@@ -75,6 +88,7 @@ class ReloadRejected(ReloadError):
 
 def reload_module(module_name: str) -> types.ModuleType:
     """Reload ``module_name`` in place, preserving object identity."""
+    global _ACTIVE_MODULE
     module = sys.modules.get(module_name)
     if module is None:
         # F-96: the watcher used to auto-import unknown modules, so saving
@@ -95,8 +109,10 @@ def reload_module(module_name: str) -> types.ModuleType:
     assert module.__file__ is not None
     code = compile(source, module.__file__, "exec")  # the SAME validated bytes
     _RELOADING.add(module_name)
+    _CELL_SEEN.clear()  # F-166: per-reload cycle guard
     cache = ModCache(module)  # pre-reload deep snapshot: the OLD objects
     try:
+        _ACTIVE_MODULE = module_name
         before_digest = hashlib.sha256(source).hexdigest()
         exec(code, module.__dict__)  # module dict now holds NEW objects
         updated_classes = _update_module(module, cache)
@@ -117,6 +133,7 @@ def reload_module(module_name: str) -> types.ModuleType:
         get_metrics().reload_total.labels(result="failed").inc()
         raise
     finally:
+        _ACTIVE_MODULE = None
         _RELOADING.discard(module_name)
     return module
 
@@ -648,6 +665,21 @@ def _update_module(module: types.ModuleType, cache: ModCache) -> int:
             # Plain module-level values are runtime state: a reload never
             # clobbers live state. (The prototype needed a manual
             # "if not g_X in globals()" guard for this; here it is default.)
+            # F-168: a CHANGED value is now visible in the log. "I edited the
+            # constant and hot-reloaded, why is the old value still live" is
+            # the single most surprising documented behaviour -- the info
+            # line turns it from a support ticket into a log lookup.
+            try:
+                changed = bool(new_obj != old_obj)
+            except Exception:
+                changed = True  # exotic __eq__; assume changed, the log is cheap
+            if changed:
+                logger.info(
+                    "reload kept the live value of module-level %s.%s (runtime state; "
+                    "the new source's value was NOT applied)",
+                    module.__name__,
+                    name,
+                )
             setattr(module, name, old_obj)
     return updated_classes
 
@@ -704,8 +736,19 @@ def _update_function(old_func: types.FunctionType, new_func: types.FunctionType)
             "restart required"
         )
     for attr in _FUNC_ATTRS:
-        with contextlib.suppress(AttributeError, TypeError):
+        # F-167: the suppress stays (a swap failure must not abort the rest
+        # of the update) but is no longer SILENT -- a function whose code
+        # silently failed to swap looks exactly like a reload that "did
+        # nothing" for that function.
+        try:
             setattr(old_func, attr, getattr(new_func, attr))
+        except (AttributeError, TypeError):
+            logger.warning(
+                "reload: could not swap %s of %s (%r kept)",
+                attr,
+                old_func.__qualname__,
+                "old value",
+            )
     # F-100: ``__dict__`` holds runtime-attached state (caches, memo flags,
     # registration marks) that the module-level policy never clobbers for
     # plain values -- a wholesale swap dropped it on every reload, silently
@@ -714,6 +757,60 @@ def _update_function(old_func: types.FunctionType, new_func: types.FunctionType)
     # had; anything attached at runtime always wins.
     for key, value in new_func.__dict__.items():
         old_func.__dict__.setdefault(key, value)
+    _refresh_closure(old_func, new_func)
+
+
+def _refresh_closure(old_func: types.FunctionType, new_func: types.FunctionType) -> None:
+    """F-166: refresh FUNCTION-valued cells owned by the reloaded module.
+
+    The swap keeps the OLD closure cells (they are shared state), which is
+    correct for counters/configs and WRONG for decorated functions: a
+    ``functools.wraps``-style wrapper's cell holds the wrapped inner
+    function, so after swapping only the wrapper's code the call still
+    executed the OLD inner -- the edit silently did nothing, the exact
+    failure class this validator exists to prevent.  For each free variable
+    where BOTH old and new cells hold functions and the old one belongs to
+    the module being reloaded, the old inner function is updated in place
+    (recursively -- the inner may itself hold decorated inners).
+
+    Non-function cells (state) keep their old value: the documented
+    state-preservation semantics are unchanged.  Functions from OTHER
+    modules are never touched: their reload is their own module's business.
+    """
+    module_name = _ACTIVE_MODULE
+    if module_name is None:
+        return  # not inside a reload (defensive; every caller is one)
+    old_cells = old_func.__closure__ or ()
+    new_cells = new_func.__closure__ or ()
+    if not old_cells or len(old_cells) != len(new_cells):
+        return  # no closure, or the layout guard in _update_function fired
+    for old_cell, new_cell, var_name in zip(
+        old_cells, new_cells, old_func.__code__.co_freevars, strict=True
+    ):
+        try:
+            old_val = old_cell.cell_contents
+        except ValueError:
+            continue  # empty cell (branch not taken yet in the old code)
+        try:
+            new_val = new_cell.cell_contents
+        except ValueError:
+            continue
+        if not isinstance(old_val, types.FunctionType) or not isinstance(
+            new_val, types.FunctionType
+        ):
+            continue  # state cell: preserved (documented semantics)
+        if old_val is new_val or id(old_val) in _CELL_SEEN:
+            continue
+        if old_val.__module__ != module_name:
+            continue  # foreign module's function
+        _CELL_SEEN.add(id(old_val))
+        logger.debug(
+            "reload: refreshing closure-held function %s (via %s.%s)",
+            old_val.__qualname__,
+            old_func.__qualname__,
+            var_name,
+        )
+        _update_function(old_val, new_val)
 
 
 def _update_class(old_cls: type, new_cls: type) -> None:
@@ -746,8 +843,12 @@ def _update_class(old_cls: type, new_cls: type) -> None:
             continue
         if getattr(old_dict[key], "__reloadkeep__", False):
             continue
-        with contextlib.suppress(AttributeError, TypeError):
+        # F-167: keep suppressing (one unremovable attribute must not abort
+        # the diff) but log -- a silently surviving member is invisible rot.
+        try:
             delattr(old_cls, key)
+        except (AttributeError, TypeError):
+            logger.warning("reload: could not remove %s.%s during diff", old_cls.__qualname__, key)
     for key, new_val in new_dict.items():
         if key == "__dict__" or key == "__weakref__":
             continue
@@ -811,21 +912,28 @@ def _func_state(fn: types.FunctionType) -> tuple[object, ...]:
 
 
 def _restore_func(fn: types.FunctionType, state: tuple[object, ...]) -> None:
+    # ``__closure__`` is intentionally not captured: it is read-only on
+    # functions, and closure layout equality at swap time guarantees the old
+    # cells remain valid for the restored code.  F-166 refreshes cell-held
+    # functions' code in place, so those inners carry their OWN snapshots
+    # (ModCache._capture recurses into closures) and are restored here too.
     code, defaults, kwdefaults, fdict, annotations, doc = state
-    with contextlib.suppress(AttributeError, TypeError):
-        fn.__code__ = code  # type: ignore[assignment]
-    with contextlib.suppress(AttributeError, TypeError):
-        fn.__defaults__ = defaults  # type: ignore[assignment]
-    with contextlib.suppress(AttributeError, TypeError):
-        fn.__kwdefaults__ = kwdefaults  # type: ignore[assignment]
-    with contextlib.suppress(AttributeError, TypeError):
-        fn.__dict__.clear()
-        cast("dict[str, object]", fdict)
-        fn.__dict__.update(cast("dict[str, object]", fdict))
-    with contextlib.suppress(AttributeError, TypeError):
-        fn.__annotations__ = annotations  # type: ignore[assignment]
-    with contextlib.suppress(AttributeError, TypeError):
-        fn.__doc__ = doc  # type: ignore[assignment]
+
+    def _restore(attr: str, value: object) -> None:
+        # F-167: a failed restore leaves the function half-rolled-back --
+        # that must be visible, or a subsequent reload stacks on corrupt state.
+        try:
+            setattr(fn, attr, value)
+        except (AttributeError, TypeError):
+            logger.warning("reload rollback: could not restore %s of %s", attr, fn.__qualname__)
+
+    _restore("__code__", code)
+    _restore("__defaults__", defaults)
+    _restore("__kwdefaults__", kwdefaults)
+    fn.__dict__.clear()
+    fn.__dict__.update(cast("dict[str, object]", fdict))
+    _restore("__annotations__", annotations)
+    _restore("__doc__", doc)
 
 
 class ModCache:
@@ -847,7 +955,20 @@ class ModCache:
 
     def _capture(self, obj: object) -> None:
         if isinstance(obj, types.FunctionType) and self._owned(obj):
-            self._func_snapshots.setdefault(id(obj), (obj, _func_state(obj)))
+            if id(obj) in self._func_snapshots:
+                return  # already captured; also breaks self-referential cycles
+            self._func_snapshots[id(obj)] = (obj, _func_state(obj))
+            # F-166: closure-held inner functions are swappable now (the
+            # update phase refreshes them in place), so rollback must cover
+            # them too -- without this, a failed reload restored the wrapper
+            # while the cell-held inner kept the half-applied new code.
+            for cell in obj.__closure__ or ():
+                try:
+                    inner = cell.cell_contents
+                except ValueError:
+                    continue  # empty cell
+                if isinstance(inner, types.FunctionType):
+                    self._capture(inner)  # _owned() inside guards foreign functions
         elif isinstance(obj, type) and self._owned(obj):
             if obj in self._class_snapshots:
                 return  # already captured; also breaks pathological cycles
@@ -887,8 +1008,17 @@ class ModCache:
             current = dict(cls.__dict__)
             for key in current:
                 if key not in saved and key not in ("__dict__", "__weakref__"):
-                    with contextlib.suppress(AttributeError, TypeError):
+                    # F-167: rollback removes what the failed reload added;
+                    # a failed removal is a half-done rollback -- loud, not
+                    # silent.
+                    try:
                         delattr(cls, key)
+                    except (AttributeError, TypeError):
+                        logger.warning(
+                            "reload rollback: could not remove added attribute %s.%s",
+                            cls.__qualname__,
+                            key,
+                        )
             for key, value in saved.items():
                 if key in ("__dict__", "__weakref__"):
                     continue
